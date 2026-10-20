@@ -457,6 +457,190 @@ def normalize_keys(bt: SharedTable, pt: SharedTable, bcols: List[Int], pcols: Li
     keys.po_addr = Int(keys.pok.unsafe_ptr())
 
 
+# ── the keys of a probe side that arrives in chunks (F-158) ────────────────────────────────────────────
+
+struct KeyPlan(Movable):
+    """How a probe chunk's key columns become the int64 keys the build side's map holds: planned once from the build side and the probe's schema, applied to
+    each chunk (a scan's row group, a frame's shared rows, its changed rows). `hashed`: the keys are hashes of tuples (a join the chunked path leaves to the
+    materialized one: its pairs must be verified against the columns)."""
+    var nk: Int
+    var own: Bool                    # one key that is the column itself
+    var kinds: List[Int]
+    var pmuls: List[Int64]           # the probe's decimal scale brought to the build side's
+    var translates: List[List[Int32]]   # a TEXT key: the probe's code -> the build side's (-1: the word has no partner)
+    var packed: Bool
+    var hashed: Bool
+    var los: List[Int64]
+    var spans: List[UInt64]
+    var layout: String
+
+    def __init__(out self):
+        self.nk = 0
+        self.own = False
+        self.kinds = List[Int]()
+        self.pmuls = List[Int64]()
+        self.translates = List[List[Int32]]()
+        self.packed = False
+        self.hashed = False
+        self.los = List[Int64]()
+        self.spans = List[UInt64]()
+        self.layout = String()
+
+
+def make_key_plan(bt: SharedTable, ps: SharedTable, bcols: List[Int], pcols: List[Int], pwords: List[List[String]], aliases: List[List[Int]],
+                  mut keys: JoinKeys) raises -> KeyPlan:
+    """The plan, and the build side's keys in `keys` (`bk_addr`, `bo_addr`). `ps` holds the probe's kinds, scales and (when `pwords[j]` is empty) the words
+    of its TEXT key columns by code; `pwords[j]` are a column's words by code when a frame's session words go beyond the shared table's, `aliases[j]` its merged
+    codes (from, to, from, to ...)."""
+    var plan = KeyPlan()
+    var nk = len(bcols)
+    plan.nk = nk
+    if bt.rows() >= (1 << 31):
+        raise Error("join: a side of 2^31 rows or more is not supported (the join's row numbers are 32-bit); filter or split the table first")
+    if nk == 1:
+        var kind = bt.kind(bcols[0]).value
+        var numeric = kind == INT.value or kind == DECIMAL.value
+        if (numeric and bt.scale(bcols[0]) == ps.scale(pcols[0])) or kind == DATE.value or kind == BOOL.value:
+            plan.own = True
+            plan.layout = "one key (the column itself)"
+            keys.bk_addr = Int(bt.values(bcols[0]).unsafe_ptr())
+            keys.bo_addr = _ok_bytes(bt, bcols[0], keys.bok)
+            plan.kinds.append(kind)
+            return plan^
+    var bvals = List[List[Int64]]()
+    keys.bok = List[UInt8](length=bt.rows(), fill=1)
+    for j in range(nk):
+        var kind = bt.kind(bcols[j]).value
+        var bs = bt.scale(bcols[j])
+        var psc = ps.scale(pcols[j])
+        var bmul = Int64(1)
+        var pmul = Int64(1)
+        if (kind == INT.value or kind == DECIMAL.value) and bs != psc:
+            if bs < psc:
+                bmul = _pow10(psc - bs)
+            else:
+                pmul = _pow10(bs - psc)
+        var translate = List[Int32]()
+        if kind == TEXT.value:
+            var words = List[String]()
+            if len(pwords[j]) > 0:
+                words = pwords[j].copy()
+            else:
+                var dw = ps.dictionary(pcols[j])
+                for w in range(len(dw)):
+                    words.append(String(dw[w]))
+            for w in range(len(words)):
+                var target = w
+                var a = 0
+                while a + 1 < len(aliases[j]):                       # a merged code reads as the code it was merged into
+                    if aliases[j][a] == w:
+                        target = aliases[j][a + 1]
+                    a += 2
+                translate.append(Int32(bt.code_of(bcols[j], words[target]) if target < len(words) else -1))
+        var bv = List[Int64]()
+        var bo = List[UInt8]()
+        _column_keys(bt, bcols[j], kind, bmul, List[Int32](), False, bv, bo)
+        bvals.append(bv^)
+        for i in range(bt.rows()):
+            if bo[i] == 0:
+                keys.bok[i] = 0
+        plan.kinds.append(kind)
+        plan.pmuls.append(pmul)
+        plan.translates.append(translate^)
+    var nb = bt.rows()
+    if nk == 1:
+        keys.bkeys = bvals[0].copy()
+        plan.layout = "one key"
+    else:
+        var product = UInt64(1)
+        var fits = True
+        for j in range(nk):
+            var lo = Int64.MAX
+            var hi = Int64.MIN
+            for i in range(nb):
+                if keys.bok[i] != 0:
+                    lo = min(lo, bvals[j][i])
+                    hi = max(hi, bvals[j][i])
+            if lo > hi:
+                lo = 0
+                hi = 0
+            var span = UInt64(hi) - UInt64(lo) + 1
+            plan.los.append(lo)
+            plan.spans.append(span)
+            if span == 0 or product > (UInt64(1) << 62) // span:
+                fits = False
+            else:
+                product *= span
+        if not fits:
+            plan.hashed = True
+            plan.layout = String(nk) + " keys hashed to one int64 (their ranges are too wide to pack)"
+            return plan^
+        plan.packed = True
+        plan.layout = String(nk) + " keys packed into one int64 (" + String(product) + " combinations)"
+        keys.bkeys = List[Int64](length=nb, fill=0)
+        var stride = UInt64(1)
+        for j in range(nk):
+            for i in range(nb):
+                keys.bkeys[i] = Int64(UInt64(keys.bkeys[i]) + UInt64(bvals[j][i] - plan.los[j]) * stride)
+            stride *= plan.spans[j]
+    keys.bk_addr = Int(keys.bkeys.unsafe_ptr())
+    keys.bo_addr = Int(keys.bok.unsafe_ptr())
+    return plan^
+
+
+def probe_chunk_keys(plan: KeyPlan, chunk: SharedTable, pcols: List[Int], mut keys: JoinKeys) raises:
+    """The probe keys of one chunk (`pcols` are its key columns' positions in the chunk): into `keys.pk_addr` / `keys.po_addr` (the lists it owns live as long as
+    `keys`)."""
+    var n = chunk.rows()
+    if plan.own:
+        keys.pk_addr = Int(chunk.values(pcols[0]).unsafe_ptr())
+        keys.po_addr = _ok_bytes(chunk, pcols[0], keys.pok)
+        return
+    keys.pok = List[UInt8](length=n, fill=1)
+    var pvals = List[List[Int64]]()
+    for j in range(plan.nk):
+        var kind = plan.kinds[j]
+        var pv = List[Int64](length=n, fill=0)
+        var src = chunk.values(pcols[j]).unsafe_ptr()
+        var valid = _valid_bits(chunk, pcols[j])
+        var bits = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=valid)
+        for i in range(n):
+            if valid != 0 and (bits[i >> 3] >> UInt8(i & 7)) & 1 == 0:
+                keys.pok[i] = 0
+                continue
+            var v = src[i]
+            if kind == FLOAT.value:
+                pv[i] = float_key(v)
+            elif kind == TEXT.value:
+                if v < 0 or Int(v) >= len(plan.translates[j]) or plan.translates[j][Int(v)] < 0:
+                    keys.pok[i] = 0                                  # a word the build side lacks never matches
+                    continue
+                pv[i] = Int64(plan.translates[j][Int(v)])
+            elif plan.pmuls[j] != 1:
+                var r = v * plan.pmuls[j]
+                if (v != 0 and r // v != plan.pmuls[j]) or v == Int64.MIN:
+                    keys.pok[i] = 0
+                    continue
+                pv[i] = r
+            else:
+                pv[i] = v
+        pvals.append(pv^)
+    keys.pkeys = List[Int64](length=n, fill=0)
+    if plan.nk == 1:
+        keys.pkeys = pvals[0].copy()
+    else:
+        var stride = UInt64(1)
+        for j in range(plan.nk):
+            for i in range(n):
+                if keys.pok[i] != 0 and (pvals[j][i] < plan.los[j] or UInt64(pvals[j][i] - plan.los[j]) >= plan.spans[j]):
+                    keys.pok[i] = 0                                  # outside the build side's range: it cannot match
+                else:
+                    keys.pkeys[i] = Int64(UInt64(keys.pkeys[i]) + UInt64(pvals[j][i] - plan.los[j]) * stride)
+            stride *= plan.spans[j]
+    keys.pk_addr = Int(keys.pkeys.unsafe_ptr())
+    keys.po_addr = Int(keys.pok.unsafe_ptr())
+
+
 # ── the pairs ────────────────────────────────────────────────────────────────────────────────────────
 
 struct JoinPairs(Movable):

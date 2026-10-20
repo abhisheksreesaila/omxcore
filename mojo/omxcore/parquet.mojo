@@ -2914,6 +2914,11 @@ struct ParquetScan(Copyable, Movable):
             raise e^
         Atomic[Scalar[DType.int64]].store(lock, 0)
 
+    def dictionary_into(self, mut t: Table, col: Int, c: Int) raises:
+        """Column `col` of `t` takes TEXT column `c`'s file-wide dictionary (shared, no word is copied)."""
+        self.ensure_words(c)
+        t.cols[col].dict = self._info[].dicts.cols[c].dict
+
     def word_count(self, c: Int) raises -> Int:
         """A TEXT column's number of words in the whole file: the `groups=` of a query keyed by it."""
         self.ensure_words(c)

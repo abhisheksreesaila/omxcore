@@ -11,12 +11,14 @@ the numbering of the joined columns (each is a column of the probe table or of t
 value copy of it that the front closure captures; the arrays it points to live in the kernel run (`KernelRun` regions) or in `FusedJoin`,
 both alive for the whole kernel call.
 """
-from .table import SharedTable
+from std.memory import ArcPointer
+from .table import SharedTable, Table
+from .bind import SqlSource
 from .query import Program
 from .kernels.pipeline_cpu import IP, LP, FP, BP, VEC
 from .kernels.hashjoin_cpu import JoinMap, MapView, load_view, hj_probe_block, hj_probe_left_block, hj_filter_block
 from .kargs import KernelRun
-from .joincore import JoinKeys
+from .joincore import JoinKeys, KeyPlan, probe_chunk_keys
 
 comptime DT_NULLMASK = 7
 
@@ -28,12 +30,51 @@ comptime FM_LEFT = 1
 
 struct StageData(Movable):
     """One dimension of a star (F-155): the map built on its table's keys, and the probe table's normalized keys for it."""
-    var map: JoinMap
+    var map: ArcPointer[JoinMap]
     var keys: JoinKeys
 
-    def __init__(out self, var map: JoinMap, var keys: JoinKeys):
-        self.map = map^
+    def __init__(out self, map: ArcPointer[JoinMap], var keys: JoinKeys):
+        self.map = map
         self.keys = keys^
+
+
+struct StreamStage(Movable):
+    """One join of a streamed probe (F-158): the build side's table and map (shared by every chunk and every worker, read only) and how a chunk's key columns
+    become the map's keys."""
+    var build: SharedTable
+    var map: ArcPointer[JoinMap]
+    var plan: KeyPlan
+    var pcols: List[Int]             # the probe's key columns, by the probe source's column numbers
+
+    def __init__(out self, build: SharedTable, map: ArcPointer[JoinMap], var plan: KeyPlan, var pcols: List[Int]):
+        self.build = build
+        self.map = map
+        self.plan = plan^
+        self.pcols = pcols^
+
+
+struct ProbeStream(Movable):
+    """A fused join whose probe side arrives in chunks: a scan's row groups, a frame's shared rows and then its changed rows, a table. Each chunk gets a
+    `FusedJoin` of its own (`chunk_join`): its keys are planned once (`StreamStage.plan`), the build side's maps are shared. `used` are the probe source's
+    columns a chunk holds (in order; all of them for a table or a frame), `pos` the position of each in a chunk."""
+    var src: SqlSource
+    var used: List[Int]
+    var pos: List[Int]
+    var stages: List[StreamStage]
+    var fmode: Int                   # a single join: FM_INNER, FM_LEFT or a presence filter mode
+    var star: Bool                   # several unique-key dimensions probed one after the other
+    var vstage: List[Int]            # per joined column: -1 a probe column, else the stage whose build table it comes from
+    var vreal: List[Int]             # ... the probe source's column number, or the build table's column
+
+    def __init__(out self, var src: SqlSource, var used: List[Int], var pos: List[Int], var stages: List[StreamStage], fmode: Int, star: Bool, var vstage: List[Int], var vreal: List[Int]):
+        self.src = src^
+        self.used = used^
+        self.pos = pos^
+        self.stages = stages^
+        self.fmode = fmode
+        self.star = star
+        self.vstage = vstage^
+        self.vreal = vreal^
 
 
 struct FusedJoin(Movable):
@@ -43,15 +84,19 @@ struct FusedJoin(Movable):
     var vreal: List[Int]             # ... and which column of its table
     var vpartner: List[Int]          # a build-side joined column: its number among the partner columns (-1 for a probe column)
     var partner: List[Int]           # the build table's columns the front stage gathers, in partner order
-    var map: JoinMap
+    var map: ArcPointer[JoinMap]
     var keys: JoinKeys               # the probe side's normalized keys (and the build side's, which built the map)
+    var n_probe_cols: Int            # the columns of a probe chunk (the program's table columns after them are the dimensions' placeholders)
+    var stream: Optional[ArcPointer[ProbeStream]]   # set on the join a streamed query is lowered against: its probe arrives in chunks
     var fmode: Int                   # FM_INNER, FM_LEFT, or a presence filter mode (semi / anti: no partner columns)
     var partner_table: List[SharedTable]   # the table each partner column comes from (one table for a join; a star has one per dimension)
     var partner_stage: List[Int]           # ... and which stage (dimension) of the star
     var stages: List[StageData]      # a star: the dimensions probed one after the other, each with unique keys (empty for a single join)
 
-    def __init__(out self, probe: SharedTable, build: SharedTable, var vprobe: List[Bool], var vreal: List[Int], var map: JoinMap, var keys: JoinKeys, fmode: Int = 0):
+    def __init__(out self, probe: SharedTable, build: SharedTable, var vprobe: List[Bool], var vreal: List[Int], map: ArcPointer[JoinMap], var keys: JoinKeys, fmode: Int = 0):
         self.fmode = fmode
+        self.n_probe_cols = probe.columns()
+        self.stream = None
         self.probe = probe
         self.build = build
         self.vpartner = List[Int]()
@@ -69,12 +114,14 @@ struct FusedJoin(Movable):
                 self.partner_stage.append(0)
         self.vprobe = vprobe^
         self.vreal = vreal^
-        self.map = map^
+        self.map = map
         self.keys = keys^
 
     def __init__(out self, probe: SharedTable, var tables: List[SharedTable], var vstage: List[Int], var vreal: List[Int], var stages: List[StageData]):
         """A star: joined column i is the probe table's column `vreal[i]` when `vstage[i]` is -1, else column `vreal[i]` of dimension `vstage[i]`."""
         self.fmode = 0
+        self.n_probe_cols = probe.columns()
+        self.stream = None
         self.probe = probe
         self.build = probe
         self.vprobe = List[Bool]()
@@ -93,7 +140,7 @@ struct FusedJoin(Movable):
                 self.partner_table.append(tables[vstage[i]])
                 self.partner_stage.append(vstage[i])
         self.vreal = vreal^
-        self.map = JoinMap()
+        self.map = ArcPointer(JoinMap())
         self.keys = JoinKeys()
         self.stages = stages^
 
@@ -151,13 +198,13 @@ def front_spec(mut run: KernelRun, fj: FusedJoin, p: Program) raises -> FrontSpe
     """Which of the program's columns are the build side's, and where the front stage finds what it gathers. The arrays go into the run's
     regions (alive as long as the run, which the kernel call is a method of)."""
     var fs = FrontSpec()
-    fs.view = MapView(fj.map)
+    fs.view = MapView(fj.map[])
     fs.fmode = fj.fmode
     fs.keys_a = fj.keys.pk_addr
     fs.ok_a = fj.keys.po_addr
     fs.n_words = len(p.cols)
     fs.n_partner = len(fj.partner)
-    var first = fj.probe.columns()                                   # the program's table columns from here on are the build side's (placeholders)
+    var first = fj.n_probe_cols                                      # the program's table columns from here on are the build side's (placeholders)
     var data = List[Int]()
     var valid = List[Int]()
     for q in range(len(p.cols)):
@@ -190,7 +237,7 @@ def front_spec(mut run: KernelRun, fj: FusedJoin, p: Program) raises -> FrontSpe
     fs.n_stages = len(fj.stages)
     var rs = run.region(max(15 * fs.n_stages, 1))
     for k in range(fs.n_stages):
-        MapView(fj.stages[k].map).store(run.i64(rs) + 15 * k)
+        MapView(fj.stages[k].map[]).store(run.i64(rs) + 15 * k)
         run.i64(rs)[15 * k + 11] = Int64(fj.stages[k].keys.pk_addr)
         run.i64(rs)[15 * k + 12] = Int64(fj.stages[k].keys.po_addr)
     fs.stages_a = Int(run.i64(rs))
@@ -315,3 +362,46 @@ def _jf_star(fs: FrontSpec, i0: Int, n: Int, sel: IP, ws: BP) -> Int:
         lc[slot] = Int64(Int(bits))
         lc[slot + 1] = Int64(-i0)
     return kept
+
+
+def chunk_join(ps: ProbeStream, chunk: SharedTable, layout_only: Bool = False) raises -> FusedJoin:
+    """The fused join of one probe chunk: its keys from the chunk's columns, the build sides' maps shared. `layout_only`: no keys, no rows (the join the query is
+    lowered against: it has the chunk's columns and the dimensions' placeholders)."""
+    var vreal = List[Int]()
+    for v in range(len(ps.vstage)):
+        vreal.append(ps.pos[ps.vreal[v]] if ps.vstage[v] < 0 else ps.vreal[v])
+    var fj: FusedJoin
+    if not ps.star:
+        var keys = JoinKeys()
+        if not layout_only:
+            var pc = List[Int]()
+            for c in ps.stages[0].pcols:
+                pc.append(ps.pos[c])
+            probe_chunk_keys(ps.stages[0].plan, chunk, pc, keys)
+        var vprobe = List[Bool]()
+        for v in range(len(ps.vstage)):
+            vprobe.append(ps.vstage[v] < 0)
+        fj = FusedJoin(chunk, ps.stages[0].build, vprobe^, vreal^, ps.stages[0].map, keys^, ps.fmode)
+    else:
+        var tables = List[SharedTable]()
+        var stages = List[StageData]()
+        for k in range(len(ps.stages)):
+            var keys = JoinKeys()
+            if not layout_only:
+                var pc = List[Int]()
+                for c in ps.stages[k].pcols:
+                    pc.append(ps.pos[c])
+                probe_chunk_keys(ps.stages[k].plan, chunk, pc, keys)
+            tables.append(ps.stages[k].build)
+            stages.append(StageData(ps.stages[k].map, keys^))
+        fj = FusedJoin(chunk, tables^, ps.vstage.copy(), vreal^, stages^)
+    if layout_only:
+        fj.n_probe_cols = len(ps.used)
+    return fj^
+
+
+def stream_template(ps: ArcPointer[ProbeStream]) raises -> FusedJoin:
+    """The join a streamed query is lowered against."""
+    var fj = chunk_join(ps[], Table.empty().share(), True)
+    fj.stream = ps
+    return fj^
