@@ -27,6 +27,7 @@ from .kernels._fpenv import core_count
 from .kernels.pipeline_cpu import IP, LP, FP, BP, VEC, E_OVERFLOW, pipeline_keyed
 from .sql import sql_error
 from .bind import SqlSource, BoundQuery, SortKey, B_COL, B_LIT, SRC_FRAME, pow10_checked
+from .joincore import JOIN_BUDGET_BYTES
 from .planner import PhysicalPlan, PlannerOptions, commas
 from .sqlprog import SqlProgram, DictAccess, lower_rows, bkey, collect_columns
 from .sqleval import ValCol
@@ -693,6 +694,10 @@ def run_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
                 else:
                     _append_gathered(cols[k], chunk, inp.pos[it.col], IP(unsafe_from_address=Int(rc.ids.unsafe_ptr())), rc.n)
             rows_in += rc.n
+            if q.is_side and rows_in * max(len(items), 1) * 8 > (opts.join_budget if opts.join_budget > 0 else JOIN_BUDGET_BYTES):
+                raise Error("the build side of the join (" + src.name + ") has " + commas(rows_in) + " rows of " + String(len(items)) + " columns so far, past the join's memory budget of " +
+                            commas((opts.join_budget if opts.join_budget > 0 else JOIN_BUDGET_BYTES) >> 20) + " MB: filter it, carry fewer columns, put the larger table on the other side, or raise the budget " +
+                            "(`PlannerOptions.join_budget`, `mx --join-budget`); a join that spills to disk is not built yet")
             opts.job.advance(end - at)
             at = end
     var ms_run = Float64(perf_counter_ns() - t_run) / 1e6

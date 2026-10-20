@@ -80,6 +80,7 @@ def side_query(catalog: Catalog, q: BoundQuery, t: Int, needed: List[Int]) -> Bo
     var sq = copy_query(q)
     var start = q.tab_start[t]
     sq.explain = 0                                                  # the side runs, whatever the query is asked for
+    sq.is_side = True
     sq.joined = False
     sq.sources = List[Int]()
     sq.sources.append(q.sources[t])

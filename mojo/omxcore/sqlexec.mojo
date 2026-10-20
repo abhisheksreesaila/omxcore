@@ -1061,12 +1061,14 @@ def _plain_side(catalog: Catalog, q: BoundQuery, t: Int, needed: List[Int]) -> J
     return JoinSide(src.table, cols^, kc^, True)
 
 
-def _prefill_ranges_n(mut src: SqlSource, jq: BoundQuery, tabs: List[SharedTable], vtab: List[Int], vreal: List[Int]):
-    """`_prefill_ranges` for a star: virtual column c is column `vreal[c]` of table `tabs[vtab[c]]`."""
+def _prefill_ranges_n(mut src: SqlSource, jq: BoundQuery, tabs: List[SharedTable], vtab: List[Int], vreal: List[Int], skip: List[Int] = List[Int]()):
+    """`_prefill_ranges` for a star: virtual column c is column `vreal[c]` of table `tabs[vtab[c]]` (`skip[c]` != 0: its range is unknown, a streamed probe's)."""
     var cols = List[Int]()
     for k in jq.keys:
         _key_columns(jq, k.expr, cols)
     for c in cols:
+        if len(skip) > 0 and skip[c] != 0:
+            continue
         var r = _column_range(tabs[vtab[c]], vreal[c])
         src.range_cols.append(c)
         src.range_lo.append(r[1])
@@ -1173,6 +1175,69 @@ def _prefill_ranges_stream(mut src: SqlSource, jq: BoundQuery, bt: SharedTable, 
         src.range_lo.append(r[1])
         src.range_hi.append(r[2])
         src.range_has.append(r[0])
+
+
+def _probe_words(src: SqlSource, cols: List[Int], mut words: List[List[String]], mut aliases: List[List[Int]]) raises:
+    """For `make_key_plan`: each key column's words by code (the file's or table's, then a Frame's session words) and its merged codes."""
+    var dact = DictAccess(src.table, src.scan, src.overlay.words)
+    var all_alias = _alias_lists(src)
+    for c in cols:
+        var ws = List[String]()
+        if src.table.kind(c) == TEXT:
+            for code in range(dact.count(c)):
+                ws.append(dact.word(c, code))
+        words.append(ws^)
+        aliases.append(all_alias[c].copy())
+
+
+def _stream_schema_fix(mut vt: Table, src: SqlSource, vstage: List[Int], vreal: List[Int]) raises:
+    """The virtual schema of a streamed join: its probe columns hold the source's dictionaries (shared) and may hold NULLs."""
+    for v in range(len(vstage)):
+        if vstage[v] < 0:
+            var c = vreal[v]
+            if src.table.kind(c) == TEXT:
+                if src.scan:
+                    src.scan.value().dictionary_into(vt, v, c)
+                else:
+                    vt.share_dictionary(v, src.table, c)
+            vt.cols[v].nulls = _probe_null_count(src, c)
+
+
+def _stream_overlay_fix(mut v0: SqlSource, src: SqlSource, vstage: List[Int], vreal: List[Int]):
+    """... and a Frame's session words and merged codes ride on the virtual columns that are its columns."""
+    for v in range(len(vstage)):
+        if vstage[v] >= 0:
+            continue
+        var c = vreal[v]
+        if c < len(src.overlay.words) and len(src.overlay.words[c]) > 0:
+            while len(v0.overlay.words) <= v:
+                v0.overlay.words.append(List[String]())
+            v0.overlay.words[v] = src.overlay.words[c].copy()
+        for item in src.overlay.aliases.items():
+            if Int(item.key >> 32) == c:
+                v0.overlay.aliases[(v << 32) | Int(item.key & 0xFFFFFFFF)] = item.value
+
+
+def _stream_layout(src: SqlSource, vstage: List[Int], vreal: List[Int], key_cols: List[List[Int]], mut used: List[Int], mut pos: List[Int]):
+    """The columns a chunk of the streamed source holds, in order (a scan: the ones the query and the keys read; a table or Frame: all), and where each is."""
+    var ncs = src.table.columns()
+    pos = List[Int](length=ncs, fill=-1)
+    if src.kind == SRC_SCAN:
+        var want = List[Bool](length=ncs, fill=False)
+        for v in range(len(vstage)):
+            if vstage[v] < 0:
+                want[vreal[v]] = True
+        for kc in key_cols:
+            for c in kc:
+                want[c] = True
+        for c in range(ncs):
+            if want[c]:
+                pos[c] = len(used)
+                used.append(c)
+    else:
+        for c in range(ncs):
+            pos[c] = c
+            used.append(c)
 
 
 def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPlan, planner: P, opts: PlannerOptions, trust: Bool, lie: String,
@@ -1291,15 +1356,7 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
             ref bs = left if left_builds else right
             var pw = List[List[String]]()
             var pal = List[List[Int]]()
-            var dact = DictAccess(probe_src.table, probe_src.scan, probe_src.overlay.words)
-            var all_alias = _alias_lists(probe_src)
-            for c in probe_keys_src:
-                var ws = List[String]()
-                if probe_src.table.kind(c) == TEXT:
-                    for code in range(dact.count(c)):
-                        ws.append(dact.word(c, code))
-                pw.append(ws^)
-                pal.append(all_alias[c].copy())
+            _probe_words(probe_src, probe_keys_src, pw, pal)
             kplan = make_key_plan(bs.table, probe_src.table, bs.key_cols, probe_keys_src, pw, pal, keys)
         elif left_builds:
             normalize_keys(left.table, right.table, left.key_cols, right.key_cols, keys, opts.threads)
@@ -1378,47 +1435,17 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
         for c in right.cols:
             vstage.append(-1 if defer_probe == 1 else 0)
             vreal_s.append(c)
-        var ncs = probe_src.table.columns()
         var used = List[Int]()
-        var pos = List[Int](length=ncs, fill=-1)
-        if probe_src.kind == SRC_SCAN:
-            var want = List[Bool](length=ncs, fill=False)
-            for v in range(len(vstage)):
-                if vstage[v] < 0:
-                    want[vreal_s[v]] = True
-            for c in probe_keys_src:
-                want[c] = True
-            for c in range(ncs):
-                if want[c]:
-                    pos[c] = len(used)
-                    used.append(c)
-        else:
-            for c in range(ncs):
-                pos[c] = c
-                used.append(c)
+        var pos = List[Int]()
+        var kcs = List[List[Int]]()
+        kcs.append(probe_keys_src.copy())
+        _stream_layout(probe_src, vstage, vreal_s, kcs, used, pos)
         # the virtual schema: the probe's columns (kinds, dictionaries, nullability from the source) then the build side's
         var vt = virtual_schema(left, right, kind == 1)
-        for v in range(len(vstage)):
-            if vstage[v] < 0:
-                var c = vreal_s[v]
-                if probe_src.table.kind(c) == TEXT:
-                    if probe_src.scan:
-                        probe_src.scan.value().dictionary_into(vt, v, c)
-                    else:
-                        vt.share_dictionary(v, probe_src.table, c)
-                vt.cols[v].nulls = _probe_null_count(probe_src, c)
+        _stream_schema_fix(vt, probe_src, vstage, vreal_s)
         cat2.add_table("join", vt^.share())
         cat2.sources[0].fixed_rows = np
-        # a Frame's session words and merges, on the virtual columns that are its columns
-        for v in range(len(vstage)):
-            if vstage[v] >= 0:
-                continue
-            var c = vreal_s[v]
-            if c < len(probe_src.overlay.words) and len(probe_src.overlay.words[c]) > 0 and v < len(cat2.sources[0].overlay.words):
-                cat2.sources[0].overlay.words[v] = probe_src.overlay.words[c].copy()
-            for item in probe_src.overlay.aliases.items():
-                if Int(item.key >> 32) == c:
-                    cat2.sources[0].overlay.aliases[(v << 32) | Int(item.key & 0xFFFFFFFF)] = item.value
+        _stream_overlay_fix(cat2.sources[0], probe_src, vstage, vreal_s)
         _prefill_ranges_stream(cat2.sources[0], jq, bside, vstage, vreal_s)
         var stages = List[StreamStage]()
         stages.append(StreamStage(bside, ArcPointer(m^), kplan^, probe_keys_src.copy()))
@@ -1506,9 +1533,11 @@ struct _Leaf(Movable):
     var rows: Int
     var base_rows: Int
     var deferred: Bool               # a big plain table whose filter has only been counted: `table` is the unfiltered source (read filtered when it is the last join's probe side)
+    var streamed: Bool               # a scan or a Frame, not read: `table` is its schema; it is read filtered unless it is a probe side, which streams
 
-    def __init__(out self, table: SharedTable, var cols: List[Int], var gcols: List[Int], var gtable: List[Int], rows: Int, base_rows: Int, deferred: Bool = False):
+    def __init__(out self, table: SharedTable, var cols: List[Int], var gcols: List[Int], var gtable: List[Int], rows: Int, base_rows: Int, deferred: Bool = False, streamed: Bool = False):
         self.deferred = deferred
+        self.streamed = streamed
         self.table = table
         self.cols = cols^
         self.gcols = gcols^
@@ -1540,12 +1569,12 @@ def _read_filtered[P: Planner](mut catalog: Catalog, q: BoundQuery, t: Int, mut 
         cols2.append(i)
     var gt = leaves[t].gcols.copy()
     var gc = leaves[t].gcols.copy()
-    leaves[t] = _Leaf(tab, cols2^, gc^, gt^, tab.rows(), leaves[t].base_rows, False)
+    leaves[t] = _Leaf(tab, cols2^, gc^, gt^, tab.rows(), leaves[t].base_rows, False, False)
     res.actuals.append("read " + _label(q, t) + " filtered: " + commas(tab.rows()) + " rows, " + _ms(Float64(perf_counter_ns() - t_m) / 1e6) + " ms")
 
 
 def _copy_leaf(l: _Leaf) -> _Leaf:
-    return _Leaf(l.table, l.cols.copy(), l.gcols.copy(), l.gtable.copy(), l.rows, l.base_rows, l.deferred)
+    return _Leaf(l.table, l.cols.copy(), l.gcols.copy(), l.gtable.copy(), l.rows, l.base_rows, l.deferred, l.streamed)
 
 
 def _build_cluster[P: Planner](q: BoundQuery, leaves: List[_Leaf], js: JoinStats, cluster: List[Int], keep: List[Int], planner: P, opts: PlannerOptions, threads: Int,
@@ -1605,7 +1634,7 @@ def _build_cluster[P: Planner](q: BoundQuery, leaves: List[_Leaf], js: JoinStats
 
 
 def _run_star[P: Planner](q: BoundQuery, leaves: List[_Leaf], js: JoinStats, jp: JoinPlan, s0: Int, before: Int, probe: SharedTable, probe_gt: List[Int], conj0: List[Int],
-                          done: List[Bool], planner: P, opts: PlannerOptions, trust: Bool, lie: String, mut res: SqlResult, mut out: SqlResult) raises -> Bool:
+                          psrc: SqlSource, streamed: Bool, done: List[Bool], planner: P, opts: PlannerOptions, trust: Bool, lie: String, mut res: SqlResult, mut out: SqlResult) raises -> Bool:
     """Steps `s0` to the last as one star: the probe table (the rows joined so far, or a table read unfiltered whose filter `conj0` runs in the pipeline) meets each
     dimension (a table, or a group of tables joined with each other first) through a map built on the dimension's unique keys, all in one pass over the probe rows
     (no joined row is written, no intermediate table). False (nothing changed but notes) when a dimension's keys are not unique or are hashed: the steps run one by one."""
@@ -1622,6 +1651,7 @@ def _run_star[P: Planner](q: BoundQuery, leaves: List[_Leaf], js: JoinStats, jp:
         tail.append(jp.steps[j].leaf)
     var comps = _tail_components(q, tail)
     var stages = List[StageData]()
+    var sstages = List[StreamStage]()
     var dim_tabs = List[SharedTable]()
     var dim_gt = List[List[Int]]()
     var dim_name = List[String]()
@@ -1662,13 +1692,24 @@ def _run_star[P: Planner](q: BoundQuery, leaves: List[_Leaf], js: JoinStats, jp:
                 lkey.append(_position(probe_gt, ga))
                 rkey.append(_position(stage_leaf.gtable, gb))
         var keys = JoinKeys()
-        normalize_keys(stage_leaf.table, probe, rkey, lkey, keys, threads)
+        var kplan = KeyPlan()
+        if streamed:
+            # the probe arrives in chunks: its keys are planned once from the dimension, applied to each chunk
+            var pw = List[List[String]]()
+            var pal = List[List[Int]]()
+            _probe_words(psrc, lkey, pw, pal)
+            kplan = make_key_plan(stage_leaf.table, psrc.table, rkey, lkey, pw, pal, keys)
+        else:
+            normalize_keys(stage_leaf.table, probe, rkey, lkey, keys, threads)
         var m = hj_build(keys.bk_addr, keys.bo_addr, stage_leaf.table.rows(), threads)
-        if keys.verify or not m.unique:
-            res.notes.append("star: " + label + " has " + ("hashed keys" if keys.verify else "repeated keys") + ": the joins run one by one")
+        if keys.verify or kplan.hashed or not m.unique:
+            res.notes.append("star: " + label + " has " + ("hashed keys" if (keys.verify or kplan.hashed) else "repeated keys") + ": the joins run one by one")
             return False
-        res.notes.append("star dimension " + label + ": " + commas(stage_leaf.table.rows()) + " rows, " + m.kind() + ", " + keys.layout)
-        stages.append(StageData(ArcPointer(m^), keys^))
+        res.notes.append("star dimension " + label + ": " + commas(stage_leaf.table.rows()) + " rows, " + m.kind() + ", " + (kplan.layout if streamed else keys.layout))
+        if streamed:
+            sstages.append(StreamStage(stage_leaf.table, ArcPointer(m^), kplan^, lkey.copy()))
+        else:
+            stages.append(StageData(ArcPointer(m^), keys^))
         dim_tabs.append(stage_leaf.table)
         dim_gt.append(stage_leaf.gtable.copy())
         dim_name.append(label)
@@ -1704,19 +1745,42 @@ def _run_star[P: Planner](q: BoundQuery, leaves: List[_Leaf], js: JoinStats, jp:
         colsets.append(dc^)
     var vt = virtual_schema_multi(tabs, colsets)
     var cat2 = Catalog()
+    var psrc_rows = probe.rows()
+    if streamed:
+        _stream_schema_fix(vt, psrc, vstage, vreal)
+        psrc_rows = psrc.rows()
     cat2.add_table("join", vt^.share())
-    cat2.sources[0].fixed_rows = probe.rows()
+    cat2.sources[0].fixed_rows = psrc_rows
+    if streamed:
+        _stream_overlay_fix(cat2.sources[0], psrc, vstage, vreal)
     var jq = star_query(q, vglobal, conj)
-    _prefill_ranges_n(cat2.sources[0], jq, tabs, vtab, vreal)
+    if streamed:
+        var skip = List[Int]()
+        for c in range(len(vtab)):
+            skip.append(0 if vtab[c] == 0 else 1)
+        _prefill_ranges_n(cat2.sources[0], jq, tabs, vtab, vreal, skip)
+    else:
+        _prefill_ranges_n(cat2.sources[0], jq, tabs, vtab, vreal)
     var names = String()
     for si in range(len(dim_name)):
         names += (", " if si > 0 else "") + dim_name[si]
-    res.notes.append("join path: fused: a star: " + commas(probe.rows()) + " probe rows meet " + String(len(dim_name)) + " dimensions (" + names + ") with unique keys in one pass of blocks of 1,024; " +
+    res.notes.append("join path: fused: a star: " + commas(psrc_rows) + " probe rows" + (" (a scan or Frame streamed chunk by chunk, never read into a table)" if streamed else "") + " meet " + String(len(dim_name)) + " dimensions (" + names + ") with unique keys in one pass of blocks of 1,024; " +
                      String(n_dim_cols) + " dimension columns are gathered into per-worker scratch (no joined row and no intermediate table is written)" +
                      (" (the probe table's filter runs in the pipeline)" if len(conj0) > 0 else ""))
-    var fj = ArcPointer(FusedJoin(probe, dim_tabs^, vstage^, vreal^, stages^))
-    out = _run_sql_once(cat2, jq, planner, opts, trust, lie, fj)
-    res.actuals.append("star (" + names + "): " + commas(probe.rows()) + " probe rows, " + _ms(Float64(perf_counter_ns() - t_star) / 1e6) + " ms including the aggregate")
+    if streamed:
+        var used = List[Int]()
+        var pos = List[Int]()
+        var kcs = List[List[Int]]()
+        for st in sstages:
+            kcs.append(st.pcols.copy())
+        _stream_layout(psrc, vstage, vreal, kcs, used, pos)
+        var ps = ArcPointer(ProbeStream(psrc.copy(), used^, pos^, sstages^, 0, True, vstage^, vreal^))
+        var template = ArcPointer(stream_template(ps))
+        out = _run_sql_once(cat2, jq, planner, opts, trust, lie, template)
+    else:
+        var fj = ArcPointer(FusedJoin(probe, dim_tabs^, vstage^, vreal^, stages^))
+        out = _run_sql_once(cat2, jq, planner, opts, trust, lie, fj)
+    res.actuals.append("star (" + names + "): " + commas(psrc_rows) + " probe rows, " + _ms(Float64(perf_counter_ns() - t_star) / 1e6) + " ms including the aggregate")
     return True
 
 
@@ -1790,6 +1854,7 @@ def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPl
         var cols = List[Int]()
         var gtable = List[Int]()
         var is_deferred = False
+        var is_streamed = False
         var counted = -1
         if len(q.leaf_conj[t]) == 0 and plain:
             table = src_table
@@ -1800,6 +1865,17 @@ def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPl
         elif _can_defer(catalog, q, t, opts.fuse and not _any_hol(q)):
             counted = _count_side[P](catalog, q, t, planner, opts, trust)          # its rows are only counted for now
             is_deferred = counted * DEFER_PASS_DEN >= base_rows
+            table = src_table
+            for g in gcols:
+                cols.append(g - start)
+            for c in range(src_table.columns()):
+                gtable.append(start + c)
+        elif _can_stream(catalog, q, t, opts.fuse and not _any_hol(q)):
+            # a scan or a Frame: not read now; it streams if it ends up a probe side, else it is read filtered once the order is known
+            is_deferred = True
+            is_streamed = True
+            counted = catalog.sources[q.sources[t]].rows()
+            base_rows = counted
             table = src_table
             for g in gcols:
                 cols.append(g - start)
@@ -1820,18 +1896,18 @@ def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPl
         js.rows.append(rows)
         res.actuals.append("scan " + _label(q, t) + ": " + commas(base_rows) + " rows, " + commas(rows) + " after " + ("its filter" if len(q.leaf_conj[t]) > 0 else "no filter") +
                            " (" + String(len(gcols)) + " columns kept" + (", counted: its filter may run in the last join's pipeline" if is_deferred else "") + "), " + _ms(Float64(perf_counter_ns() - t_leaf) / 1e6) + " ms")
-        leaves.append(_Leaf(table, cols^, gcols^, gtable^, rows, base_rows, is_deferred))
+        leaves.append(_Leaf(table, cols^, gcols^, gtable^, rows, base_rows, is_deferred, is_streamed))
     var t_ndv = perf_counter_ns()
     for k in range(len(q.edge_a)):
         var ta = table_of_column(q, q.edge_a[k])
         var tb = table_of_column(q, q.edge_b[k])
         js.edge_a.append(ta)
         js.edge_b.append(tb)
-        js.ndv_a.append(column_ndv(leaves[ta].table, leaves[ta].cols[_position(leaves[ta].gcols, q.edge_a[k])], threads))
-        js.ndv_b.append(column_ndv(leaves[tb].table, leaves[tb].cols[_position(leaves[tb].gcols, q.edge_b[k])], threads))
+        js.ndv_a.append(-1 if leaves[ta].streamed else column_ndv(leaves[ta].table, leaves[ta].cols[_position(leaves[ta].gcols, q.edge_a[k])], threads))
+        js.ndv_b.append(-1 if leaves[tb].streamed else column_ndv(leaves[tb].table, leaves[tb].cols[_position(leaves[tb].gcols, q.edge_b[k])], threads))
     for k in range(len(q.edge_a)):
-        res.notes.append("statistics: " + _label(q, js.edge_a[k]) + "." + q.src_name(q.edge_a[k]) + " has " + commas(js.ndv_a[k]) + " distinct values in " + commas(js.rows[js.edge_a[k]]) +
-                         " rows, " + _label(q, js.edge_b[k]) + "." + q.src_name(q.edge_b[k]) + " " + commas(js.ndv_b[k]) + " in " + commas(js.rows[js.edge_b[k]]))
+        res.notes.append("statistics: " + _label(q, js.edge_a[k]) + "." + q.src_name(q.edge_a[k]) + " has " + (commas(js.ndv_a[k]) if js.ndv_a[k] >= 0 else String("an unknown number of")) + " distinct values in " + commas(js.rows[js.edge_a[k]]) +
+                         " rows, " + _label(q, js.edge_b[k]) + "." + q.src_name(q.edge_b[k]) + " " + (commas(js.ndv_b[k]) if js.ndv_b[k] >= 0 else String("an unknown number")) + " in " + commas(js.rows[js.edge_b[k]]))
     res.actuals.append("distinct counts of the join columns: " + _ms(Float64(perf_counter_ns() - t_ndv) / 1e6) + " ms")
     var jp = planner.join_order(js, opts)
     for nt in jp.notes:
@@ -1873,14 +1949,19 @@ def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPl
             var sp_gt = cur_g.copy()
             var sp_conj = List[Int]()
             var sp_conj_text = List[String]()
+            var sp_src = SqlSource("", Table.empty().share())
+            var sp_streamed = False
             if si == 0:
                 sp_table = leaves[jp.start].table
                 sp_gt = leaves[jp.start].gtable.copy()
                 if leaves[jp.start].deferred:
                     sp_conj = q.leaf_conj[jp.start].copy()
                     sp_conj_text = q.leaf_conj_text[jp.start].copy()
+                if leaves[jp.start].streamed:
+                    sp_src = catalog.sources[q.sources[jp.start]].copy()
+                    sp_streamed = True
             var star_out = SqlResult()
-            if _run_star[P](q, leaves, js, jp, si, joined, sp_table, sp_gt, sp_conj, done, planner, opts, trust, lie, res, star_out):
+            if _run_star[P](q, leaves, js, jp, si, joined, sp_table, sp_gt, sp_conj, sp_src, sp_streamed, done, planner, opts, trust, lie, res, star_out):
                 for nt in star_out.notes:
                     res.notes.append(nt)
                 for a in star_out.actuals:
@@ -1967,7 +2048,12 @@ def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPl
     var fq = final_query(q, cur_g, leaves[lf].gtable, cur_table, leaves[lf].table, key_l, key_r, rest, rconj, rtext)
     var cat3 = Catalog()
     cat3.add_table("rows joined so far", cur_table)
-    cat3.add_table(_label(q, lf), leaves[lf].table)
+    if leaves[lf].deferred:
+        var rsrc = catalog.sources[q.sources[lf]].copy()                       # the real source: the last join reads (or streams) it itself
+        rsrc.name = _label(q, lf)
+        cat3.sources.append(rsrc^)
+    else:
+        cat3.add_table(_label(q, lf), leaves[lf].table)
     var o2 = opts.copy()
     o2.build_side = BUILD_RIGHT if last.build_new else BUILD_LEFT
     var lp2 = build_plan(fq, "rows joined so far")
