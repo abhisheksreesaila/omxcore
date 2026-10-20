@@ -201,6 +201,198 @@ def _merge_hashed(mut acc: Partial, other: Partial, ops: List[Int], mut ix: _Key
         acc.counts[found] += other.counts[o]
 
 
+comptime MERGE_PART_BITS = 8                  # 256 partitions: each is merged by one worker, with no sharing and no locks
+
+
+struct _PartData(Movable):
+    """One partition of a streamed hashed aggregate's groups: their slots, counts and key words, and the table that finds a group by its key words."""
+    var slots: List[List[Int]]
+    var counts: List[Int]
+    var kw: List[List[Int64]]
+    var hashes: List[UInt64]
+    var table: List[Int32]
+    var mask: Int
+
+    def __init__(out self, n_slots: Int, nkw: Int):
+        self.slots = List[List[Int]]()
+        for _ in range(n_slots):
+            self.slots.append(List[Int]())
+        self.counts = List[Int]()
+        self.kw = List[List[Int64]]()
+        for _ in range(nkw):
+            self.kw.append(List[Int64]())
+        self.hashes = List[UInt64]()
+        self.table = List[Int32](length=16, fill=-1)
+        self.mask = 15
+
+    def grow(mut self):
+        var cap = len(self.table) * 2
+        self.table = List[Int32](length=cap, fill=-1)
+        self.mask = cap - 1
+        for g in range(len(self.counts)):
+            var pos = Int(self.hashes[g]) & self.mask
+            while self.table[pos] >= 0:
+                pos = (pos + 1) & self.mask
+            self.table[pos] = Int32(g)
+
+    def fold(mut self, other: Partial, o: Int, h: UInt64, ops: List[Int]) -> Bool:
+        """Folds group `o` of `other` (hash `h`) into this partition; False when an integer total passes int64."""
+        if 2 * (len(self.counts) + 1) > len(self.table):
+            self.grow()
+        var pos = Int(h) & self.mask
+        var found = -1
+        while self.table[pos] >= 0:
+            var g = Int(self.table[pos])
+            if self.hashes[g] == h:
+                var same = True
+                for k in range(len(self.kw)):
+                    if self.kw[k][g] != other.kw[k][o]:
+                        same = False
+                        break
+                if same:
+                    found = g
+                    break
+            pos = (pos + 1) & self.mask
+        if found < 0:
+            found = len(self.counts)
+            for sl in range(len(self.slots)):
+                self.slots[sl].append(other.slots[sl][o])
+            self.counts.append(other.counts[o])
+            for k in range(len(self.kw)):
+                self.kw[k].append(other.kw[k][o])
+            self.hashes.append(h)
+            self.table[pos] = Int32(found)
+            return True
+        for sl in range(len(self.slots)):
+            var a = self.slots[sl][found]
+            var b = other.slots[sl][o]
+            if ops[sl] >= A_FSUM:
+                self.slots[sl][found] = fold_float(ops[sl], a, b)
+            elif ops[sl] == A_MIN:
+                self.slots[sl][found] = min(a, b)
+            elif ops[sl] == A_MAX:
+                self.slots[sl][found] = max(a, b)
+            else:
+                var x = Int64(a)
+                var y = Int64(b)
+                var t = x + y
+                if ((x ^ t) & (y ^ t)) < 0:
+                    return False
+                self.slots[sl][found] = Int(t)
+        self.counts[found] += other.counts[o]
+        return True
+
+
+struct PartAcc(Movable):
+    """The groups of a streamed hashed aggregate (a scan's row groups, a frame's base and delta), merged as each chunk's partial arrives: the first partial is
+    kept whole, from the second on the groups live in 256 hash partitions and a partial's groups are routed by their hash and folded by the workers, one
+    partition each (no sharing, no locks), so the merge costs the chunk's groups over the workers, not a serial pass over a growing table. Integer totals are
+    exact (a total past int64 raises); the groups come back partition by partition."""
+    var first: Partial
+    var batches: Int
+    var parts: List[_PartData]
+    var n_slots: Int
+    var nkw: Int
+
+    def __init__(out self):
+        self.first = Partial()
+        self.batches = 0
+        self.parts = List[_PartData]()
+        self.n_slots = 0
+        self.nkw = 0
+
+    def _route(mut self, batch: Partial, ops: List[Int], threads: Int) raises:
+        var og = batch.groups()
+        if og == 0:
+            return
+        var np = 1 << MERGE_PART_BITS
+        var hashes = List[UInt64](length=og, fill=0)
+        var hp = hashes.unsafe_ptr()
+        var T = max(1, min(threads if threads > 0 else core_count(), og // 32768 + 1))
+
+        def hash_range(t: Int) {imm}:
+            for o in range(og * t // T, og * (t + 1) // T):
+                hp[o] = _hash_group(batch.kw, o)
+
+        par_n(hash_range, T, T)
+        var start = List[Int](length=np + 1, fill=0)
+        for o in range(og):
+            start[Int(hashes[o] >> UInt64(64 - MERGE_PART_BITS)) + 1] += 1
+        for p in range(np):
+            start[p + 1] += start[p]
+        var fill = List[Int](length=np, fill=0)
+        var order = List[Int32](length=og, fill=0)
+        for o in range(og):
+            var p = Int(hashes[o] >> UInt64(64 - MERGE_PART_BITS))
+            order[start[p] + fill[p]] = Int32(o)
+            fill[p] += 1
+        var bad = List[Int](length=1, fill=0)
+        var badp = bad.unsafe_ptr()
+        var pp = self.parts.unsafe_ptr()
+        var op = order.unsafe_ptr()
+        var sp = start.unsafe_ptr()
+        var W = max(1, min(threads if threads > 0 else core_count(), np))
+        var next = List[Int](length=1, fill=0)
+        var nextp = next.unsafe_ptr()
+
+        def fold_parts(w: Int) {imm}:
+            for p in range(w, np, W):
+                for i in range(sp[p], sp[p + 1]):
+                    var o = Int(op[i])
+                    if not pp[p].fold(batch, o, hp[o], ops):
+                        badp[0] = 1
+                        return
+
+        par_n(fold_parts, W, W)
+        if bad[0] != 0:
+            raise Error(OVERFLOW_MESSAGE)
+
+    def add(mut self, var batch: Partial, ops: List[Int], threads: Int) raises:
+        if batch.groups() == 0:
+            return
+        if self.batches == 0:
+            self.n_slots = len(batch.slots)
+            self.nkw = len(batch.kw)
+            self.first = batch^
+            self.batches = 1
+            return
+        if self.batches == 1:
+            for _ in range(1 << MERGE_PART_BITS):
+                self.parts.append(_PartData(self.n_slots, self.nkw))
+            var f = self.first^
+            self.first = Partial()
+            self._route(f, ops, threads)
+        self._route(batch, ops, threads)
+        self.batches += 1
+
+    def finish(mut self) -> Partial:
+        if self.batches <= 1:
+            var f = self.first^
+            self.first = Partial()
+            return f^
+        var out = Partial()
+        var total = 0
+        for p in range(len(self.parts)):
+            total += len(self.parts[p].counts)
+        for sl in range(self.n_slots):
+            var col = List[Int]()
+            col.reserve(total)
+            for p in range(len(self.parts)):
+                col.extend(self.parts[p].slots[sl].copy())
+            out.slots.append(col^)
+        out.counts.reserve(total)
+        for p in range(len(self.parts)):
+            out.counts.extend(self.parts[p].counts.copy())
+        for k in range(self.nkw):
+            var col = List[Int64]()
+            col.reserve(total)
+            for p in range(len(self.parts)):
+                col.extend(self.parts[p].kw[k].copy())
+            out.kw.append(col^)
+        self.parts = List[_PartData]()
+        return out^
+
+
 def _hashed_result(run: KernelRun, res_r: Int, n_slots: Int, nkw: Int) -> Partial:
     """The groups hash_aggregate found, from the addresses it left in the run's result region (the run is a parameter: alive here)."""
     var res = run.i64(res_r)
@@ -436,7 +628,7 @@ def _run_dense_fused(t: SharedTable, sp: SqlProgram, mask_addr: Int, threads: In
 
 
 def _fold(sp: SqlProgram, plan: PhysicalPlan, chunk: SharedTable, mask_addr: Int, mut hs: HolStates, ops: List[Int], threads: Int,
-          mut acc: Partial, mut dense_acc: QueryResult, mut ix: _KeyIndex, fj: Optional[ArcPointer[FusedJoin]], job: JobCtl = JobCtl()) raises:
+          mut pacc: PartAcc, mut dense_acc: QueryResult, fj: Optional[ArcPointer[FusedJoin]], job: JobCtl = JobCtl()) raises:
     """Runs the program over one chunk and folds its partial result into the accumulator. `job` (F-175) moves by the chunk's rows."""
     var n = chunk.rows()
     var exact = job.active() and not sp.p.repro
@@ -450,11 +642,11 @@ def _fold(sp: SqlProgram, plan: PhysicalPlan, chunk: SharedTable, mask_addr: Int
             while at < n:
                 job.check()
                 var end = min(n, at + step)
-                _merge_hashed(acc, _run_hashed(chunk, sp, mask_addr, plan.key_words(), threads, fj, at, end - at), ops, ix)
+                pacc.add(_run_hashed(chunk, sp, mask_addr, plan.key_words(), threads, fj, at, end - at), ops, threads)
                 job.advance(end - at)
                 at = end
             return
-        _merge_hashed(acc, _run_hashed(chunk, sp, mask_addr, plan.key_words(), threads, fj), ops, ix)
+        pacc.add(_run_hashed(chunk, sp, mask_addr, plan.key_words(), threads, fj), ops, threads)
         job.advance(n)
         return
     var r: QueryResult
@@ -665,7 +857,7 @@ def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
              HolStates(1, List[HolSpec](), List[List[Int64]]())
     var domain = sp.p.groups                                      # (a dense plan with a footer-stated range has one extra, for rows outside it)
     var acc = Partial()
-    var ix = _KeyIndex()
+    var pacc = PartAcc()
     var dense_acc = _identity_partial(sp.p.n_slots, domain, ops)
     var ch = _open_chunks(src, used)
     if fj:
@@ -682,7 +874,7 @@ def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
         if trust:
             _check_footer(src, ch, i, chunk)
         ns_load += perf_counter_ns() - t_load
-        _fold(sp, plan, chunk, ch.mask_addr, hs, ops, threads, acc, dense_acc, ix, fj, opts.job)
+        _fold(sp, plan, chunk, ch.mask_addr, hs, ops, threads, pacc, dense_acc, fj, opts.job)
     if sp.guard_slot >= 0 and dense_acc.counts[sp.guard_slot] > 0:
         raise Error(LIE + String(dense_acc.counts[sp.guard_slot]) + (" row lies" if dense_acc.counts[sp.guard_slot] == 1 else " rows lie") +
                     " outside the range of a group key that the footer gave")
@@ -697,7 +889,9 @@ def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
                      ((", + " + commas(delta_rows) + " changed or appended rows") if delta_rows > 0 else ""))
     else:
         notes.append("ran: table " + src.name + ": 1 chunk of " + commas(src.table.rows()) + " rows")
-    if plan.group != G_HASHED:
+    if plan.group == G_HASHED:
+        acc = pacc.finish()
+    else:
         acc.slots = dense_acc.slots.copy()
         acc.counts = dense_acc.counts.copy()
     var hres = HolResult()
