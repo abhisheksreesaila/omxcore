@@ -51,3 +51,10 @@
   3M groups decline to the CPU on AUTO with a reason).
 - Light NVIDIA A/B on GPU 0 (1M orders, 15 runs, median ms, base 3a33697 vs new): 0.171/0.170, 0.248/0.248,
   0.165/0.164, 0.112/0.112; a second round equal within noise (one 0.27 vs 0.25 with the Apple-shape suite loading the box).
+
+## Review round 2: PASS (2026-10-25)
+- Follow-ups done: a mode-5 test (5000 sparse groups, min / max / sum / count of negative values vs the CPU) passes on
+  NVIDIA and under Apple's plan; test_gpu_plan asserts Apple's plan reaches modes 0, 4, 5 and narrow blocks, never 1 / 2;
+  a comment pins the Python path as CUDA-only.
+- The Linux-built `omxcore.mojoc` gives Metal kernels when the *app* builds for macOS with a Metal accelerator (7
+  kernels, Int64 word, no double / atomics), and none for a triple-only cross-build: the switches resolve at app build.

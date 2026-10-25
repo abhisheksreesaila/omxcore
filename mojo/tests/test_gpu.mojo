@@ -489,6 +489,26 @@ def test_an_empty_table() raises:
     dt.release()
 
 
+def test_many_groups_min_max_negative_and_sparse() raises:
+    """Mode 5 on Apple's plan (5000 groups, past mode 4's table): min / max of negative values, sparse groups (most
+    keys never appear, some only through a filter), counts, equal to the CPU. On NVIDIA the atomic modes answer."""
+    var t = Table.empty()
+    var k = t.add_column("k", INT)
+    var v = t.add_column("v", INT)
+    var rng = Rng(11)
+    for i in range(300_000):
+        t.append(k, Int64(rng.int(0, 1999) * 2 + (1 if i % 97 == 0 else 0)))     # even keys, a few odd ones
+        t.append(v, Int64(rng.int(-5_000_000_000, 5_000_000_000)))
+    var s = t^.share()
+    var dt = DeviceTable(s)
+    var g = Query(s).on_device(dt).where(col("v") < 4_000_000_000).group_by(col("k"), groups=5000).agg(
+        min_of(col("v")), max_of(col("v")), sum(col("v")), count()).compute(GPU)
+    var c = Query(s).where(col("v") < 4_000_000_000).group_by(col("k"), groups=5000).agg(
+        min_of(col("v")), max_of(col("v")), sum(col("v")), count()).compute(CPU)
+    same(g, c, "5000 sparse groups: min / max / sum / count of negative values")
+    dt.release()
+
+
 def main() raises:
     if not gpu_available():
         print("skipped: no GPU")
@@ -498,6 +518,7 @@ def main() raises:
     test_keys_past_int32_and_negative_are_left_out()
     test_values_past_int32_and_2_53()
     test_two_million_rows_use_the_multi_block_modes()
+    test_many_groups_min_max_negative_and_sparse()
     test_overflow_raises_the_same_error()
     test_a_frames_edits_without_re_uploading()
     test_release_frees_the_device_memory()

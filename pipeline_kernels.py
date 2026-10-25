@@ -553,6 +553,7 @@ def run_pipeline_gpu(program: PipelineProgram, columns: Union[Sequence[np.ndarra
         out_cnt = take("out_cnt", n_groups * 8)
         repro = reproducible if reproducible is not None else _reproducible_now()
         ns = (n_slots + 1) * n_groups
+        # (CUDA only: the Python path never runs on an Apple GPU, whose mode 5 would need scratch_rows' sizing)
         block_rows = ns if ns <= 48 or (repro and ns <= REPRO_MAX_NS) else 0
         scratch = take("scratch", max(max_blocks * block_rows * 8, 8))
         ovf = take("ovf", 8)                       # the kernel sets it when an integer sum passes int64 (F-060)

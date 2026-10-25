@@ -17,6 +17,8 @@ def test_plans_fit_and_scratch_covers_the_grid() raises:
     var rows: List[Int] = [1, 1000, 1_000_000, 50_000_000]
     var plans = 0
     var declined = 0
+    var modes = List[Int](length=6, fill=0)
+    var narrows = 0
     for groups in [1, 2, 5, 7, 41, 300, 2000, 5000, 100_000, 3_000_000]:
         for slots in [0, 1, 3, 6, 12]:
             for regs in [2, 6, 12, 23, 40]:
@@ -26,7 +28,10 @@ def test_plans_fit_and_scratch_covers_the_grid() raises:
                     declined += 1
                     continue
                 plans += 1
+                modes[mode] += 1
                 var narrow = _narrow(mode, groups, slots, regs, code_ints)
+                if narrow:
+                    narrows += 1
                 var what = "groups " + String(groups) + " slots " + String(slots) + " regs " + String(regs) + " mode " + String(mode)
                 expect(_smem_bytes(mode, groups, slots, regs, code_ints, narrow) <= SMEM_LIMIT, "shared memory fits: " + what)
                 comptime if APPLE_GPU:
@@ -39,6 +44,10 @@ def test_plans_fit_and_scratch_covers_the_grid() raises:
                         if mode == 0 or mode == 3 or mode == 4 or mode == 5:
                             expect(b <= sr, "scratch has a row per block (" + String(b) + " > " + String(sr) + "): " + what)
     expect(plans > 0, "some plans")
+    expect(narrows > 0, "some plans use narrow blocks")
+    comptime if APPLE_GPU:
+        expect(modes[5] > 0 and modes[4] > 0 and modes[0] > 0, "Apple's plan reaches modes 0, 4 and 5")
+        expect(modes[1] == 0 and modes[2] == 0, "and never an atomic mode")
     print("ok", plans, "plans", declined, "declined", "apple" if APPLE_GPU else "")
 
 
