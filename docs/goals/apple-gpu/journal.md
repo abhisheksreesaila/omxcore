@@ -12,3 +12,27 @@
 - The pipeline kernel: modes 1 and 2 use 64-bit atomics; 0, 3 and 4 write per-block rows merged in block order.
 - Open premise (the riskiest): the engine passes device addresses as integers and reads column addresses out of a
   buffer. On Metal that needs every buffer resident and its GPU address valid in the kernel. First probe on the runner.
+
+## Run 1 on macos-26 (run 40171201386, c1fe1ea)
+- `PROBE DEVICE: Apple Paravirtual device · metal` (Apple M1 (Virtual), macOS 26.6.2). Every premise **wrong**: an
+  integer-address write left 1023 of 1024 slots untouched; shared memory, int64 maths and shuffles wrong too. All
+  of those passed buffers as Int64 addresses (`unsafe_ptr()` cast to an integer); omxcode's probe, which passes
+  typed pointers, gave `RESULT: ok` on the same runner. Hypothesis: on Metal `DeviceBuffer.unsafe_ptr()` on the host
+  is not the address the kernel sees (MAX translates typed pointer arguments when it binds them), and/or a buffer used
+  only through an address is not resident. Probe v2 separates the two.
+
+## Run 2 (40171534745, ae3afeb)
+- typed-pointer write ok; the host's `unsafe_ptr()` is the address the kernel sees (`same`, unified memory);
+  shared memory 16 / 32 KB, int64 maths and 32-lane shuffles ok.
+- Every pointer made from an integer wrong, even of a buffer bound as an argument (`typed-roundtrip`), so not
+  residency: in AIR `Pointer(unsafe_from_address=)` is a generic `ptr`, which Metal reads as thread-private memory;
+  device memory is `ptr addrspace(1)`. Fix: kernels make such pointers with `address_space=KAS`, GLOBAL when
+  `is_apple_gpu()` (a module-level alias resolves per kernel target: AIR `ptr addrspace(1)`, NVIDIA PTX unchanged).
+- `ENGINE AVAILABLE: False`: the runner's virtual M1 is not `is_apple_silicon()`; HAS_GPU now keys on
+  `is_macos() and has_apple_gpu_accelerator()` (D-07 revised).
+- Kernel word: `pipeline_kernel[RPT, B, W]`, `_run_int` beside the untouched float64 `_run`; atomic modes compiled for
+  float64 only; the NVIDIA merge kernel kept verbatim as its own function (a parameterised merge laid its loop out
+  differently in PTX). NVIDIA PTX fingerprint = baseline 3bbe74fdd7263978 (6 kernels). Metal AIR: no double, no
+  atomicrmw, no asm. Remaining generic `load ptr` in AIR are stack slots (the shuffle's), which is fine.
+- NVIDIA: mojo-test gpu / gpu_scan / query / holistic_query / kernels_from_package ok; pytest -k "gpu or pipeline"
+  9879 passed.

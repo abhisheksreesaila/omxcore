@@ -48,7 +48,8 @@ def report():
 
 def m1(text):
     dev = re.search(r"^PROBE DEVICE: (.+ · metal)$", text, re.M)
-    want = ["int-address", "address-in-buffer", "shared-16kb", "shared-32kb", "int64-maths", "shuffle-32"]
+    want = ["typed-write", "int-address", "address-in-buffer", "learned-address-not-arg", "shared-16kb", "shared-32kb",
+            "int64-maths", "shuffle-32"]
     bad = [w for w in want if not re.search(rf"^PROBE {w}: ok$", text, re.M)]
     if dev and not bad:
         return True, dev.group(1)

@@ -26,11 +26,11 @@ Why it looks like this:
 """
 from std.memory import ArcPointer
 from std.memory.alloc import unsafe_alloc
-from std.sys import is_defined, CompilationTarget
+from std.sys import is_defined, CompilationTarget, has_apple_gpu_accelerator
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from .table import SharedTable
 
-comptime HAS_GPU = (CompilationTarget.is_linux() or CompilationTarget.is_apple_silicon()) and not is_defined["MXFRAME_NO_GPU"]()
+comptime HAS_GPU = (CompilationTarget.is_linux() or (CompilationTarget.is_macos() and has_apple_gpu_accelerator())) and not is_defined["MXFRAME_NO_GPU"]()
 comptime NO_GPU_MESSAGE = "no GPU on this build"
 
 

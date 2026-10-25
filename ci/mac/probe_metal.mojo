@@ -8,13 +8,20 @@
 # also has controls: `typed-*` lines pass buffers as typed pointers (as MAX's own kernels do), `gpu-address` prints
 # the address the kernel sees beside the host's `unsafe_ptr()`, and `learned-*` lines use the kernel's own view of an
 # address (learned by a first kernel) for a buffer that is, or is not, also an argument (residency).
+# Run 2 (40171534745): typed pointers fine and the host's address is the kernel's; every pointer made from an integer
+# wrong, even of a bound buffer: in AIR it is a generic `ptr`, and Metal's device memory is `ptr addrspace(1)`. So the
+# premises now use `KP`, the address space omxcore's kernels use (GLOBAL on an Apple GPU, generic elsewhere);
+# `generic-*` lines keep the plain-pointer result as evidence.
 from std.memory import Pointer, bitcast
+from std.sys.info import is_apple_gpu
 from max.gpu import thread_idx, block_idx, barrier
 from max.gpu.host import DeviceContext, DeviceBuffer
 from max.gpu.memory import AddressSpace, external_memory
 from max.gpu.primitives.warp import shuffle_down
 
-comptime LP = Pointer[Int64, MutUntrackedOrigin]
+comptime GP = Pointer[Int64, MutUntrackedOrigin]                       # a plain (generic) pointer
+comptime KAS = AddressSpace.GLOBAL if is_apple_gpu() else AddressSpace.GENERIC
+comptime LP = Pointer[Int64, MutUntrackedOrigin, address_space=KAS]    # as kernels_aot/pipeline_gpu.mojo makes them
 comptime N = 1024
 comptime TP = UnsafePointer[Int64, MutAnyOrigin]
 
@@ -47,6 +54,11 @@ def k_addr_with(p: TP, addr: Int64):
 def k_roundtrip(p: TP):
     var i = Int(block_idx.x) * 256 + Int(thread_idx.x)
     LP(unsafe_from_address=Int(p))[i] = Int64(i) * 7
+
+
+def k_generic(addr: Int64):
+    var i = Int(block_idx.x) * 256 + Int(thread_idx.x)
+    GP(unsafe_from_address=Int(addr))[i] = Int64(i) * 3
 
 
 def k_table(table: TP, anchor: TP):
@@ -132,6 +144,11 @@ def main() raises:
     var host_b = Int64(Int(b.unsafe_ptr()))
     print("PROBE gpu-address:", "same" if seen[0] == host_a and seen[1] == host_b else "differs",
           "(host", hex(host_a), hex(host_b), "kernel", hex(seen[0]), hex(seen[1]), ")")
+
+    # 0. a plain pointer made from the integer (wrong on Metal: generic address space)
+    ctx.enqueue_memset(a, 0)
+    ctx.enqueue_function[k_generic](host_a, grid_dim=N // 256, block_dim=256)
+    _say("generic-int-address", _count_bad(_back(ctx, a, N), 3, 0), N)
 
     # 1. an integer address (the host's unsafe_ptr), alone
     ctx.enqueue_memset(a, 0)

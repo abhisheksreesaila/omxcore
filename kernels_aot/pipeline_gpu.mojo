@@ -32,7 +32,11 @@ Aggregation modes (chosen from the slot and group counts):
   and 3 finish with a second kernel that merges the per-block rows of `scratch`
   in block order, so their results are deterministic.
 
-All arithmetic is float64 (columns are widened on load). Device pointers are
+All arithmetic is float64 (columns are widened on load) on NVIDIA. On an Apple GPU (Metal: no double, no general
+64-bit atomics; F-183, F-184) the kernels are instantiated with an Int64 word instead (`WORD`, chosen at compile time
+for the build's GPU): the integer programs of the Mojo API run unchanged on it (int registers, 0 / 1 booleans, counts
+and int64 totals), a float instruction sets the overflow flag (the host never sends one: `int_word_program_ok`), and
+only the atomic-free modes 0, 3 and 4 run (more groups than mode 4 holds return -6). Device pointers are
 passed as integers; the Python side owns device memory (CUDA driver API on the
 primary context, like AOTKernelsGPU), so already-resident morsels are accepted
 without another copy.
@@ -48,8 +52,16 @@ from max.gpu import thread_idx, block_idx, grid_dim, barrier
 from max.gpu.primitives.warp import shuffle_down
 from max.gpu.memory import AddressSpace, external_memory
 from std.memory import Pointer, stack_allocation, bitcast
+from std.sys import has_apple_gpu_accelerator
+from std.sys.info import is_apple_gpu
 
 comptime F64 = DType.float64
+# Host side only (never read inside a kernel, which is compiled for the GPU target): is the accelerator this build
+# compiles its kernels for an Apple GPU (a native Apple Silicon build, or `--target-accelerator metal:<n>`)? The
+# kernels take their word as a parameter, `WORD`, and plans are sized to `SMEM_LIMIT`.
+comptime APPLE_GPU = has_apple_gpu_accelerator()
+comptime WORD = DType.int64 if APPLE_GPU else F64
+comptime SMEM_LIMIT: Int = (32 if APPLE_GPU else 48) * 1024     # dynamic shared memory per block: Apple 32 KB, NVIDIA 48 KB
 comptime BLOCK: Int = 256
 comptime SMALL: Int = 48            # per-thread accumulators (mode 0)
 comptime HDR: Int = 16
@@ -100,12 +112,19 @@ comptime OP_AGG_IMIN = 54       # min / max of an "int" register in int64 (F-060
 comptime OP_AGG_IMAX = 55
 
 comptime SH = AddressSpace.SHARED
+# Device memory reached through an address passed as an integer: on an Apple GPU a pointer made from an integer must
+# be in the device (GLOBAL) address space, since Metal has no generic one (a plain pointer's writes went nowhere on
+# the macos-26 runner, ci/mac/probe_metal.mojo); elsewhere the generic pointer as before. `is_apple_gpu()` is resolved
+# for the target each kernel is compiled for.
+comptime KAS = AddressSpace.GLOBAL if is_apple_gpu() else AddressSpace.GENERIC
 comptime SFP = Pointer[Float64, MutUntrackedOrigin, address_space=SH]
 comptime SIP = Pointer[Int32, MutUntrackedOrigin, address_space=SH]
-comptime FP = Pointer[Float64, MutUntrackedOrigin]
-comptime IP = Pointer[Int32, MutUntrackedOrigin]
-comptime LP = Pointer[Int64, MutUntrackedOrigin]
-comptime BP = Pointer[UInt8, MutUntrackedOrigin]
+comptime FP = Pointer[Float64, MutUntrackedOrigin, address_space=KAS]
+comptime SWP[W: DType] = Pointer[Scalar[W], MutUntrackedOrigin, address_space=SH]
+comptime WP[W: DType] = Pointer[Scalar[W], MutUntrackedOrigin, address_space=KAS]
+comptime IP = Pointer[Int32, MutUntrackedOrigin, address_space=KAS]
+comptime LP = Pointer[Int64, MutUntrackedOrigin, address_space=KAS]
+comptime BP = Pointer[UInt8, MutUntrackedOrigin, address_space=KAS]
 
 
 # ── monotonic atomics ────────────────────────────────────────────────────────
@@ -142,9 +161,9 @@ def _atomic_max_f64[space: AddressSpace](ptr: Pointer[Float64, MutUntrackedOrigi
 
 
 @always_inline
-def _atomic_add_i64(ptr: Pointer[Int64, MutUntrackedOrigin], val: Int64):
+def _atomic_add_i64(ptr: LP, val: Int64):
     var v = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.i64](val)
-    _ = __mlir_op.`llvm.atomicrmw`[bin_op = __mlir_attr.`1 : i64`, ordering = __mlir_attr.`2 : i64`, _type = __mlir_type.i64](_llvm_ptr[AddressSpace.GENERIC, DType.int64](ptr), v)
+    _ = __mlir_op.`llvm.atomicrmw`[bin_op = __mlir_attr.`1 : i64`, ordering = __mlir_attr.`2 : i64`, _type = __mlir_type.i64](_llvm_ptr[KAS, DType.int64](ptr), v)
 
 
 @always_inline
@@ -170,14 +189,20 @@ def _atomic_max_bits[space: AddressSpace](ptr: Pointer[Float64, MutUntrackedOrig
 
 
 @always_inline
-def _i64_of(x: Float64) -> Int64:
-    """The int64 a slot word holds."""
-    return bitcast[DType.int64, 1](SIMD[F64, 1](x))[0]
+def _i64_of[W: DType](x: Scalar[W]) -> Int64:
+    """The int64 a slot word holds (its bits: a float64 word holds int64 bits, an Int64 word is the value)."""
+    comptime if W == F64:
+        return bitcast[DType.int64, 1](SIMD[F64, 1](rebind[Float64](x)))[0]
+    else:
+        return rebind[Int64](x)
 
 
 @always_inline
-def _word_of(x: Int64) -> Float64:
-    return bitcast[F64, 1](SIMD[DType.int64, 1](x))[0]
+def _word_of[W: DType = F64](x: Int64) -> Scalar[W]:
+    comptime if W == F64:
+        return rebind[Scalar[W]](bitcast[F64, 1](SIMD[DType.int64, 1](x))[0])
+    else:
+        return rebind[Scalar[W]](x)
 
 
 @always_inline
@@ -189,29 +214,29 @@ def _note_ovf(a: Int64, b: Int64, ovf: LP):
 
 
 @always_inline
-def _iext_words(kind: Int, a: Float64, b: Float64) -> Float64:
+def _iext_words[W: DType](kind: Int, a: Scalar[W], b: Scalar[W]) -> Scalar[W]:
     """The integer min / max (OP_AGG_IMIN / IMAX) of two slot words that hold int64s, as a slot word."""
     var x = _i64_of(a)
     var y = _i64_of(b)
-    return _word_of(min(x, y) if kind == OP_AGG_IMIN else max(x, y))
+    return _word_of[W](min(x, y) if kind == OP_AGG_IMIN else max(x, y))
 
 
 @always_inline
-def _iadd_words(a: Float64, b: Float64, ovf: LP) -> Float64:
+def _iadd_words[W: DType](a: Scalar[W], b: Scalar[W], ovf: LP) -> Scalar[W]:
     """The sum of two slot words that hold int64s, as a slot word."""
     var x = _i64_of(a)
     var y = _i64_of(b)
     _note_ovf(x, y, ovf)
-    return _word_of(x + y)
+    return _word_of[W](x + y)
 
 
 @always_inline
-def _iadd_value(a: Float64, v: Float64, ovf: LP) -> Float64:
+def _iadd_value[W: DType](a: Scalar[W], v: Scalar[W], ovf: LP) -> Scalar[W]:
     """The slot word `a` (int64 bits) plus `v`, an "int" register's word (int64 bits)."""
     var x = _i64_of(a)
     var y = _i64_of(v)
     _note_ovf(x, y, ovf)
-    return _word_of(x + y)
+    return _word_of[W](x + y)
 
 
 @always_inline
@@ -234,6 +259,10 @@ def _fp(addr: Int) -> FP:
     return FP(unsafe_from_address=addr)
 
 @always_inline
+def _wp[W: DType](addr: Int) -> WP[W]:
+    return WP[W](unsafe_from_address=addr)
+
+@always_inline
 def _ip(addr: Int) -> IP:
     return IP(unsafe_from_address=addr)
 
@@ -249,7 +278,7 @@ def _bp(addr: Int) -> BP:
 @always_inline
 def _load(addr: Int, dtype: Int, row: Int) -> Float64:
     if dtype == 2:
-        return Pointer[Float32, MutUntrackedOrigin](unsafe_from_address=addr)[row].cast[F64]()
+        return Pointer[Float32, MutUntrackedOrigin, address_space=KAS](unsafe_from_address=addr)[row].cast[F64]()
     elif dtype == 0:
         return _ip(addr)[row].cast[F64]()
     elif dtype == 3:
@@ -261,24 +290,24 @@ def _load(addr: Int, dtype: Int, row: Int) -> Float64:
 
 
 @always_inline
-def _load_i(addr: Int, dtype: Int, row: Int) -> Float64:
-    """OP_LOADI: the column value widened to int64, as the bits of the register's float64 word."""
+def _load_i[W: DType = F64](addr: Int, dtype: Int, row: Int) -> Scalar[W]:
+    """OP_LOADI: the column value widened to int64, as the bits of the register's word."""
     if dtype == 0:
-        return _word_of(_ip(addr)[row].cast[DType.int64]())
+        return _word_of[W](_ip(addr)[row].cast[DType.int64]())
     elif dtype == 4:
-        return _word_of(_bp(addr)[row].cast[DType.int64]())
-    return _word_of(_lp(addr)[row])                  # 1: int64, 8: int64 read only here (exact past 2^53)
+        return _word_of[W](_bp(addr)[row].cast[DType.int64]())
+    return _word_of[W](_lp(addr)[row])               # 1: int64, 8: int64 read only here (exact past 2^53)
 
 
 @always_inline
-def _b(x: Bool) -> Float64:
-    return 1.0 if x else 0.0
+def _b[W: DType = F64](x: Bool) -> Scalar[W]:
+    return Scalar[W](1) if x else Scalar[W](0)
 
 
 @always_inline
-def _nz(x: Float64) -> Bool:
-    """x != 0 for the 0.0 / 1.0 booleans, by integer test (float64 compares are 1/64 rate on GeForce)."""
-    return bitcast[DType.int64, 1](SIMD[F64, 1](x))[0] != 0
+def _nz[W: DType](x: Scalar[W]) -> Bool:
+    """x != 0 for the 0 / 1 booleans, by integer test (float64 compares are 1/64 rate on GeForce)."""
+    return _i64_of(x) != 0
 
 
 @always_inline
@@ -332,7 +361,7 @@ def _cmp_i(cmp: Int, x: Int64, t: Int64) -> Bool:
 def _cmpc(addr: Int, dtype: Int, row: Int, thr: Float64, cmp: Int, na: Bool) -> Float64:
     """column[row] <cmp> thr in the column's own type (thr was rounded on the host)."""
     if dtype == 2:
-        var x = Pointer[Float32, MutUntrackedOrigin](unsafe_from_address=addr)[row]
+        var x = Pointer[Float32, MutUntrackedOrigin, address_space=KAS](unsafe_from_address=addr)[row]
         return _b(_cmp_f(cmp, x, thr.cast[DType.float32](), na))
     elif dtype == 0:
         return _b(_cmp_i(cmp, _ip(addr)[row].cast[DType.int64](), Int64(thr)))
@@ -344,16 +373,16 @@ def _cmpc(addr: Int, dtype: Int, row: Int, thr: Float64, cmp: Int, na: Bool) -> 
 
 
 @always_inline
-def _shfl_down(v: Float64, off: Int) -> Float64:
-    """Float64 warp shuffle as two 32-bit shuffles (the stdlib has no f64 shuffle)."""
-    var bits = bitcast[DType.uint32, 2](SIMD[F64, 1](v))
+def _shfl_down[W: DType](v: Scalar[W], off: Int) -> Scalar[W]:
+    """A 64-bit word's warp shuffle as two 32-bit shuffles (the stdlib has no 64-bit shuffle)."""
+    var bits = bitcast[DType.uint32, 2](SIMD[W, 1](v))
     var lo = shuffle_down(SIMD[DType.uint32, 1](bits[0]), UInt32(off))
     var hi = shuffle_down(SIMD[DType.uint32, 1](bits[1]), UInt32(off))
-    return bitcast[F64, 1](SIMD[DType.uint32, 2](lo[0], hi[0]))[0]
+    return bitcast[W, 1](SIMD[DType.uint32, 2](lo[0], hi[0]))[0]
 
 
 @always_inline
-def _combine(kind: Int, a: Float64, b: Float64, ovf: LP) -> Float64:
+def _combine[W: DType](kind: Int, a: Scalar[W], b: Scalar[W], ovf: LP) -> Scalar[W]:
     if kind == OP_AGG_MIN:
         return min(a, b)
     elif kind == OP_AGG_MAX:
@@ -366,7 +395,7 @@ def _combine(kind: Int, a: Float64, b: Float64, ovf: LP) -> Float64:
 
 
 @always_inline
-def _warp_reduce(kind: Int, v: Float64, ovf: LP) -> Float64:
+def _warp_reduce[W: DType](kind: Int, v: Scalar[W], ovf: LP) -> Scalar[W]:
     var x = v
     var off = 16
     while off > 0:
@@ -376,16 +405,23 @@ def _warp_reduce(kind: Int, v: Float64, ovf: LP) -> Float64:
 
 
 @always_inline
-def _ident(kind: Int) -> Float64:
-    if kind == OP_AGG_MIN:
-        return Float64.MAX
-    elif kind == OP_AGG_MAX:
-        return -Float64.MAX
-    elif kind == OP_AGG_IMIN:
-        return _word_of(Int64.MAX)
-    elif kind == OP_AGG_IMAX:
-        return _word_of(Int64.MIN)
-    return 0.0
+def _ident[W: DType](kind: Int) -> Scalar[W]:
+    comptime if W == F64:
+        if kind == OP_AGG_MIN:
+            return rebind[Scalar[W]](Float64.MAX)
+        elif kind == OP_AGG_MAX:
+            return rebind[Scalar[W]](-Float64.MAX)
+        elif kind == OP_AGG_IMIN:
+            return _word_of[W](Int64.MAX)
+        elif kind == OP_AGG_IMAX:
+            return _word_of[W](Int64.MIN)
+        return Scalar[W](0)
+    else:
+        if kind == OP_AGG_IMIN:
+            return _word_of[W](Int64.MAX)
+        elif kind == OP_AGG_IMAX:
+            return _word_of[W](Int64.MIN)
+        return Scalar[W](0)
 
 
 def _run[RPT: Int, B: Int](
@@ -571,14 +607,161 @@ def _run[RPT: Int, B: Int](
                         d[k * B] = _b(_cmp_i(cmp, x, y))
 
 
+comptime SLP = Pointer[Int64, MutUntrackedOrigin, address_space=SH]
+
+
+def _run_int[RPT: Int, B: Int](
+    code: SIP, base: Int, count: Int, regs: SLP, consts: SLP, cols: LP, dts: IP, tid: Int, row_base: Int, mask: Int,
+    ovf: LP,
+):
+    """`_run` on an Int64 word (Apple's GPU, F-183): the integer instructions of the Mojo API's programs, with the same
+    results and overflow rules; booleans are 0 / 1. A float instruction (the host never sends one, see
+    `int_word_program_ok`) sets the overflow flag instead of computing."""
+    comptime TILE = B * RPT
+    for n in range(count):
+        var ins = code + (HDR + (base + n) * 5)
+        var op = Int(ins[0])
+        var d = regs + Int(ins[1]) * TILE + tid
+        if op == OP_LOADI:
+            var c = Int(ins[2])
+            var addr = Int(cols[c])
+            var dt = Int(dts[c])
+            comptime for k in range(RPT):
+                if (mask >> k) & 1 != 0:
+                    d[k * B] = _load_i[DType.int64](addr, dt, row_base + tid + k * B)
+        elif op == OP_LOAD_CONST:
+            var v = consts[Int(ins[2])]
+            comptime for k in range(RPT):
+                d[k * B] = v
+        elif op == OP_IADD or op == OP_ISUB or op == OP_IMUL:
+            var a = regs + Int(ins[2]) * TILE + tid
+            var b = regs + Int(ins[3]) * TILE + tid
+            comptime for k in range(RPT):
+                if (mask >> k) & 1 != 0:
+                    var x = a[k * B]
+                    var y = b[k * B]
+                    var r = x + y
+                    if op == OP_ISUB:
+                        r = x - y
+                        if ((x ^ y) & (x ^ r)) < 0:
+                            ovf[0] = 1
+                    elif op == OP_IMUL:
+                        r = x * y
+                        if _imul_ovf(x, y):
+                            ovf[0] = 1
+                    elif ((x ^ r) & (y ^ r)) < 0:
+                        ovf[0] = 1
+                    d[k * B] = r
+        elif op == OP_F2I:                               # a 0 / 1 boolean as the number: already one
+            var a = regs + Int(ins[2]) * TILE + tid
+            comptime for k in range(RPT):
+                if (mask >> k) & 1 != 0:
+                    d[k * B] = a[k * B]
+        elif op == OP_AND or op == OP_OR:
+            var a = regs + Int(ins[2]) * TILE + tid
+            var b = regs + Int(ins[3]) * TILE + tid
+            comptime for k in range(RPT):
+                if (mask >> k) & 1 != 0:
+                    var x = a[k * B] != 0
+                    var y = b[k * B] != 0
+                    d[k * B] = Int64(1) if (x and y if op == OP_AND else x or y) else Int64(0)
+        elif op == OP_NOT:
+            var a = regs + Int(ins[2]) * TILE + tid
+            comptime for k in range(RPT):
+                if (mask >> k) & 1 != 0:
+                    d[k * B] = Int64(1) if a[k * B] == 0 else Int64(0)
+        elif op == OP_SELECT:
+            var c = regs + Int(ins[2]) * TILE + tid
+            var a = regs + Int(ins[3]) * TILE + tid
+            var b = regs + Int(ins[4]) * TILE + tid
+            comptime for k in range(RPT):
+                if (mask >> k) & 1 != 0:
+                    d[k * B] = a[k * B] if c[k * B] != 0 else b[k * B]
+        elif op == OP_ISNULL:
+            var slot = Int(dts[Int(ins[2])]) >> 8              # dtype 7 | (slot << 8): bitmap address, bit base
+            var valid = _bp(Int(cols[slot]))
+            var has = Int(cols[slot]) != 0
+            var bit_base = Int(cols[slot + 1])
+            comptime for k in range(RPT):
+                if (mask >> k) & 1 != 0:
+                    var null = Int64(0)
+                    if has:
+                        var bit = bit_base + row_base + tid + k * B
+                        if ((Int(valid[bit >> 3]) >> (bit & 7)) & 1) == 0:
+                            null = 1
+                    d[k * B] = null
+        elif op >= OP_IDIV and op <= OP_ICMP:
+            var a = regs + Int(ins[2]) * TILE + tid
+            var b = regs + Int(ins[3]) * TILE + tid
+            var cmp = Int(ins[4])
+            comptime for k in range(RPT):
+                if (mask >> k) & 1 != 0:
+                    var x = a[k * B]
+                    var y = b[k * B]
+                    if op == OP_IDIV:
+                        var q = Int64(0)
+                        if y == -1 and x == Int64.MIN:
+                            ovf[0] = 1
+                            q = x
+                        elif y != 0:
+                            q = x // y
+                        d[k * B] = q
+                    elif op == OP_IMOD:
+                        d[k * B] = 0 if y == 0 or y == -1 else x % y
+                    elif op == OP_IMIN:
+                        d[k * B] = min(x, y)
+                    elif op == OP_IMAX:
+                        d[k * B] = max(x, y)
+                    else:
+                        d[k * B] = Int64(1) if _cmp_i(cmp, x, y) else Int64(0)
+        else:
+            ovf[0] = 1                                   # a float instruction: not on an Int64 word
+
+
 @always_inline
-def _key_group(word: Float64, groups: Int) -> Int:
+def _run_w[RPT: Int, B: Int, W: DType](
+    code: SIP, base: Int, count: Int, regs: SWP[W], consts: SWP[W], cols: LP, dts: IP,
+    set_bytes: BP, set_meta: LP, tid: Int, row_base: Int, mask: Int, ovf: LP,
+):
+    """The interpreter for the kernel's word: `_run` (float64, NVIDIA) or `_run_int` (Int64, Apple)."""
+    comptime if W == F64:
+        _run[RPT, B](code, base, count, rebind[SFP](regs), rebind[SFP](consts), cols, dts, set_bytes, set_meta, tid,
+                     row_base, mask, ovf)
+    else:
+        _run_int[RPT, B](code, base, count, rebind[SLP](regs), rebind[SLP](consts), cols, dts, tid, row_base, mask, ovf)
+
+
+comptime INT_WORD_OPS: List[Int] = [OP_LOAD_CONST, OP_LOADI, OP_IADD, OP_ISUB, OP_IMUL, OP_F2I, OP_AND, OP_OR, OP_NOT,
+                                    OP_SELECT, OP_ISNULL, OP_IDIV, OP_IMOD, OP_IMIN, OP_IMAX, OP_ICMP]
+
+
+def int_word_program_ok(code: List[Int32], n_ins: Int, agg_base: Int) -> Bool:
+    """Can an Int64-word kernel (Apple's GPU) run this program? Its first `agg_base` instructions (after the header)
+    must be integer ones, and its aggregates integer sums, mins and maxes. The Mojo API sends float programs to the
+    CPU before this (`Program.has_float`); this is the check at the kernel's door."""
+    for i in range(n_ins):
+        var op = Int(code[HDR + i * 5])
+        if i >= agg_base:
+            if op != OP_AGG_ISUM and op != OP_AGG_IMIN and op != OP_AGG_IMAX:
+                return False
+            continue
+        var ok = False
+        for o in materialize[INT_WORD_OPS]():
+            if op == o:
+                ok = True
+        if not ok:
+            return False
+    return True
+
+
+@always_inline
+def _key_group[W: DType](word: Scalar[W], groups: Int) -> Int:
     """Keyed mode: register 0 holds the row's group key as int64 bits; a key outside 0 .. groups-1 leaves the row out."""
     var v = _i64_of(word)
     return Int(v) if v >= 0 and v < Int64(groups) else -1
 
 
-def pipeline_kernel[RPT: Int, B: Int](
+def pipeline_kernel[RPT: Int, B: Int, W: DType](
     code_a_i64: Int64, consts_a_i64: Int64, set_bytes_a_i64: Int64, set_meta_a_i64: Int64,
     cols_a_i64: Int64, dtypes_a_i64: Int64, gids_a_i64: Int64, n_groups_i64: Int64, n_slots_i64: Int64,
     row0_i64: Int64, row_end_i64: Int64, out_vals_a_i64: Int64, out_cnt_a_i64: Int64, scratch_a_i64: Int64,
@@ -609,7 +792,7 @@ def pipeline_kernel[RPT: Int, B: Int](
     var A = n_slots
 
     # dynamic shared memory: [register file | constants | warp partials | program]
-    var smem = external_memory[Scalar[F64], address_space=SH, alignment=16]()
+    var smem = external_memory[Scalar[W], address_space=SH, alignment=16]()
     var regs = smem
     var consts = smem + n_regs * TILE
     var wpart = consts + MAX_CONSTS
@@ -625,7 +808,7 @@ def pipeline_kernel[RPT: Int, B: Int](
         i += B
     i = tid
     while i < MAX_CONSTS:
-        consts[i] = _fp(consts_a)[i]
+        consts[i] = _wp[W](consts_a)[i]
         i += B
     barrier()
 
@@ -641,32 +824,32 @@ def pipeline_kernel[RPT: Int, B: Int](
     var keyed = gids_a == -1                     # keyed mode (F-137): the group id comes from register 0 of the body
     var gids = _ip(gids_a) if not keyed else _ip(0)
     var has_gids = gids_a != 0 and not keyed
-    var out_vals = _fp(out_vals_a)
+    var out_vals = _wp[W](out_vals_a)
     var out_cnt = _lp(out_cnt_a)
 
     var all_rows = (1 << RPT) - 1
-    _run[RPT, B](code, 0, n_pro, regs, consts, cols, dts, set_bytes, set_meta, tid, 0, all_rows, ovf)
+    _run_w[RPT, B, W](code, 0, n_pro, regs, consts, cols, dts, set_bytes, set_meta, tid, 0, all_rows, ovf)
 
-    var acc = stack_allocation[SMALL, Scalar[F64]]()
+    var acc = stack_allocation[SMALL, Scalar[W]]()
     var ns = (A + 1) * G
     if mode == 0:
         for a in range(A):
-            var init = _ident(Int(code[HDR + (agg_base + a) * 5]))
+            var init = _ident[W](Int(code[HDR + (agg_base + a) * 5]))
             for g in range(G):
                 acc[a * G + g] = init
         for g in range(G):
-            acc[A * G + g] = 0.0
+            acc[A * G + g] = 0
     elif mode == 3:
         for a in range(A):
-            var init = _ident(Int(code[HDR + (agg_base + a) * 5]))
+            var init = _ident[W](Int(code[HDR + (agg_base + a) * 5]))
             for g in range(G):
                 accs[(a * G + g) * B + tid] = init
         for g in range(G):
-            accs[(A * G + g) * B + tid] = 0.0
+            accs[(A * G + g) * B + tid] = 0
     elif mode == 1 or mode == 4:
         var j = tid
         while j < ns:
-            accs[j] = _ident(Int(code[HDR + (agg_base + j // G) * 5])) if j < A * G else 0.0
+            accs[j] = _ident[W](Int(code[HDR + (agg_base + j // G) * 5])) if j < A * G else 0
             j += B
         barrier()
 
@@ -681,7 +864,7 @@ def pipeline_kernel[RPT: Int, B: Int](
                 valid |= 1 << k
         var active = valid
         if pred_reg >= 0:
-            _run[RPT, B](code, n_pro, n_pred, regs, consts, cols, dts, set_bytes, set_meta,
+            _run_w[RPT, B, W](code, n_pro, n_pred, regs, consts, cols, dts, set_bytes, set_meta,
                       tid, row_base, valid, ovf)
             active = 0
             comptime for k in range(RPT):
@@ -691,7 +874,7 @@ def pipeline_kernel[RPT: Int, B: Int](
             comptime for k in range(RPT):
                 tg[tid + k * B] = -1
         if active != 0:
-            _run[RPT, B](code, n_pro + n_pred, n_body, regs, consts, cols, dts, set_bytes,
+            _run_w[RPT, B, W](code, n_pro + n_pred, n_body, regs, consts, cols, dts, set_bytes,
                       set_meta, tid, row_base, active, ovf)
             if mode == 4:
                 comptime for k in range(RPT):
@@ -712,7 +895,7 @@ def pipeline_kernel[RPT: Int, B: Int](
                         g = Int(gids[row_base + tid + k * B])
                     if g >= 0 and g < G:
                         if mode == 0:
-                            acc[A * G + g] += 1.0
+                            acc[A * G + g] += 1
                             for a in range(A):
                                 var ins = code + (HDR + (agg_base + a) * 5)
                                 var kind = Int(ins[0])
@@ -729,7 +912,7 @@ def pipeline_kernel[RPT: Int, B: Int](
                                 else:
                                     acc[q] = max(acc[q], v)
                         elif mode == 3:
-                            accs[(A * G + g) * B + tid] += 1.0
+                            accs[(A * G + g) * B + tid] += 1
                             for a in range(A):
                                 var ins = code + (HDR + (agg_base + a) * 5)
                                 var kind = Int(ins[0])
@@ -745,46 +928,50 @@ def pipeline_kernel[RPT: Int, B: Int](
                                     p[0] = min(p[0], v)
                                 else:
                                     p[0] = max(p[0], v)
-                        elif mode == 1:
-                            _atomic_add_f64(accs + (A * G + g), 1.0)
-                            for a in range(A):
-                                var ins = code + (HDR + (agg_base + a) * 5)
-                                var kind = Int(ins[0])
-                                var v = regs[Int(ins[2]) * TILE + tid + k * B]
-                                var p = accs + (a * G + g)
-                                if kind == OP_AGG_SUM:
-                                    _atomic_add_f64(p, v)
-                                elif kind == OP_AGG_ISUM:
-                                    var yv = _i64_of(v)
-                                    _note_ovf(_atomic_add_bits(p, yv), yv, ovf)
-                                elif kind == OP_AGG_IMIN:
-                                    _atomic_min_bits(p, _i64_of(v))
-                                elif kind == OP_AGG_IMAX:
-                                    _atomic_max_bits(p, _i64_of(v))
-                                elif kind == OP_AGG_MIN:
-                                    _atomic_min_f64(p, v)
-                                else:
-                                    _atomic_max_f64(p, v)
                         else:
-                            _atomic_add_i64(out_cnt + g, Int64(1))
-                            for a in range(A):
-                                var ins = code + (HDR + (agg_base + a) * 5)
-                                var kind = Int(ins[0])
-                                var v = regs[Int(ins[2]) * TILE + tid + k * B]
-                                var p = out_vals + (a * G + g)
-                                if kind == OP_AGG_SUM:
-                                    _atomic_add_f64(p, v)
-                                elif kind == OP_AGG_ISUM:
-                                    var yv = _i64_of(v)
-                                    _note_ovf(_atomic_add_bits(p, yv), yv, ovf)
-                                elif kind == OP_AGG_IMIN:
-                                    _atomic_min_bits(p, _i64_of(v))
-                                elif kind == OP_AGG_IMAX:
-                                    _atomic_max_bits(p, _i64_of(v))
-                                elif kind == OP_AGG_MIN:
-                                    _atomic_min_f64(p, v)
+                            comptime if W == F64:
+                                var faccs = rebind[SFP](accs)
+                                var fvals = rebind[FP](out_vals)
+                                if mode == 1:
+                                    _atomic_add_f64(faccs + (A * G + g), 1.0)
+                                    for a in range(A):
+                                        var ins = code + (HDR + (agg_base + a) * 5)
+                                        var kind = Int(ins[0])
+                                        var v = rebind[Float64](regs[Int(ins[2]) * TILE + tid + k * B])
+                                        var p = faccs + (a * G + g)
+                                        if kind == OP_AGG_SUM:
+                                            _atomic_add_f64(p, v)
+                                        elif kind == OP_AGG_ISUM:
+                                            var yv = _i64_of(v)
+                                            _note_ovf(_atomic_add_bits(p, yv), yv, ovf)
+                                        elif kind == OP_AGG_IMIN:
+                                            _atomic_min_bits(p, _i64_of(v))
+                                        elif kind == OP_AGG_IMAX:
+                                            _atomic_max_bits(p, _i64_of(v))
+                                        elif kind == OP_AGG_MIN:
+                                            _atomic_min_f64(p, v)
+                                        else:
+                                            _atomic_max_f64(p, v)
                                 else:
-                                    _atomic_max_f64(p, v)
+                                    _atomic_add_i64(out_cnt + g, Int64(1))
+                                    for a in range(A):
+                                        var ins = code + (HDR + (agg_base + a) * 5)
+                                        var kind = Int(ins[0])
+                                        var v = rebind[Float64](regs[Int(ins[2]) * TILE + tid + k * B])
+                                        var p = fvals + (a * G + g)
+                                        if kind == OP_AGG_SUM:
+                                            _atomic_add_f64(p, v)
+                                        elif kind == OP_AGG_ISUM:
+                                            var yv = _i64_of(v)
+                                            _note_ovf(_atomic_add_bits(p, yv), yv, ovf)
+                                        elif kind == OP_AGG_IMIN:
+                                            _atomic_min_bits(p, _i64_of(v))
+                                        elif kind == OP_AGG_IMAX:
+                                            _atomic_max_bits(p, _i64_of(v))
+                                        elif kind == OP_AGG_MIN:
+                                            _atomic_min_f64(p, v)
+                                        else:
+                                            _atomic_max_f64(p, v)
         if mode == 4:
             # the owner of group g walks this tile's rows in row order (no two threads add to one slot)
             barrier()
@@ -792,7 +979,7 @@ def pipeline_kernel[RPT: Int, B: Int](
             while g < G:
                 for r in range(TILE):
                     if Int(tg[r]) == g:
-                        accs[A * G + g] += 1.0
+                        accs[A * G + g] += 1
                         for a in range(A):
                             var ins = code + (HDR + (agg_base + a) * 5)
                             var kind = Int(ins[0])
@@ -816,7 +1003,7 @@ def pipeline_kernel[RPT: Int, B: Int](
         # the block's table is its row of `scratch`; merge_kernel adds the rows in block order
         var j = tid
         while j < ns:
-            _fp(scratch_a)[Int(block_idx.x) * ns + j] = accs[j]
+            _wp[W](scratch_a)[Int(block_idx.x) * ns + j] = accs[j]
             j += B
     elif mode == 0 or mode == 3:
         # reduce the block's per-thread partials: warp shuffles, then across warps
@@ -837,41 +1024,65 @@ def pipeline_kernel[RPT: Int, B: Int](
             var r = wpart[tid]
             for w in range(1, NWARPS):
                 r = _combine(kind, r, wpart[w * SMALL + tid], ovf)
-            _fp(scratch_a)[Int(block_idx.x) * ns + tid] = r
-    elif mode == 1:
-        barrier()
-        var j = tid
-        while j < ns:
-            var kind = OP_AGG_SUM
-            if j < A * G:
-                kind = Int(code[HDR + (agg_base + j // G) * 5])
-            var v = accs[j]
-            if j >= A * G:
-                if v != 0.0:
-                    _atomic_add_i64(out_cnt + (j - A * G), Int64(v))
-            elif kind == OP_AGG_ISUM:
-                if _i64_of(v) != 0:
-                    var yv = _i64_of(v)
-                    _note_ovf(_atomic_add_bits(out_vals + j, yv), yv, ovf)
-            elif kind == OP_AGG_SUM:
-                if v != 0.0:
-                    _atomic_add_f64(out_vals + j, v)
-            elif kind == OP_AGG_IMIN:
-                if _i64_of(v) != Int64.MAX:
-                    _atomic_min_bits(out_vals + j, _i64_of(v))
-            elif kind == OP_AGG_IMAX:
-                if _i64_of(v) != Int64.MIN:
-                    _atomic_max_bits(out_vals + j, _i64_of(v))
-            elif kind == OP_AGG_MIN:
-                if v != Float64.MAX:
-                    _atomic_min_f64(out_vals + j, v)
-            else:
-                if v != -Float64.MAX:
-                    _atomic_max_f64(out_vals + j, v)
-            j += B
+            _wp[W](scratch_a)[Int(block_idx.x) * ns + tid] = r
+    else:
+        comptime if W == F64:
+            var faccs = rebind[SFP](accs)
+            var fvals = rebind[FP](out_vals)
+            if mode == 1:
+                barrier()
+                var j = tid
+                while j < ns:
+                    var kind = OP_AGG_SUM
+                    if j < A * G:
+                        kind = Int(code[HDR + (agg_base + j // G) * 5])
+                    var v = faccs[j]
+                    if j >= A * G:
+                        if v != 0.0:
+                            _atomic_add_i64(out_cnt + (j - A * G), Int64(v))
+                    elif kind == OP_AGG_ISUM:
+                        if _i64_of(v) != 0:
+                            var yv = _i64_of(v)
+                            _note_ovf(_atomic_add_bits(fvals + j, yv), yv, ovf)
+                    elif kind == OP_AGG_SUM:
+                        if v != 0.0:
+                            _atomic_add_f64(fvals + j, v)
+                    elif kind == OP_AGG_IMIN:
+                        if _i64_of(v) != Int64.MAX:
+                            _atomic_min_bits(fvals + j, _i64_of(v))
+                    elif kind == OP_AGG_IMAX:
+                        if _i64_of(v) != Int64.MIN:
+                            _atomic_max_bits(fvals + j, _i64_of(v))
+                    elif kind == OP_AGG_MIN:
+                        if v != Float64.MAX:
+                            _atomic_min_f64(fvals + j, v)
+                    else:
+                        if v != -Float64.MAX:
+                            _atomic_max_f64(fvals + j, v)
+                    j += B
 
 
-def init_kernel(out_vals_a_i64: Int64, out_cnt_a_i64: Int64, ident_a_i64: Int64, n_groups_i64: Int64, total_i64: Int64):
+@always_inline
+def _combine_f64(kind: Int, a: Float64, b: Float64, ovf: LP) -> Float64:
+    """`_combine` on float64 words exactly as it was before the word became a parameter: NVIDIA's merge kernel uses
+    it so its PTX stays the pinned one (ci/mac/nvidia_ptx.sha)."""
+    if kind == OP_AGG_MIN:
+        return min(a, b)
+    elif kind == OP_AGG_MAX:
+        return max(a, b)
+    elif kind == OP_AGG_ISUM:
+        var x = bitcast[DType.int64, 1](SIMD[F64, 1](a))[0]
+        var y = bitcast[DType.int64, 1](SIMD[F64, 1](b))[0]
+        _note_ovf(x, y, ovf)
+        return bitcast[F64, 1](SIMD[DType.int64, 1](x + y))[0]
+    elif kind == OP_AGG_IMIN or kind == OP_AGG_IMAX:
+        var x = bitcast[DType.int64, 1](SIMD[F64, 1](a))[0]
+        var y = bitcast[DType.int64, 1](SIMD[F64, 1](b))[0]
+        return bitcast[F64, 1](SIMD[DType.int64, 1](min(x, y) if kind == OP_AGG_IMIN else max(x, y)))[0]
+    return a + b
+
+
+def init_kernel[W: DType](out_vals_a_i64: Int64, out_cnt_a_i64: Int64, ident_a_i64: Int64, n_groups_i64: Int64, total_i64: Int64):
     var out_vals_a = Int(out_vals_a_i64)
     var out_cnt_a = Int(out_cnt_a_i64)
     var ident_a = Int(ident_a_i64)
@@ -879,7 +1090,7 @@ def init_kernel(out_vals_a_i64: Int64, out_cnt_a_i64: Int64, ident_a_i64: Int64,
     var total = Int(total_i64)
     var t = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
     if t < total:
-        _fp(out_vals_a)[t] = _fp(ident_a)[t // n_groups]
+        _wp[W](out_vals_a)[t] = _wp[W](ident_a)[t // n_groups]
     if t < n_groups:
         _lp(out_cnt_a)[t] = 0
 
@@ -911,11 +1122,45 @@ def merge_kernel(
         kind = Int(_ip(code_a)[HDR + (agg_base + s // G) * 5])
         r = _fp(ident_a)[s // G]
     for b in range(n_blocks):
-        r = _combine(kind, r, _fp(scratch_a)[b * ns + s], ovf)
+        r = _combine_f64(kind, r, _fp(scratch_a)[b * ns + s], ovf)
     if s < A * G:
         _fp(out_vals_a)[s] = r
     else:
         _lp(out_cnt_a)[s - A * G] = Int64(r)
+
+
+def merge_kernel_int(
+    code_a_i64: Int64, scratch_a_i64: Int64, out_vals_a_i64: Int64, out_cnt_a_i64: Int64, n_blocks_i64: Int64,
+    n_groups_i64: Int64, n_slots_i64: Int64, agg_base_i64: Int64, ident_a_i64: Int64, ovf_a_i64: Int64,
+):
+    var code_a = Int(code_a_i64)
+    var scratch_a = Int(scratch_a_i64)
+    var out_vals_a = Int(out_vals_a_i64)
+    var out_cnt_a = Int(out_cnt_a_i64)
+    var n_blocks = Int(n_blocks_i64)
+    var n_groups = Int(n_groups_i64)
+    var n_slots = Int(n_slots_i64)
+    var agg_base = Int(agg_base_i64)
+    var ident_a = Int(ident_a_i64)
+    var ovf = _lp(Int(ovf_a_i64))
+    """Merge the per-block partials in block order (deterministic)."""
+    var s = Int(block_idx.x) * BLOCK + Int(thread_idx.x)
+    var A = n_slots
+    var G = n_groups
+    var ns = (A + 1) * G
+    if s >= ns:
+        return
+    var kind = OP_AGG_SUM
+    var r = Int64(0)
+    if s < A * G:
+        kind = Int(_ip(code_a)[HDR + (agg_base + s // G) * 5])
+        r = _lp(ident_a)[s // G]
+    for b in range(n_blocks):
+        r = _combine(kind, r, _lp(scratch_a)[b * ns + s], ovf)
+    if s < A * G:
+        _lp(out_vals_a)[s] = r
+    else:
+        _lp(out_cnt_a)[s - A * G] = r
 
 
 def _rows_per_thread(n_regs: Int, n_groups: Int, n_slots: Int) -> Int:
@@ -942,26 +1187,31 @@ def _smem_bytes(mode: Int, n_groups: Int, n_slots: Int, n_regs: Int, code_ints: 
     return smem
 
 
-def _choose_mode(n_groups: Int, n_slots: Int, n_regs: Int, code_ints: Int, repro: Int, allow_narrow: Bool = False) -> Int:
+def _choose_mode(n_groups: Int, n_slots: Int, n_regs: Int, code_ints: Int, repro_asked: Int, allow_narrow: Bool = False) -> Int:
     """The aggregation mode (see the header) a program with these sizes runs in, or -5 (needs more shared
-    memory than a block has) / -6 (reproducible mode and the group table does not fit)."""
+    memory than a block has) / -6 (reproducible mode and the group table does not fit). On an Apple GPU the
+    atomic-free modes only (as if reproducible mode were asked: modes 1 and 2 need 64-bit atomics, which Metal lacks),
+    within its 32 KB of shared memory."""
+    var repro = repro_asked
+    comptime if APPLE_GPU:
+        repro = 1
     var G = n_groups
     var ns = (n_slots + 1) * G
     var mode = 0 if G == 1 and ns <= SMALL else 2
     if G > 1:
         # few groups: per-thread accumulators in shared memory (128-thread blocks); otherwise one shared
         # table of accumulators per block, folded into the output with global atomics, if it fits
-        if ns <= SMALL and _smem_bytes(3, G, n_slots, n_regs, code_ints) <= 48 * 1024:
+        if ns <= SMALL and _smem_bytes(3, G, n_slots, n_regs, code_ints) <= SMEM_LIMIT:
             mode = 3
-        elif _smem_bytes(1, G, n_slots, n_regs, code_ints) <= 48 * 1024:
+        elif _smem_bytes(1, G, n_slots, n_regs, code_ints) <= SMEM_LIMIT:
             mode = 1
     if repro != 0 and (mode == 1 or mode == 2):
         # no atomics: the ordered per-block table (mode 4), if the group count fits in shared memory
-        if ns > REPRO_MAX_NS or _smem_bytes(4, G, n_slots, n_regs, code_ints) > 48 * 1024:
+        if ns > REPRO_MAX_NS or _smem_bytes(4, G, n_slots, n_regs, code_ints) > SMEM_LIMIT:
             return -6
         mode = 4
-    if _smem_bytes(mode, G, n_slots, n_regs, code_ints) > 48 * 1024:
-        if allow_narrow and _smem_bytes(mode, G, n_slots, n_regs, code_ints, True) <= 48 * 1024:
+    if _smem_bytes(mode, G, n_slots, n_regs, code_ints) > SMEM_LIMIT:
+        if allow_narrow and _smem_bytes(mode, G, n_slots, n_regs, code_ints, True) <= SMEM_LIMIT:
             return mode
         return -5
     return mode
@@ -970,8 +1220,8 @@ def _choose_mode(n_groups: Int, n_slots: Int, n_regs: Int, code_ints: Int, repro
 def _narrow(mode: Int, n_groups: Int, n_slots: Int, n_regs: Int, code_ints: Int) -> Bool:
     """The Mojo API's programs keep many registers (a pivot with ten aggregates needs 23): when 256-thread blocks do
     not fit in shared memory, 128-thread blocks (rpt 1) may. Modes 3 and 4 already differ and keep their shape."""
-    return mode != 3 and mode != 4 and _smem_bytes(mode, n_groups, n_slots, n_regs, code_ints) > 48 * 1024 and \
-        _smem_bytes(mode, n_groups, n_slots, n_regs, code_ints, True) <= 48 * 1024
+    return mode != 3 and mode != 4 and _smem_bytes(mode, n_groups, n_slots, n_regs, code_ints) > SMEM_LIMIT and \
+        _smem_bytes(mode, n_groups, n_slots, n_regs, code_ints, True) <= SMEM_LIMIT
 
 
 @export
@@ -1013,36 +1263,41 @@ def run_pipeline_gpu(
     var small = 1 if (mode == 0 or mode == 3 or mode == 4) else 0
     var total = A * G
     if small == 0 or end <= start:
-        ctx.enqueue_function[init_kernel](
+        ctx.enqueue_function[init_kernel[WORD]](
             Int64(out_vals_a), Int64(out_cnt_a), Int64(ident_a), Int64(G), Int64(total),
             grid_dim=ceildiv(max(total, G), BLOCK), block_dim=BLOCK)
     if end > start:
         var blocks = min(ceildiv(end - start, tile), max(n_blocks, 1) * per_sm)
         for _ in range(max(repeat, 1)):
             if bsz == 128 and rpt == 2:
-                ctx.enqueue_function[pipeline_kernel[2, 128]](
+                ctx.enqueue_function[pipeline_kernel[2, 128, WORD]](
                     Int64(code_a), Int64(consts_a), Int64(set_bytes_a), Int64(set_meta_a), Int64(cols_a), Int64(dtypes_a), Int64(gids_a),
                     Int64(G), Int64(A), Int64(start), Int64(end), Int64(out_vals_a), Int64(out_cnt_a), Int64(scratch_a), Int64(n_regs), Int64(code_ints),
                     Int64(mode), Int64(ovf_a), grid_dim=blocks, block_dim=bsz, shared_mem_bytes=smem)
             elif bsz == 128:
-                ctx.enqueue_function[pipeline_kernel[1, 128]](
+                ctx.enqueue_function[pipeline_kernel[1, 128, WORD]](
                     Int64(code_a), Int64(consts_a), Int64(set_bytes_a), Int64(set_meta_a), Int64(cols_a), Int64(dtypes_a), Int64(gids_a),
                     Int64(G), Int64(A), Int64(start), Int64(end), Int64(out_vals_a), Int64(out_cnt_a), Int64(scratch_a), Int64(n_regs), Int64(code_ints),
                     Int64(mode), Int64(ovf_a), grid_dim=blocks, block_dim=bsz, shared_mem_bytes=smem)
             elif rpt == 2:
-                ctx.enqueue_function[pipeline_kernel[2, 256]](
+                ctx.enqueue_function[pipeline_kernel[2, 256, WORD]](
                     Int64(code_a), Int64(consts_a), Int64(set_bytes_a), Int64(set_meta_a), Int64(cols_a), Int64(dtypes_a), Int64(gids_a),
                     Int64(G), Int64(A), Int64(start), Int64(end), Int64(out_vals_a), Int64(out_cnt_a), Int64(scratch_a), Int64(n_regs), Int64(code_ints),
                     Int64(mode), Int64(ovf_a), grid_dim=blocks, block_dim=bsz, shared_mem_bytes=smem)
             else:
-                ctx.enqueue_function[pipeline_kernel[1, 256]](
+                ctx.enqueue_function[pipeline_kernel[1, 256, WORD]](
                     Int64(code_a), Int64(consts_a), Int64(set_bytes_a), Int64(set_meta_a), Int64(cols_a), Int64(dtypes_a), Int64(gids_a),
                     Int64(G), Int64(A), Int64(start), Int64(end), Int64(out_vals_a), Int64(out_cnt_a), Int64(scratch_a), Int64(n_regs), Int64(code_ints),
                     Int64(mode), Int64(ovf_a), grid_dim=blocks, block_dim=bsz, shared_mem_bytes=smem)
         if small != 0:
-            ctx.enqueue_function[merge_kernel](
-                Int64(code_a), Int64(scratch_a), Int64(out_vals_a), Int64(out_cnt_a), Int64(blocks), Int64(G), Int64(A), Int64(agg_base), Int64(ident_a), Int64(ovf_a),
-                grid_dim=ceildiv((A + 1) * G, BLOCK), block_dim=BLOCK)
+            comptime if WORD == F64:
+                ctx.enqueue_function[merge_kernel](
+                    Int64(code_a), Int64(scratch_a), Int64(out_vals_a), Int64(out_cnt_a), Int64(blocks), Int64(G), Int64(A), Int64(agg_base), Int64(ident_a), Int64(ovf_a),
+                    grid_dim=ceildiv((A + 1) * G, BLOCK), block_dim=BLOCK)
+            else:
+                ctx.enqueue_function[merge_kernel_int](
+                    Int64(code_a), Int64(scratch_a), Int64(out_vals_a), Int64(out_cnt_a), Int64(blocks), Int64(G), Int64(A), Int64(agg_base), Int64(ident_a), Int64(ovf_a),
+                    grid_dim=ceildiv((A + 1) * G, BLOCK), block_dim=BLOCK)
     ctx.synchronize()
     return 0
 

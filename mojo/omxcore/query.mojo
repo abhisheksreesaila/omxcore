@@ -35,7 +35,7 @@ from .expr import (Expr, Node, N_COL, N_LIT, N_LITF, N_DIV, N_I2F, N_ADD, N_SUB,
                    N_LT, N_LE, N_GT, N_GE, N_EQ, N_NE, N_AND, N_OR, N_NOT, N_BOOL2INT, N_SCALE_TO)
 from .kernels._fpenv import core_count, par_n
 from .kernels.pipeline_cpu import pipeline_keyed, pipeline_plain, E_OVERFLOW, IP, FP, LP, VEC
-from .kernels.pipeline_gpu import run_pipeline_gpu, _choose_mode
+from .kernels.pipeline_gpu import run_pipeline_gpu, _choose_mode, int_word_program_ok, APPLE_GPU, HDR as GPU_HDR
 from max.gpu.host import DeviceContext, DeviceBuffer
 from .gpu import DeviceTable, HAS_GPU, NO_GPU_MESSAGE, gpu_available, _ScanContext, _scan_context, _stage_load, _stage_data, _stage_valid, _pinned_prepare
 from .holistic import HolStates, HolSpec, HolResult, window_blocks, heap_offer, float_key, A_DISTINCT, A_PCT, A_TOPK, A_MEDIAN
@@ -1744,7 +1744,9 @@ def _run_gpu_cols(ctx: DeviceContext, data_addr: List[Int], valid_addr: List[Int
 
     `strict` (device=GPU) raises on every failure. On AUTO only two things send the query to the CPU, and `fallback`
     says which: the device cannot hold the query's buffers (an allocation failed), or the kernel declined the
-    program (needs more shared memory than a block has: -5). A launch error, an illegal address or an int64 overflow is a bug or an answer: it always raises."""
+    program (needs more shared memory than a block has: -5; on an Apple GPU also more groups than its atomic-free
+    modes hold, -6, or an instruction its Int64 word does not run). A launch error, an illegal address or an int64
+    overflow is a bug or an answer: it always raises."""
     var ins = p.pred.copy()
     ins.extend(p.body.copy())
     ins.extend(p.aggs.copy())
@@ -1761,6 +1763,14 @@ def _run_gpu_cols(ctx: DeviceContext, data_addr: List[Int], valid_addr: List[Int
         consts[k] = Float64(from_bits=UInt64(p.consts[k]))
     var A = p.n_slots
     var G = p.groups
+    var agg_base = (len(p.pred) + len(p.body)) // 5
+    comptime if APPLE_GPU:                               # F-183: the Int64-word kernel runs integer programs only
+        if not int_word_program_ok(code, (len(code) - GPU_HDR) // 5, agg_base):
+            var why = "the Apple GPU kernel runs integer programs only (this one has a float instruction)"
+            if strict:
+                raise Error("device GPU: " + why)
+            fallback = why
+            return None
     var n_blocks = ctx.default_device_info.sm_count
     # the per-block partial rows exist only in the small-group modes (0, 3, 4): at most sm_count x 8 blocks, one row
     # of (slots + 1) x groups each. Many groups run in the atomic modes, which write the output directly.
@@ -1817,19 +1827,21 @@ def _run_gpu_cols(ctx: DeviceContext, data_addr: List[Int], valid_addr: List[Int
     ctx.enqueue_copy(dst_buf=d_ident, src_ptr=ident.unsafe_ptr())
     ctx.enqueue_memset(d_set, 0)
     ctx.enqueue_memset(d_ovf, 0)
-    var agg_base = (len(p.pred) + len(p.body)) // 5
     var rc = run_pipeline_gpu(ctx, Int(d_code.unsafe_ptr()), Int(d_consts.unsafe_ptr()), Int(d_set.unsafe_ptr()),
                               Int(d_set.unsafe_ptr()), Int(d_cols.unsafe_ptr()), Int(d_dt.unsafe_ptr()),
                               -1 if p.keyed else 0, G, A, 0, n_rows, Int(d_vals.unsafe_ptr()),
                               Int(d_cnt.unsafe_ptr()), Int(d_ident.unsafe_ptr()), Int(d_scratch.unsafe_ptr()),
                               n_regs, len(code), agg_base, n_blocks, 1, 0, Int(d_ovf.unsafe_ptr()), True)
     if rc != 0:
-        if not strict and rc == -5:                       # (-6 is the reproducible mode's, which this API never asks for)
+        if not strict and rc == -5:
             fallback = "the GPU kernel declined the program (code -5: it needs more shared memory than a block has)"
             return None                                   # the CPU answers
+        if not strict and rc == -6:                       # (asked for only on an Apple GPU, where atomics are out)
+            fallback = "the GPU kernel declined the program (code -6: more groups than its atomic-free modes hold)"
+            return None
         raise Error("the GPU kernel failed with code " + String(rc) +
                     (" (the query needs more GPU shared memory than a block has: " + String(n_regs) + " registers, " + String(A) + " slots, " + String(G) + " groups)"
-                     if rc == -5 else ""))
+                     if rc == -5 else (" (more groups than the GPU's atomic-free modes hold: " + String(A) + " slots, " + String(G) + " groups)" if rc == -6 else "")))
     var out_vals = List[Float64](length=A * G, fill=0.0)
     var out_cnt = List[Int64](length=G, fill=0)
     var ovf = List[Int64](length=1, fill=0)
