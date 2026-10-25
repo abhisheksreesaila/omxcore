@@ -41,3 +41,13 @@
 - `scripts/check_apple_gpu.py`: M1 premises, M2 Metal AIR clean + NVIDIA PTX = baseline, M3 `ENGINE DEVICE: Apple
   Paravirtual device · metal`, M4 10/10 orders queries on the Apple GPU equal pyarrow, M5 mojo-test 26 ok.
 - Known limit: more than 4096 (slots + 1) x groups decline on an Apple GPU (-6: AUTO answers on the CPU). Next: mode 5.
+
+## Review round 1 (NEEDS WORK) and mode 5 (2026-10-25, worktree f-184-mode5)
+- Mode 5: many groups on the Int64 word, mode 4's ordered walk with the block's table in its device-memory scratch
+  row, group g owned by thread g % B. Narrow blocks are 64 threads on Apple (NARROW_B), so a 44-aggregate pivot runs.
+- Keeping NVIDIA's PTX byte-identical needed *additive* comptime blocks: wrapping an existing `if mode == 4:` in
+  `comptime if W == F64:` (or `x and helper()` that folds to True) swapped two predicate registers in two kernels.
+- `test_gpu` under `-D OMXCORE_APPLE_GPU_SHAPE`: ok (two cases Apple-aware: 44 aggregates now fit and equal the CPU;
+  3M groups decline to the CPU on AUTO with a reason).
+- Light NVIDIA A/B on GPU 0 (1M orders, 15 runs, median ms, base 3a33697 vs new): 0.171/0.170, 0.248/0.248,
+  0.165/0.164, 0.112/0.112; a second round equal within noise (one 0.27 vs 0.25 with the Apple-shape suite loading the box).

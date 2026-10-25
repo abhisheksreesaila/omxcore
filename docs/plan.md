@@ -1736,7 +1736,7 @@ Owner: GPU **on by default** on Apple Silicon (unified memory: the GPU comes fre
 - [ ] the run's report is an artifact `scripts/check_apple_gpu.py` reads
 
 ## F-182 The GPU on the Mac: `HAS_GPU` on macOS, `gpu_device()` names it [todo]
-- [ ] `gpu_available()` true on Apple Silicon when MAX sees a GPU; `gpu_device()` returns "<name> · <api>" ("Apple M4 · metal"); `QueryResult.device_name` says where a query ran
+- [ ] `gpu_available()` true on Apple Silicon when MAX sees a GPU; `gpu_device()` returns "<name> · <api>" ("Apple M4 · metal"); with `QueryResult.device` that says where a query ran (no `device_name` field: D-08)
 
 ## F-183 The pipeline kernel's word on Apple: Int64, chosen at compile time (NVIDIA keeps Float64) [todo]
 - [ ] the kernel compiles for `metal:1` with no `double` in its AIR; NVIDIA's PTX unchanged; a float program never reaches an Apple GPU (it declines to the CPU)

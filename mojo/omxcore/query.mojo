@@ -35,7 +35,7 @@ from .expr import (Expr, Node, N_COL, N_LIT, N_LITF, N_DIV, N_I2F, N_ADD, N_SUB,
                    N_LT, N_LE, N_GT, N_GE, N_EQ, N_NE, N_AND, N_OR, N_NOT, N_BOOL2INT, N_SCALE_TO)
 from .kernels._fpenv import core_count, par_n
 from .kernels.pipeline_cpu import pipeline_keyed, pipeline_plain, E_OVERFLOW, IP, FP, LP, VEC
-from .kernels.pipeline_gpu import run_pipeline_gpu, _choose_mode, int_word_program_ok, APPLE_GPU, HDR as GPU_HDR
+from .kernels.pipeline_gpu import run_pipeline_gpu, _choose_mode, scratch_rows, int_word_program_ok, APPLE_GPU, HDR as GPU_HDR
 from max.gpu.host import DeviceContext, DeviceBuffer
 from .gpu import DeviceTable, HAS_GPU, NO_GPU_MESSAGE, gpu_available, _ScanContext, _scan_context, _stage_load, _stage_data, _stage_valid, _pinned_prepare
 from .holistic import HolStates, HolSpec, HolResult, window_blocks, heap_offer, float_key, A_DISTINCT, A_PCT, A_TOPK, A_MEDIAN
@@ -1766,16 +1766,16 @@ def _run_gpu_cols(ctx: DeviceContext, data_addr: List[Int], valid_addr: List[Int
     var agg_base = (len(p.pred) + len(p.body)) // 5
     comptime if APPLE_GPU:                               # F-183: the Int64-word kernel runs integer programs only
         if not int_word_program_ok(code, (len(code) - GPU_HDR) // 5, agg_base):
-            var why = "the Apple GPU kernel runs integer programs only (this one has a float instruction)"
+            var why = "the Apple GPU kernel runs integer programs only (this one has an instruction its Int64 word does not run)"
             if strict:
                 raise Error("device GPU: " + why)
             fallback = why
             return None
-    var n_blocks = ctx.default_device_info.sm_count
-    # the per-block partial rows exist only in the small-group modes (0, 3, 4): at most sm_count x 8 blocks, one row
-    # of (slots + 1) x groups each. Many groups run in the atomic modes, which write the output directly.
+    var n_blocks = max(ctx.default_device_info.sm_count, 1)
+    # the per-block partial rows exist only in the modes that merge them (0, 3, 4, and 5 on an Apple GPU): one row of
+    # (slots + 1) x groups per block the launch may use (`scratch_rows`). The atomic modes write the output directly.
     var mode = _choose_mode(G, A, n_regs, len(code), 0, True)
-    var scratch_words = n_blocks * 8 * (A + 1) * G if mode == 0 or mode == 3 or mode == 4 else 1
+    var scratch_words = max(scratch_rows(mode, G, A, n_blocks) * (A + 1) * G, 1)
     var made = Optional[_QueryBuffers](None)
     try:
         made = _QueryBuffers(ctx, len(code), max(len(p.cols), 1), max(len(p.dtypes), 1), A, G, scratch_words, len(mask))
@@ -1837,11 +1837,11 @@ def _run_gpu_cols(ctx: DeviceContext, data_addr: List[Int], valid_addr: List[Int
             fallback = "the GPU kernel declined the program (code -5: it needs more shared memory than a block has)"
             return None                                   # the CPU answers
         if not strict and rc == -6:                       # (asked for only on an Apple GPU, where atomics are out)
-            fallback = "the GPU kernel declined the program (code -6: more groups than its atomic-free modes hold)"
+            fallback = "the GPU kernel declined the program (code -6: its groups or registers do not fit the atomic-free modes)"
             return None
         raise Error("the GPU kernel failed with code " + String(rc) +
                     (" (the query needs more GPU shared memory than a block has: " + String(n_regs) + " registers, " + String(A) + " slots, " + String(G) + " groups)"
-                     if rc == -5 else (" (more groups than the GPU's atomic-free modes hold: " + String(A) + " slots, " + String(G) + " groups)" if rc == -6 else "")))
+                     if rc == -5 else (" (the query's groups or registers do not fit the GPU's atomic-free modes: " + String(n_regs) + " registers, " + String(A) + " slots, " + String(G) + " groups)" if rc == -6 else "")))
     var out_vals = List[Float64](length=A * G, fill=0.0)
     var out_cnt = List[Int64](length=G, fill=0)
     var ovf = List[Int64](length=1, fill=0)

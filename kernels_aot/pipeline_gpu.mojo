@@ -20,6 +20,10 @@ Aggregation modes (chosen from the slot and group counts):
     shared memory, updates it with shared float64 atomics, and adds the table to
     the output once per block with global atomics.
   * 2, many groups: per-row float64 atomics (add / min / max) into the output.
+  * 5, many groups on an Int64 word (Apple's GPU, F-184): mode 4's ordered walk with the block's table in its row
+    of `scratch` in device memory instead of shared memory, and group g owned by thread g % B (each slot is read and
+    written by one thread only, so no device-memory barrier is needed). For more groups than mode 4 holds; up to
+    MANY_MAX_NS slots, in at most MANY_SCRATCH_WORDS // ns blocks (`scratch_rows`).
   * 4, reproducible mode (F-067) replaces modes 1 and 2 when the table fits shared memory: no atomics.
     Per tile, every row's group id is written to shared memory; after a barrier the thread that owns a
     group (group g belongs to thread g % BLOCK) walks the tile's rows in row order and adds the matching
@@ -59,8 +63,9 @@ comptime F64 = DType.float64
 # Host side only (never read inside a kernel, which is compiled for the GPU target): is the accelerator this build
 # compiles its kernels for an Apple GPU (a native Apple Silicon build, or `--target-accelerator metal:<n>`)? The
 # kernels take their word as a parameter, `WORD`, and plans are sized to `SMEM_LIMIT`.
-# `-D OMXCORE_APPLE_GPU_SHAPE` gives any GPU Apple's plan (the Int64 word, the atomic-free modes, 32 KB), so the
-# Apple path is tested on an NVIDIA card too (mojo/tests, scripts/check_apple_gpu.py); never set in a release build.
+# `-D OMXCORE_APPLE_GPU_SHAPE` gives any GPU Apple's plan (the Int64 word, the atomic-free modes, 32 KB, 64-thread
+# narrow blocks), so the Apple path is tested on an NVIDIA card too: scripts/check_apple_gpu.py's M6 runs the GPU
+# Mojo suites and the orders check with it. Never set in a release build.
 comptime APPLE_GPU = has_apple_gpu_accelerator() or is_defined["OMXCORE_APPLE_GPU_SHAPE"]()
 comptime WORD = DType.int64 if APPLE_GPU else F64
 comptime SMEM_LIMIT: Int = (32 if APPLE_GPU else 48) * 1024     # dynamic shared memory per block: Apple 32 KB, NVIDIA 48 KB
@@ -71,6 +76,9 @@ comptime MAX_CONSTS: Int = 64
 comptime WARPS: Int = BLOCK // 32
 comptime LIM53 = Int64(1) << 53         # an int64 value outside +-2^53 is not exact as a double
 comptime REPRO_MAX_NS: Int = 4096   # most (slots + 1) * groups the ordered mode holds (pipeline_kernels.REPRO_MAX_NS)
+comptime MANY_MAX_NS: Int = 1 << 20          # mode 5: most (slots + 1) * groups (more: the CPU answers)
+comptime MANY_SCRATCH_WORDS: Int = 1 << 24   # mode 5: device words for the blocks' tables (128 MB); fewer blocks above
+comptime NARROW_B: Int = 64 if APPLE_GPU else 128   # threads of a narrow block: half (NVIDIA) or a quarter (Apple's 32 KB) of BLOCK
 
 comptime OP_LOAD_COL = 1
 comptime OP_LOAD_CONST = 2
@@ -803,6 +811,9 @@ def pipeline_kernel[RPT: Int, B: Int, W: DType](
     var tg = (accs + acc_words).bitcast[Int32]()      # mode 4: this tile's group id per row (-1: not counted)
     if mode == 4:
         acc_words += TILE // 2
+    comptime if W != F64:
+        if mode == 5:
+            acc_words += TILE // 2
     var code = (accs + acc_words).bitcast[Int32]()
     var i = tid
     while i < code_ints:
@@ -855,6 +866,16 @@ def pipeline_kernel[RPT: Int, B: Int, W: DType](
             j += B
         barrier()
 
+    comptime if W != F64:
+        if mode == 5:                            # the block's table in device memory, each group by its owner
+            var row = _lp(scratch_a) + Int(block_idx.x) * ns
+            var g = tid
+            while g < G:
+                for a in range(A):
+                    row[a * G + g] = _i64_of(_ident[W](Int(code[HDR + (agg_base + a) * 5])))
+                row[A * G + g] = 0
+                g += B
+
     var n_tiles = ceildiv(row_end - row0, TILE)
     var tile = Int(block_idx.x)
     var step = Int(grid_dim.x)
@@ -875,6 +896,10 @@ def pipeline_kernel[RPT: Int, B: Int, W: DType](
         if mode == 4:
             comptime for k in range(RPT):
                 tg[tid + k * B] = -1
+        comptime if W != F64:
+            if mode == 5:
+                comptime for k in range(RPT):
+                    tg[tid + k * B] = -1
         if active != 0:
             _run_w[RPT, B, W](code, n_pro + n_pred, n_body, regs, consts, cols, dts, set_bytes,
                       set_meta, tid, row_base, active, ovf)
@@ -888,8 +913,19 @@ def pipeline_kernel[RPT: Int, B: Int, W: DType](
                             g = Int(gids[row_base + tid + k * B])
                         if g >= 0 and g < G:
                             tg[tid + k * B] = Int32(g)
+            comptime if W != F64:
+                if mode == 5:
+                    comptime for k in range(RPT):
+                        if (active >> k) & 1 != 0:
+                            var g = 0
+                            if keyed:
+                                g = _key_group(regs[tid + k * B], G)
+                            elif has_gids:
+                                g = Int(gids[row_base + tid + k * B])
+                            if g >= 0 and g < G:
+                                tg[tid + k * B] = Int32(g)
             comptime for k in range(RPT):
-                if (active >> k) & 1 != 0 and mode != 4:
+                if (active >> k) & 1 != 0 and mode != 4:   # (mode 5 on the Int64 word lands in the atomic modes' branch, empty there)
                     var g = 0
                     if keyed:
                         g = _key_group(regs[tid + k * B], G)
@@ -999,6 +1035,28 @@ def pipeline_kernel[RPT: Int, B: Int, W: DType](
                                 p[0] = max(p[0], v)
                 g += B
             barrier()
+        comptime if W != F64:
+            if mode == 5:
+                # each row's group is added by its owner (thread g % B), rows in row order
+                barrier()
+                var row = _lp(scratch_a) + Int(block_idx.x) * ns
+                for r in range(TILE):
+                    var g = Int(tg[r])
+                    if g >= 0 and (g & (B - 1)) == tid:
+                        row[A * G + g] += 1
+                        for a in range(A):
+                            var ins = code + (HDR + (agg_base + a) * 5)
+                            var kind = Int(ins[0])
+                            var v = _i64_of(regs[Int(ins[2]) * TILE + r])
+                            var q = a * G + g
+                            if kind == OP_AGG_ISUM:
+                                _note_ovf(row[q], v, ovf)
+                                row[q] = row[q] + v
+                            elif kind == OP_AGG_IMIN:
+                                row[q] = min(row[q], v)
+                            elif kind == OP_AGG_IMAX:
+                                row[q] = max(row[q], v)
+                barrier()
         tile += step
 
     if mode == 4:
@@ -1175,9 +1233,9 @@ def _block_threads(mode: Int) -> Int:
 
 def _smem_bytes(mode: Int, n_groups: Int, n_slots: Int, n_regs: Int, code_ints: Int, narrow: Bool = False) -> Int:
     """Dynamic shared memory of a launch in `mode`: the one formula the mode choice and the launch share. `narrow`
-    (the Mojo API's big programs): 128-thread blocks, half the register file per block."""
+    (the Mojo API's big programs): NARROW_B-thread blocks (128; 64 on an Apple GPU), a smaller register file per block."""
     var ns = (n_slots + 1) * n_groups
-    var bsz = 128 if narrow else _block_threads(mode)
+    var bsz = NARROW_B if narrow else _block_threads(mode)
     var tile = bsz * _rows_per_thread(n_regs, n_groups, n_slots)
     var smem = n_regs * tile * 8 + MAX_CONSTS * 8 + code_ints * 4 + (bsz // 32) * SMALL * 8
     if mode == 3:
@@ -1186,6 +1244,8 @@ def _smem_bytes(mode: Int, n_groups: Int, n_slots: Int, n_regs: Int, code_ints: 
         smem += ns * 8
     elif mode == 4:
         smem += ns * 8 + tile * 4
+    elif mode == 5:
+        smem += tile * 4
     return smem
 
 
@@ -1210,17 +1270,48 @@ def _choose_mode(n_groups: Int, n_slots: Int, n_regs: Int, code_ints: Int, repro
     if repro != 0 and (mode == 1 or mode == 2):
         # no atomics: the ordered per-block table (mode 4), if the group count fits in shared memory (in
         # 128-thread blocks when the caller allows them: on an Apple GPU, big programs have no other mode)
-        if ns > REPRO_MAX_NS:
-            return -6
-        if _smem_bytes(4, G, n_slots, n_regs, code_ints) > SMEM_LIMIT and \
-           not (allow_narrow and _smem_bytes(4, G, n_slots, n_regs, code_ints, True) <= SMEM_LIMIT):
-            return -6
-        mode = 4
+        var fits4 = ns <= REPRO_MAX_NS and (_smem_bytes(4, G, n_slots, n_regs, code_ints) <= SMEM_LIMIT or
+                                            (allow_narrow and _smem_bytes(4, G, n_slots, n_regs, code_ints, True) <= SMEM_LIMIT))
+        if fits4:
+            mode = 4
+        else:
+            comptime if APPLE_GPU:               # many groups on the Int64 word: the table in device memory (mode 5)
+                if G > 1 and ns <= MANY_MAX_NS and (_smem_bytes(5, G, n_slots, n_regs, code_ints) <= SMEM_LIMIT or
+                                                    (allow_narrow and _smem_bytes(5, G, n_slots, n_regs, code_ints, True) <= SMEM_LIMIT)):
+                    mode = 5
+                else:
+                    return -6
+            else:
+                return -6
     if _smem_bytes(mode, G, n_slots, n_regs, code_ints) > SMEM_LIMIT:
         if allow_narrow and _smem_bytes(mode, G, n_slots, n_regs, code_ints, True) <= SMEM_LIMIT:
             return mode
         return -5
     return mode
+
+
+def scratch_rows(mode: Int, n_groups: Int, n_slots: Int, n_blocks: Int) -> Int:
+    """How many per-block rows of (slots + 1) * groups words `scratch` needs for a launch in `mode` on a device with
+    `n_blocks` cores (0 for the modes that write the output directly). The launch never uses more blocks than this
+    (`_grid_blocks`), so the two always agree (mojo/tests/test_gpu_plan.mojo)."""
+    if mode == 0 or mode == 3 or mode == 4:
+        return max(n_blocks, 1) * 8
+    if mode == 5:
+        return max(1, min(max(n_blocks, 1) * 8, MANY_SCRATCH_WORDS // ((n_slots + 1) * n_groups)))
+    return 0
+
+
+def _grid_blocks(mode: Int, n_groups: Int, n_slots: Int, n_regs: Int, code_ints: Int, narrow: Bool, rows: Int, n_blocks: Int) -> Int:
+    """The blocks a launch of `rows` rows in `mode` uses: one per tile up to `per_sm` resident blocks per core, and never
+    more than `scratch_rows` in the modes that keep per-block rows."""
+    var bsz = NARROW_B if narrow else _block_threads(mode)
+    var rpt = 1 if narrow else _rows_per_thread(n_regs, n_groups, n_slots)
+    var smem = _smem_bytes(mode, n_groups, n_slots, n_regs, code_ints, narrow)
+    var per_sm = max(1, min(8, (100 * 1024) // smem, 1536 // bsz))
+    var blocks = min(ceildiv(rows, bsz * rpt), max(n_blocks, 1) * per_sm)
+    if mode == 5:
+        blocks = min(blocks, scratch_rows(mode, n_groups, n_slots, n_blocks))
+    return max(blocks, 1)
 
 
 def _narrow(mode: Int, n_groups: Int, n_slots: Int, n_regs: Int, code_ints: Int) -> Bool:
@@ -1262,20 +1353,25 @@ def run_pipeline_gpu(
     if mode < 0:
         return mode
     var narrow = narrow_ok and _narrow(mode, G, A, n_regs, code_ints)
-    var bsz = 128 if narrow else _block_threads(mode)
+    var bsz = NARROW_B if narrow else _block_threads(mode)
     var rpt = 1 if narrow else _rows_per_thread(n_regs, G, A)
-    var tile = bsz * rpt
     var smem = _smem_bytes(mode, G, A, n_regs, code_ints, narrow)
-    var per_sm = max(1, min(8, (100 * 1024) // smem, 1536 // bsz))
-    var small = 1 if (mode == 0 or mode == 3 or mode == 4) else 0
+    var small = 1 if (mode == 0 or mode == 3 or mode == 4 or mode == 5) else 0
     var total = A * G
     if small == 0 or end <= start:
         ctx.enqueue_function[init_kernel[WORD]](
             Int64(out_vals_a), Int64(out_cnt_a), Int64(ident_a), Int64(G), Int64(total),
             grid_dim=ceildiv(max(total, G), BLOCK), block_dim=BLOCK)
     if end > start:
-        var blocks = min(ceildiv(end - start, tile), max(n_blocks, 1) * per_sm)
+        var blocks = _grid_blocks(mode, G, A, n_regs, code_ints, narrow, end - start, n_blocks)
         for _ in range(max(repeat, 1)):
+            comptime if NARROW_B == 64:                   # Apple: narrow blocks of 64 threads
+                if bsz == 64:
+                    ctx.enqueue_function[pipeline_kernel[1, 64, WORD]](
+                        Int64(code_a), Int64(consts_a), Int64(set_bytes_a), Int64(set_meta_a), Int64(cols_a), Int64(dtypes_a), Int64(gids_a),
+                        Int64(G), Int64(A), Int64(start), Int64(end), Int64(out_vals_a), Int64(out_cnt_a), Int64(scratch_a), Int64(n_regs), Int64(code_ints),
+                        Int64(mode), Int64(ovf_a), grid_dim=blocks, block_dim=bsz, shared_mem_bytes=smem)
+                    continue
             if bsz == 128 and rpt == 2:
                 ctx.enqueue_function[pipeline_kernel[2, 128, WORD]](
                     Int64(code_a), Int64(consts_a), Int64(set_bytes_a), Int64(set_meta_a), Int64(cols_a), Int64(dtypes_a), Int64(gids_a),

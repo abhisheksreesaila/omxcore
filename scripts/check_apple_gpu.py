@@ -21,6 +21,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 CACHE = Path.home() / ".cache" / "omxcore-apple-gpu"
 ENV = dict(os.environ, TMPDIR=str(Path.home() / ".cache" / "mxframe-test-tmp"))
+WORKFLOW_PATHS = ["kernels_aot", "mojo/omxcore", "ci/mac", ".github/workflows/apple-gpu.yml"]   # apple-gpu.yml's filter
+APPLE_SHAPE = "-D OMXCORE_APPLE_GPU_SHAPE"
+GPU_SUITES = ["test_gpu", "test_gpu_scan", "test_gpu_plan", "test_query", "test_holistic_query", "test_scan", "test_jobs"]
 
 
 def run(cmd, **kw):
@@ -37,6 +40,10 @@ def report():
     if not runs:
         return None, "no completed apple-gpu run on main"
     rid, sha = runs[0]["databaseId"], runs[0]["headSha"][:7]
+    # the run must have built the newest commit that changed what the workflow runs (its path filter skips the rest)
+    want = run(["git", "log", "-1", "--format=%h", "--abbrev=7", "--", *WORKFLOW_PATHS]).stdout.strip()
+    if not runs[0]["headSha"].startswith(want):
+        return None, f"stale: the newest apple-gpu run (#{rid}) built {sha}, the engine and CI last changed at {want} (push, then wait for the run)"
     d = CACHE / str(rid)
     if not (d / "report.txt").exists():
         shutil.rmtree(d, ignore_errors=True)
@@ -130,6 +137,30 @@ def m5():
     return r.returncode == 0, f"{len(oks)} ok" + (", " + "; ".join(fails[:4]) if fails else "")
 
 
+def m6():
+    """Apple's plan (Int64 word, atomic-free modes, 32 KB) on this machine's GPU: the GPU Mojo suites, and the orders
+    queries beside pyarrow."""
+    env = dict(ENV, MOJO_TEST_FLAGS=APPLE_SHAPE)
+    r = subprocess.run(["pixi", "run", "mojo-test", *[f"mojo/tests/{t}.mojo" for t in GPU_SUITES]], cwd=ROOT, env=env,
+                       capture_output=True, text=True)
+    fails = [l for l in r.stdout.splitlines() if l.startswith("FAIL")]
+    oks = [l for l in r.stdout.splitlines() if l.startswith("ok")]
+    if r.returncode != 0:
+        return False, f"suites under {APPLE_SHAPE}: {len(oks)} ok; " + "; ".join(fails[:3]) + " " + r.stdout[-300:]
+    work = CACHE / "m6"
+    work.mkdir(exist_ok=True)
+    ref = run(["pixi", "run", "python", "ci/mac/orders.py", str(work / "orders.csv"), "200000"])
+    lib = ROOT / ".pixi/envs/default/lib"
+    b = run(["pixi", "run", "mojo", "build", "--disable-warnings", *APPLE_SHAPE.split(), "-I", "build", "ci/mac/engine_check.mojo",
+             "-Xlinker", f"-L{lib}", "-Xlinker", "-lzstd", "-Xlinker", "-lsnappy", "-Xlinker", f"-rpath={lib}",
+             "-o", str(work / "engine_check")])
+    if b.returncode != 0:
+        return False, "engine check build failed: " + (b.stdout + b.stderr)[-300:]
+    e = subprocess.run([str(work / "engine_check"), str(work / "orders.csv")], capture_output=True, text=True, env=ENV)
+    ok, why = m4(ref.stdout + e.stdout)
+    return ok, f"{len(oks)} suites ok; orders: " + why.replace(" on the GPU", " under Apple's plan")
+
+
 def main():
     CACHE.mkdir(parents=True, exist_ok=True)
     if len(sys.argv) > 2 and sys.argv[1] == "--ptx-baseline":
@@ -140,8 +171,8 @@ def main():
     results = []
     for name, fn in [("M1 runner premises", lambda: m1(text)), ("M2 kernel compiles for Metal", m2),
                      ("M3 engine sees the Apple GPU", lambda: m3(text)), ("M4 done means", lambda: m4(text)),
-                     ("M5 NVIDIA unchanged (mojo-test)", m5)]:
-        if quick and name.startswith("M5"):
+                     ("M5 NVIDIA unchanged (mojo-test)", m5), ("M6 Apple's plan on this GPU", m6)]:
+        if quick and name[:2] in ("M5", "M6"):
             continue
         if text is None and name[:2] in ("M1", "M3", "M4"):
             results.append((name, False, where))

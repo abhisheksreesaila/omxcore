@@ -17,6 +17,9 @@ Spec: abhisheksreesaila/omxcode `docs/plans/omxcore-apple-gpu.md`. Tickets F-181
   a TEXT column; a WHERE; ORDER BY an aggregate with LIMIT) run with `device=GPU`, report that they ran on the GPU, and
   equal pyarrow's answers: at least 8 `Q` lines, every one `ran=gpu` and `omx == ref`. (F-184, F-186)
 - **M5 NVIDIA unchanged.** Locally: `pixi run mojo-test` passes, and the GPU Mojo tests pass on the RTX 3090. (F-186)
+- **M6 Apple's plan on this GPU** (added 2026-10-25 after review, D-12). With `-D OMXCORE_APPLE_GPU_SHAPE` (the Int64
+  word, the atomic-free modes, 32 KB) the GPU Mojo suites pass on the RTX 3090 and the orders queries equal pyarrow:
+  the Apple code path against the CPU on every case the suites hold, not only the runner's ten. (F-184, F-185)
 
 ## Out of bounds
 No PyPI publish, no repo rename, no benchmarks beyond a light A/B on GPU 0 (quiet machine rule), no force-push, no

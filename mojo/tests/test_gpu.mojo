@@ -4,6 +4,7 @@
 from omxcore import (Table, SharedTable, Frame, INT, DECIMAL, TEXT, Query, QueryResult, col, lit, least, greatest, sum,
                      count, mean, min_of, max_of, CPU, GPU, AUTO, DeviceTable, gpu_available)
 from omxcore.query import AUTO_GPU_MIN_ROWS
+from omxcore.kernels.pipeline_gpu import APPLE_GPU
 from max.gpu.host import DeviceContext, DeviceBuffer
 from std.os import getenv
 
@@ -388,6 +389,11 @@ def test_a_program_the_kernel_cannot_take() raises:
     (here with the table under the AUTO threshold, so the GPU is forced through `compute(GPU)` only)."""
     var t = agg_table()
     var dt = DeviceTable(t)
+    comptime if APPLE_GPU:
+        # Apple's plan has 64-thread narrow blocks (NARROW_B): the program fits there and equals the CPU's answer
+        same(many_aggs(t, dt, 44, GPU), many_aggs(t, dt, 44, CPU), "44 aggregates in 64-thread blocks")
+        dt.release()
+        return
     var msg = String("")
     try:
         _ = many_aggs(t, dt, 44, GPU)
@@ -419,7 +425,10 @@ def test_many_groups_run_on_auto_without_scratch() raises:
     var s = t^.share()
     var dt = DeviceTable(s)
     var g = Query(s).on_device(dt).group_by(col("k"), groups=3_000_000).agg(sum(col("v")), count()).compute(AUTO)
-    expect(g.device == GPU, "3M groups on a 1.2M-row table ran on the GPU")
+    comptime if APPLE_GPU:      # past mode 5's MANY_MAX_NS: AUTO answers on the CPU and says why
+        expect(g.device == CPU and "declined" in g.fallback_reason, "3M groups on Apple's plan: the CPU, `" + g.fallback_reason + "`")
+    else:
+        expect(g.device == GPU, "3M groups on a 1.2M-row table ran on the GPU")
     same(g, Query(s).group_by(col("k"), groups=3_000_000).agg(sum(col("v")), count()).compute(CPU), "3M groups")
     dt.release()
 
