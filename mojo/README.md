@@ -87,15 +87,19 @@ Three compile-time switches, read when the app builds (`mojo build ... -D NAME`)
 is **on for every target but Linux** (an Apple object needs no flags) and `-D` turns it on for Linux too, which is how
 `pixi run mojo-test` tests the other side (`mojo/tests/switches/test_switches.mojo`). **Android counts as Linux** to
 Mojo: an Android build gets the GPU code, the thread pool and the codecs unless it passes all three `-D` flags.
+**The GPU on a Mac** (F-182): a build for macOS whose accelerator is an Apple GPU (a native build on Apple Silicon, or
+`--target-accelerator metal:<n>`) has the GPU code too, so `MXFRAME_NO_GPU` is off there; it needs Apple's Metal
+toolchain at build time. A Linux cross-build for macOS that names only the triple keeps the GPU off without a flag.
 
 | Switch | Off (Linux default) | On |
 |---|---|---|
-| `MXFRAME_NO_GPU` (`HAS_GPU` in `gpu.mojo`) | `DeviceTable`, `compute(GPU)`, the GPU kernel | `gpu_available()` is False; `DeviceTable(...)` and `compute(GPU)` raise "no GPU on this build"; AUTO is the CPU. No `AsyncRT_Device*` symbol. |
+| `MXFRAME_NO_GPU` (`HAS_GPU` in `gpu.mojo`) | `DeviceTable`, `compute(GPU)`, the GPU kernel (Linux, and macOS with an Apple GPU) | `gpu_available()` is False; `DeviceTable(...)` and `compute(GPU)` raise "no GPU on this build"; AUTO is the CPU. No `AsyncRT_Device*` symbol. |
 | `MXFRAME_SERIAL` (`kernels/_fpenv.mojo`) | the thread pool (`par`, `par_n`) | tasks run in a loop on the calling thread, `core_count()` is 1, no `AsyncRT_*` symbol |
 | `MXFRAME_NO_CODECS` (`parquet.mojo`) | zstd and snappy (C libraries) | `write_parquet` saves UNCOMPRESSED whatever `compression` says; `read_parquet` refuses a zstd / snappy column with an error naming it. No `ZSTD_*` / `snappy_*` symbol |
 
 AUTO and the GPU: `compute(AUTO)` goes to the CPU when the GPU path fails for one of two reasons only, an allocation
-failure for the query's buffers or a program the kernel declines (-5 shared memory, -6 group table), and says which in
+failure for the query's buffers or a program the kernel declines (-5 shared memory, -6 group table; on an Apple GPU
+also a float program), and says which in
 `QueryResult.fallback_reason`. A launch error or an illegal address raises on AUTO too. `compute(GPU)` never falls back.
 
 **Link check:** `pixi run bash scripts/check_mac_link.sh` compiles `mojo/tools/mac_link_probe.mojo` over the package

@@ -36,3 +36,8 @@
   atomicrmw, no asm. Remaining generic `load ptr` in AIR are stack slots (the shuffle's), which is fine.
 - NVIDIA: mojo-test gpu / gpu_scan / query / holistic_query / kernels_from_package ok; pytest -k "gpu or pipeline"
   9879 passed.
+
+## Run 4 (40173257990, fd3ca30): every milestone passes
+- `scripts/check_apple_gpu.py`: M1 premises, M2 Metal AIR clean + NVIDIA PTX = baseline, M3 `ENGINE DEVICE: Apple
+  Paravirtual device · metal`, M4 10/10 orders queries on the Apple GPU equal pyarrow, M5 mojo-test 26 ok.
+- Known limit: more than 4096 (slots + 1) x groups decline on an Apple GPU (-6: AUTO answers on the CPU). Next: mode 5.
