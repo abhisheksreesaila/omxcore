@@ -13,6 +13,7 @@ build/
 
 # Pixi / conda environments
 .pixi/
+.pixi
 .conda/
 
 # Compiled Mojo / native artifacts
