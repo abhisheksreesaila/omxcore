@@ -8,22 +8,44 @@ green. Anything newer on `main` may still be in review: don't vendor it.
 
 ## Current stable
 
-**`23edc59`** (2026-10-20)
+**`3d2455d`** (2026-10-25): omxcore on Apple GPUs (Metal), and the first stable after the omxcore rename.
 
 ```sh
-# build the package from a clean copy of the stable commit (never from a working checkout)
-git -C <omxcore> archive 23edc59 | tar -x -C <scratch>
-cd <scratch> && pixi run bash scripts/build_mojo_pkg.sh      # -> build/mxframe.mojoc (this commit predates the rename)
-cp build/mxframe.mojoc <app>/vendor/ && echo 23edc59 > <app>/vendor/MXFRAME_COMMIT
+# build the package from a clean copy of the stable commit (never from a working checkout), on Linux as before
+git -C <omxcore> archive 3d2455d | tar -x -C <scratch>
+cd <scratch> && pixi run bash scripts/build_mojo_pkg.sh      # -> build/omxcore.mojoc (and build/mxframe.mojoc, the old name, one last time)
+cp build/omxcore.mojoc <app>/vendor/ && echo 3d2455d > <app>/vendor/OMXCORE_COMMIT
 ```
 
-**The rename (F-165, omxcore).** From the first stable commit after the rename, the same command builds both
-`build/omxcore.mojoc` (`from omxcore import ...`) and `build/mxframe.mojoc` (the same source under the old package
-name, so existing `from mxframe import ...` code keeps compiling) for one stable release; then only `omxcore.mojoc`
-remains. To switch an app: copy `build/omxcore.mojoc` to `vendor/` and run
-`sed -i 's/\bfrom mxframe\b/from omxcore/' $(grep -rl 'from mxframe' --include='*.mojo' .)`.
+**Building the Mac app with the GPU (new).** The same `omxcore.mojoc` (built on Linux) gives the Apple GPU path when
+the *app* is compiled for macOS with an Apple GPU as the accelerator; the switches resolve at the app's build, not the
+package's. Metal kernels are compiled with Apple's Metal toolchain, so that build runs **on a Mac** (or a macOS runner):
 
-## What changed since the previous stable (321870f), for apps
+```sh
+xcodebuild -downloadComponent MetalToolchain                 # once per machine
+mojo build -I vendor app_entry.mojo -o <app>                 # native build on Apple Silicon: the GPU is on, no -D flag
+mojo build -I vendor --target-accelerator metal:1 ...        # only where MAX cannot name the GPU (GitHub's virtual one)
+mojo build -I vendor -D MXFRAME_NO_GPU ...                   # opt out: CPU only, as before
+```
+
+A Linux cross-build of the Mac app (`--target-triple arm64-apple-macosx...` without a Metal accelerator) still has no
+GPU and needs no flag: it links exactly as before (`scripts/check_mac_link.sh`).
+
+## What changed since the previous stable (23edc59), for apps
+
+| Area | What you get | Ticket |
+|---|---|---|
+| Apple GPU | `gpu_available()` is True on an Apple Silicon Mac built as above, and `DeviceTable` / `compute(GPU)` / `compute(AUTO)` run the kernels on Metal. `gpu_device()` returns "<name> · <api>" for the status bar ("Apple M4 · metal"; "" without a GPU); `QueryResult.device` (CPU / GPU) says where a query ran, `fallback_reason` why AUTO used the CPU | F-182 |
+| How it runs there | Metal has no float64 and no general 64-bit atomics, so on an Apple GPU the kernel's word is an **Int64** and only the **atomic-free modes** run: 0 / 3 (few groups), 4 (the block's table in 32 KB of shared memory, up to 4,096 (slots + 1) x groups) and 5 (many groups: the table in device memory, one owner thread per group, up to 2^20). Plans are sized to **32 KB** of shared memory; big programs use 64-thread blocks. Device addresses become pointers in Metal's device address space (`addrspace(1)`). Results are exactly the CPU's (int64 totals, the same overflow error) | F-183, F-184, F-185 |
+| When AUTO answers on the CPU (Mac) | a FLOAT column or float arithmetic (`mean` of INT / DECIMAL still runs on the GPU: its division is on the host); more than 2^20 (slots + 1) x groups; a program whose registers do not fit 64-thread blocks in 32 KB (more than ~44 aggregates); count_distinct / percentile / top_k (as on NVIDIA); a table under `AUTO_GPU_MIN_ROWS` (1M rows). `compute(GPU)` raises in those cases instead, with the same reason | F-184 |
+| NVIDIA | unchanged: the kernels' PTX is byte-identical to 3a33697 (`ci/mac/nvidia_ptx.sha`), timings equal | F-186 |
+| Name | `from omxcore import ...` (F-165). `mxframe.mojoc` is built one last time for code that still says `from mxframe` | F-165 |
+
+Checked on GitHub's macos-26 runner (a virtual Apple GPU, M1 family: correctness only, not speed, not yet real
+silicon): 12 orders queries on 1M rows equal pyarrow, including 5,000 groups and a 30-aggregate pivot
+(`.github/workflows/apple-gpu.yml`, `scripts/check_apple_gpu.py`, `docs/goals/apple-gpu/report.md`).
+
+## What changed in 23edc59 (since 321870f), for apps
 
 | Area | What you get | Ticket |
 |---|---|---|
@@ -56,6 +78,7 @@ and a repro for a bug. Needs that are generic go into the engine; app-specific o
 ## History
 | Stable | Date | Highlights |
 |---|---|---|
+| `3d2455d` | 2026-10-25 | Apple GPU (Metal): Int64 word, atomic-free modes, 32 KB; `gpu_device()`; the omxcore name |
 | `23edc59` | 2026-10-20 | background jobs (cancel, progress), range aggregates and block reads |
 | `321870f` | 2026-10-19 | SQL, joins, planner, expressions, FLOAT64, `mx` |
 | `1889b7f` | 2026-10-19 | GPU for streamed files |
