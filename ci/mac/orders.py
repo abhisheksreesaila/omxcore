@@ -46,7 +46,7 @@ def write_csv(d, path):
 
 def table(d):
     return pa.table({
-        "qty": d["qty"], "amount": d["amount"],
+        "id": d["id"], "qty": d["qty"], "amount": d["amount"],
         "discount": pa.array(d["discount"], mask=d["discount_null"]),
         "status": pa.array([STATUS[i] for i in d["status"]]),
         "region": pa.array([REGION[i] for i in d["region"]]),
@@ -94,7 +94,35 @@ def answers(t):
         ("nulls-by-status", grouped(t, "status", [("discount", "count"), ("discount", "sum"), ("discount", "max")])),
         ("top5-customer", top5(t, "customer", "amount")),
         ("top5-region-where", top5(w, "region", "amount")),
+        ("many-groups", many(t)),
+        ("pivot30", pivot(t)),
     ]
+
+
+def many(t):
+    """5000 groups (id % 5000): sum of amount and count; on an Apple GPU the many-groups mode (5). Groups in key order."""
+    k = pc.subtract(t["id"], pc.multiply(pc.divide(t["id"], 5000), 5000))      # id % 5000 (ids are >= 0)
+    g = pa.table({"k": k, "amount": t["amount"]}).group_by("k").aggregate([("amount", "sum"), ([], "count_all")])
+    rows = sorted(zip(g["k"].to_pylist(), g["amount_sum"].to_pylist(), g["count_all"].to_pylist()))
+    return "|".join(f"{k}={a},{c}" for k, a, c in rows)
+
+
+def pivot(t):
+    """30 aggregates over status (a big program: 64-thread narrow blocks on an Apple GPU): for i in 0..29,
+    sum(qty + i) if i % 3 == 0, min(amount * (i + 1)) if i % 3 == 1, else max(amount - i)."""
+    out = []
+    for name in sorted(set(t["status"].to_pylist())):
+        sub = t.filter(pc.equal(t["status"], name))
+        vals = []
+        for i in range(30):
+            if i % 3 == 0:
+                vals.append(pc.sum(pc.add(sub["qty"], i)).as_py())
+            elif i % 3 == 1:
+                vals.append(pc.min(pc.multiply(sub["amount"], i + 1)).as_py())
+            else:
+                vals.append(pc.max(pc.subtract(sub["amount"], i)).as_py())
+        out.append(name + "=" + ",".join(str(v) for v in vals))
+    return "|".join(out)
 
 
 def main():

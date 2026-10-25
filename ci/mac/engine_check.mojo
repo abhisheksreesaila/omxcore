@@ -81,7 +81,7 @@ def main() raises:
     var dt = DeviceTable(t)
     var big = (col("qty") > lit(10)) & (col("amount") < lit(500_000))
     var ids: List[String] = ["count", "sums", "minmax", "by-status", "by-status-minmax", "where", "where-by-region",
-                             "nulls-by-status", "top5-customer", "top5-region-where"]
+                             "nulls-by-status", "top5-customer", "top5-region-where", "many-groups", "pivot30"]
     for qi in range(len(ids)):
         var id = ids[qi]
         try:
@@ -121,10 +121,25 @@ def main() raises:
                 var g = len(t.dictionary(t.column("customer")))
                 r = q^.group_by(col("customer"), groups=g).agg(sum(col("amount"))).compute(GPU)
                 line = _top5(r, t, "customer")
-            else:
+            elif id == "top5-region-where":
                 var g = len(t.dictionary(t.column("region")))
                 r = q^.where(big.copy()).group_by(col("region"), groups=g).agg(sum(col("amount"))).compute(GPU)
                 line = _top5(r, t, "region")
+            elif id == "many-groups":
+                r = q^.group_by(col("id") % 5000, groups=5000).agg(sum(col("amount")), count()).compute(GPU)
+                for g in range(5000):
+                    if r.counts[g] > 0:
+                        if line.byte_length() > 0:
+                            line += "|"
+                        line += String(g) + "=" + String(r.values(0)[g]) + "," + String(r.values(1)[g])
+            else:
+                var g = len(t.dictionary(t.column("status")))
+                var p = q^.group_by(col("status"), groups=g)
+                for i in range(30):
+                    var a = sum(col("qty") + i) if i % 3 == 0 else (min_of(col("amount") * (i + 1)) if i % 3 == 1 else max_of(col("amount") - i))
+                    p = p^.agg(a^)
+                r = p^.compute(GPU)
+                line = _grouped(r, 30, t, "status")
             print("Q", id, "ran=" + _ran(r), line)
         except e:
             print("Q", id, "ran=error", String(e))
