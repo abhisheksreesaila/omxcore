@@ -1731,21 +1731,22 @@ Mapped to existing tickets: #7 result cache → F-160; #12 count distinct / medi
 ## Apple GPU (owner, 2026-10-24; spec: abhisheksreesaila/omxcode `docs/plans/omxcore-apple-gpu.md`; goal `docs/goals/apple-gpu/GOAL.md`)
 Owner: GPU **on by default** on Apple Silicon (unified memory: the GPU comes free); `-D MXFRAME_NO_GPU` stays the opt-out. NVIDIA's path does not change.
 
-## F-181 Apple GPU CI: a macos-26 job that builds and runs omxcore against Metal [todo]
-- [ ] `.github/workflows/apple-gpu.yml` + `ci/mac/` (own pixi manifest, osx-arm64): probe prints `DEVICE: … · metal`, `RESULT: ok`, and the premises the engine needs (integer device addresses, an address read from a buffer, dynamic shared memory, 64-bit integer maths, warp shuffles)
-- [ ] the run's report is an artifact `scripts/check_apple_gpu.py` reads
+## F-181 Apple GPU CI: a macos-26 job that builds and runs omxcore against Metal [done]
+- [x] `.github/workflows/apple-gpu.yml` + `ci/mac/` (own pixi manifest, osx-arm64): probe prints `DEVICE: … · metal`, `RESULT: ok`, and the premises the engine needs (integer device addresses, an address read from a buffer, dynamic shared memory, 64-bit integer maths, warp shuffles)
+- [x] the run's report is an artifact `scripts/check_apple_gpu.py` reads
 
-## F-182 The GPU on the Mac: `HAS_GPU` on macOS, `gpu_device()` names it [todo]
-- [ ] `gpu_available()` true on Apple Silicon when MAX sees a GPU; `gpu_device()` returns "<name> · <api>" ("Apple M4 · metal"); with `QueryResult.device` that says where a query ran (no `device_name` field: D-08)
+## F-182 The GPU on the Mac: `HAS_GPU` on macOS, `gpu_device()` names it [done]
+- [x] `gpu_available()` true on Apple Silicon when MAX sees a GPU; `gpu_device()` returns "<name> · <api>" ("Apple M4 · metal"); with `QueryResult.device` that says where a query ran (no `device_name` field: D-08)
 
-## F-183 The pipeline kernel's word on Apple: Int64, chosen at compile time (NVIDIA keeps Float64) [todo]
-- [ ] the kernel compiles for `metal:1` with no `double` in its AIR; NVIDIA's PTX unchanged; a float program never reaches an Apple GPU (it declines to the CPU)
+## F-183 The pipeline kernel's word on Apple: Int64, chosen at compile time (NVIDIA keeps Float64) [done]
+- [x] the kernel compiles for `metal:1` with no `double` in its AIR; NVIDIA's PTX unchanged; a float program never reaches an Apple GPU (it declines to the CPU)
 
-## F-184 No 64-bit atomics on Apple: the atomic-free modes (0, 3, 4) [todo]
-- [ ] on Apple the mode choice picks 0 / 3 / 4 only (more groups than mode 4 holds decline to the CPU); count, sum, min and max equal pyarrow on the runner's GPU
+## F-184 No 64-bit atomics on Apple: the atomic-free modes (0, 3, 4) [done]
+- [x] on Apple the mode choice picks 0 / 3 / 4 only (more groups than mode 4 holds decline to the CPU); count, sum, min and max equal pyarrow on the runner's GPU
 
-## F-185 Apple's limits: 32 KB shared memory, grid from the device, scratch rows = blocks launched [todo]
-- [ ] plans sized to the device's shared memory (32 KB on Apple); blocks per core and core count taken from the device; a test checks scratch rows against blocks launched; the Mac link probe gains a Metal-GPU build
+## F-185 Apple's limits: 32 KB shared memory, grid from the device, scratch rows = blocks launched [done]
+- [x] plans sized to the device's shared memory (32 KB on Apple); blocks per core and core count taken from the device; a test checks scratch rows against blocks launched; the Mac link probe gains a Metal-GPU build
 
-## F-186 Done means: the orders queries on Apple's GPU equal pyarrow; NVIDIA unchanged [todo]
-- [ ] 1M-row orders (INT, DECIMAL, TEXT): count / sum / min / max overall and by a TEXT column, a WHERE, ORDER BY an aggregate with LIMIT, on `device=GPU` on the runner, equal pyarrow; Linux suites green; NVIDIA timing A/B vs 3a33697 within noise; STABLE.md + app issue
+## F-186 Done means: the orders queries on Apple's GPU equal pyarrow; NVIDIA unchanged [done]
+Stable 3d2455d (2026-10-25), hand-off abhisheksreesaila/omxcode#3. Review: round 1 NEEDS WORK (fixed), round 2 PASS. Report: docs/goals/apple-gpu/report.md. Not done: real-silicon speed and correctness (owner's Mac); float32 on Apple.
+- [x] 1M-row orders (INT, DECIMAL, TEXT): count / sum / min / max overall and by a TEXT column, a WHERE, ORDER BY an aggregate with LIMIT, on `device=GPU` on the runner, equal pyarrow; Linux suites green; NVIDIA timing A/B vs 3a33697 within noise; STABLE.md + app issue
