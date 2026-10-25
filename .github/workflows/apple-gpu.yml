@@ -1,0 +1,28 @@
+# F-181: omxcore on Apple's GPU. GitHub's macos-26 runner has a virtual Apple GPU MAX can use (named as M1's Metal
+# family). Builds the package from this commit, runs the probe and the orders queries on device=GPU beside pyarrow;
+# the report is an artifact that scripts/check_apple_gpu.py reads (docs/goals/apple-gpu/GOAL.md).
+name: apple-gpu
+on:
+  push:
+    branches: [main]
+    paths: ["kernels_aot/**", "mojo/omxcore/**", "ci/mac/**", ".github/workflows/apple-gpu.yml"]
+  workflow_dispatch:
+jobs:
+  metal:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          manifest-path: ci/mac/pixi.toml
+          cache: true
+      - name: Metal toolchain (Mojo's Metal kernels need it at build time)
+        run: xcodebuild -downloadComponent MetalToolchain > metal-toolchain.txt 2>&1 || tail -5 metal-toolchain.txt
+      - name: Probe, package, orders queries on the GPU
+        run: bash ci/mac/run.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: apple-gpu-report
+          path: out/

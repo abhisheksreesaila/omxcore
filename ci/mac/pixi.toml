@@ -1,0 +1,13 @@
+# F-181: the Apple GPU job's own environment (macos-26 runner, osx-arm64). The main pixi.toml stays Linux-only.
+[workspace]
+name = "omxcore-mac-ci"
+channels = ["conda-forge"]
+platforms = ["osx-arm64"]
+
+[dependencies]
+python = "3.13.*"
+pyarrow = ">=17"
+
+[pypi-dependencies]
+mojo = ">=1.1,<1.2"
+max = ">=26.6.0,<27"

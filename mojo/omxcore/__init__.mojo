@@ -10,7 +10,7 @@ from .parquet import write_parquet, read_parquet, scan_parquet, ParquetResult, P
 from .csv import read_csv, CsvOptions, CsvResult, CsvColumn, FailedRow
 from .frame import Frame, Formula
 from .floatfmt import float_text
-from .gpu import DeviceTable, gpu_available
+from .gpu import DeviceTable, gpu_available, gpu_device
 from .sql import parse_sql, SqlStatement
 from .bind import Catalog, SqlSource, BoundQuery, bind_sql, SRC_TABLE, SRC_FRAME, SRC_SCAN
 from .planner import (Planner, RulePlanner, PlannerOptions, PhysicalPlan, KeyLayout, Stats, ColStat, GROUP_AUTO, GROUP_DENSE, GROUP_HASHED, BUILD_AUTO, BUILD_LEFT, BUILD_RIGHT, JoinStats, JoinPlan, JoinStep, rule_join_order,

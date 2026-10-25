@@ -15,9 +15,10 @@ Why it looks like this:
   the app's own kernels (charts, point clouds) and omxcore's share one device, one memory pool and one stream. With
   the default constructor omxcore creates its own context on device 0.
 - It is read-only: a session's edits never touch it (a query uploads the small bitmap of changed rows instead).
-- F-138b, where the GPU code lives: only on a GPU build. `HAS_GPU` is true on Linux (the target, as the app's D-56
-  compiles its GPU path out of Apple builds); `-D MXFRAME_NO_GPU` turns it off on Linux too (to test the other side).
-  Anywhere else `gpu_available()` is False, `DeviceTable(...)` raises "no GPU on this build", `Query.compute(GPU)`
+- F-138b, where the GPU code lives: only on a GPU build. `HAS_GPU` is true on Linux and, since F-182, on Apple
+  Silicon (Metal: the kernels' word is Int64 there, see kernels/pipeline_gpu.mojo); `-D MXFRAME_NO_GPU` turns it off
+  (to test the other side, or for a Mac build cross-compiled on Linux: Metal kernels need Apple's Metal toolchain at
+  build time). Anywhere else `gpu_available()` is False, `DeviceTable(...)` raises "no GPU on this build", `Query.compute(GPU)`
   raises the same and AUTO runs on the CPU. Every use of `DeviceContext`, a buffer or `kernels.pipeline_gpu` sits in
   a `comptime if HAS_GPU` block (the imports stay; a module-level import is not code), so an Apple object refers to
   no `AsyncRT_Device*` symbol. The device memory hangs off the shared state by address (`_GpuMemory`) for that reason:
@@ -29,7 +30,7 @@ from std.sys import is_defined, CompilationTarget
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from .table import SharedTable
 
-comptime HAS_GPU = CompilationTarget.is_linux() and not is_defined["MXFRAME_NO_GPU"]()
+comptime HAS_GPU = (CompilationTarget.is_linux() or CompilationTarget.is_apple_silicon()) and not is_defined["MXFRAME_NO_GPU"]()
 comptime NO_GPU_MESSAGE = "no GPU on this build"
 
 
@@ -43,6 +44,21 @@ def gpu_available() -> Bool:
             return False
     else:
         return False
+
+
+def gpu_device() -> String:
+    """The GPU queries run on, as "<name> · <api>" ("NVIDIA GeForce RTX 3090 · cuda", "Apple M4 · metal"), for an
+    app's status bar; "" when `gpu_available()` is False."""
+    comptime if HAS_GPU:
+        if not gpu_available():
+            return String()
+        try:
+            var ctx = DeviceContext()
+            return ctx.name() + " · " + ctx.api()
+        except:
+            return String()
+    else:
+        return String()
 
 
 struct _GpuMemory(Movable):

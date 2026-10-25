@@ -1,0 +1,10 @@
+# Decisions (Apple GPU, autopilot 2026-10-24)
+
+- D-01 · Apple GPU on by default on macOS, not opt-in · owner's call ("unified memory, GPU comes for free") · reversible: yes
+- D-02 · Int64 word on Apple only, chosen at compile time; NVIDIA keeps Float64 · the spec said Int64 everywhere; a global change risks NVIDIA results and speed (done-means 3) for nothing, since Mojo API programs that reach the GPU are integer-only already (`has_float` sends float programs to the CPU) · reversible: yes
+- D-03 · No 64-bit atomics on Apple by using modes 0, 3 and 4 (already atomic-free); more groups than mode 4 holds decline to the CPU · the spec's "per-block rows + merge" exists already as mode 4 (F-067); no new kernel · reversible: yes
+- D-04 · Fast loop on Linux: `mojo build --emit asm --target-accelerator metal:1` writes each kernel's AIR (`.ll`) without the Mac-only metallib step, so float64, atomics and PTX are caught locally in seconds; the macOS runner is only for running · reversible: yes
+- D-05 · The Mac CI has its own pixi manifest (`ci/mac/pixi.toml`, osx-arm64) instead of adding osx-arm64 to the main `pixi.toml` · keeps the main lock file and Linux CI untouched · reversible: yes
+- D-06 · Scope: the Mojo package's GPU path only; the Python wheel's AOT GPU kernels stay Linux-only · the app vendors the package; the wheel has no Mac GPU users · reversible: yes
+- D-07 · `HAS_GPU` keys on `CompilationTarget.is_apple_silicon()`, not `is_macos()` · a native Mac build (host CPU apple-m*) gets the GPU; a Linux cross-build that names only the triple (`--target-triple arm64-apple-macosx14.0`, as the app and `check_mac_link.sh` do) reads as not Apple Silicon and keeps its no-GPU object, which it must: Metal kernels need Apple's toolchain at build time · reversible: yes
+- D-08 · No `QueryResult.device_name` field: `gpu_device()` plus `r.device == GPU` already say where a query ran · subtract before you add · reversible: yes
