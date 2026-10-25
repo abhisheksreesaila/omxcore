@@ -21,7 +21,9 @@ files=("$@")
 fail=0
 for t in "${files[@]}"; do
   name="$(basename "$t" .mojo)"
-  if ! mojo build --disable-warnings "$t" -I "$root/build" -Xlinker -L"$lib" -Xlinker -lzstd -Xlinker -lsnappy -Xlinker -rpath="$lib" \
+  # MOJO_TEST_FLAGS: extra build flags, e.g. "-D OMXCORE_APPLE_GPU_SHAPE" (the Apple GPU's plan on this machine's GPU)
+  # shellcheck disable=SC2086
+  if ! mojo build --disable-warnings ${MOJO_TEST_FLAGS:-} "$t" -I "$root/build" -Xlinker -L"$lib" -Xlinker -lzstd -Xlinker -lsnappy -Xlinker -rpath="$lib" \
        -o "$out/$name" > "$out/$name.build.log" 2>&1; then
     echo "FAIL (build) $name"; tail -20 "$out/$name.build.log"; fail=1; continue
   fi

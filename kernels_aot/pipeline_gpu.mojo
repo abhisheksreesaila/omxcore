@@ -52,14 +52,16 @@ from max.gpu import thread_idx, block_idx, grid_dim, barrier
 from max.gpu.primitives.warp import shuffle_down
 from max.gpu.memory import AddressSpace, external_memory
 from std.memory import Pointer, stack_allocation, bitcast
-from std.sys import has_apple_gpu_accelerator
+from std.sys import has_apple_gpu_accelerator, is_defined
 from std.sys.info import is_apple_gpu
 
 comptime F64 = DType.float64
 # Host side only (never read inside a kernel, which is compiled for the GPU target): is the accelerator this build
 # compiles its kernels for an Apple GPU (a native Apple Silicon build, or `--target-accelerator metal:<n>`)? The
 # kernels take their word as a parameter, `WORD`, and plans are sized to `SMEM_LIMIT`.
-comptime APPLE_GPU = has_apple_gpu_accelerator()
+# `-D OMXCORE_APPLE_GPU_SHAPE` gives any GPU Apple's plan (the Int64 word, the atomic-free modes, 32 KB), so the
+# Apple path is tested on an NVIDIA card too (mojo/tests, scripts/check_apple_gpu.py); never set in a release build.
+comptime APPLE_GPU = has_apple_gpu_accelerator() or is_defined["OMXCORE_APPLE_GPU_SHAPE"]()
 comptime WORD = DType.int64 if APPLE_GPU else F64
 comptime SMEM_LIMIT: Int = (32 if APPLE_GPU else 48) * 1024     # dynamic shared memory per block: Apple 32 KB, NVIDIA 48 KB
 comptime BLOCK: Int = 256
@@ -1206,8 +1208,12 @@ def _choose_mode(n_groups: Int, n_slots: Int, n_regs: Int, code_ints: Int, repro
         elif _smem_bytes(1, G, n_slots, n_regs, code_ints) <= SMEM_LIMIT:
             mode = 1
     if repro != 0 and (mode == 1 or mode == 2):
-        # no atomics: the ordered per-block table (mode 4), if the group count fits in shared memory
-        if ns > REPRO_MAX_NS or _smem_bytes(4, G, n_slots, n_regs, code_ints) > SMEM_LIMIT:
+        # no atomics: the ordered per-block table (mode 4), if the group count fits in shared memory (in
+        # 128-thread blocks when the caller allows them: on an Apple GPU, big programs have no other mode)
+        if ns > REPRO_MAX_NS:
+            return -6
+        if _smem_bytes(4, G, n_slots, n_regs, code_ints) > SMEM_LIMIT and \
+           not (allow_narrow and _smem_bytes(4, G, n_slots, n_regs, code_ints, True) <= SMEM_LIMIT):
             return -6
         mode = 4
     if _smem_bytes(mode, G, n_slots, n_regs, code_ints) > SMEM_LIMIT:
@@ -1219,8 +1225,9 @@ def _choose_mode(n_groups: Int, n_slots: Int, n_regs: Int, code_ints: Int, repro
 
 def _narrow(mode: Int, n_groups: Int, n_slots: Int, n_regs: Int, code_ints: Int) -> Bool:
     """The Mojo API's programs keep many registers (a pivot with ten aggregates needs 23): when 256-thread blocks do
-    not fit in shared memory, 128-thread blocks (rpt 1) may. Modes 3 and 4 already differ and keep their shape."""
-    return mode != 3 and mode != 4 and _smem_bytes(mode, n_groups, n_slots, n_regs, code_ints) > SMEM_LIMIT and \
+    not fit in shared memory, 128-thread blocks (rpt 1) may. Mode 3 already has its own shape; mode 4 narrows only
+    where it was chosen with narrow blocks allowed (an Apple GPU: the Mojo API never asks NVIDIA for mode 4)."""
+    return mode != 3 and _smem_bytes(mode, n_groups, n_slots, n_regs, code_ints) > SMEM_LIMIT and \
         _smem_bytes(mode, n_groups, n_slots, n_regs, code_ints, True) <= SMEM_LIMIT
 
 
