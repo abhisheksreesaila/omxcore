@@ -18,7 +18,7 @@ in it is never split, whatever the block boundary. Reading a group maps its byte
 """
 from std.memory import Pointer
 from .csv import (BP, CsvOptions, CsvColumn, FailedRow, ChunkSink, CsvShape, _Fail, _walk, _infer_shape, _delimiter, _step, _A, _Q, _NL,
-                  _MAX_FAILED, first_invalid_utf8)
+                  _MAX_FAILED, _CR, first_invalid_utf8)
 from .mapped import _Mapped
 from .table import Table, SharedTable, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
 
@@ -110,19 +110,22 @@ struct CsvSource(Movable):
 
 
 def _find_cut(p: BP, n: Int, delim: UInt8, max_lines: Int, eof: Bool) -> Tuple[Int, Int]:
-    """(cut, lines): the end of the first complete rows of `p[:n]` and how many lines they are: just after the `max_lines`-th newline that is
+    """(cut, rows): the end of the first complete rows of `p[:n]` and how many rows they are (blank lines are not rows): just after the `max_lines`-th newline that is
     outside quotes, or after the last one in the window; at the end of the file, the end of the window (a last row needs no newline). Cut 0:
     no row ends in the window. `p` starts at a row start."""
     var s = _A
     var safe = 0
     var lines = 0
+    var line_start = 0
     for i in range(n):
         var b = p[i]
         var was_quoted = s == _Q
         s = _step(s, b, delim)
         if b == _NL and not was_quoted:
+            if i > line_start and not (i == line_start + 1 and p[line_start] == _CR):      # a blank line is not a row
+                lines += 1
             safe = i + 1
-            lines += 1
+            line_start = i + 1
             if lines >= max_lines:
                 return (safe, lines)
     if eof and safe < n:
