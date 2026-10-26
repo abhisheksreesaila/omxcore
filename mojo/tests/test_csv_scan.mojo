@@ -4,7 +4,7 @@
 from std.os import makedirs
 from omxcore import (Table, SharedTable, Query, QueryResult, col, lit, sum, count, mean, min_of, max_of, count_distinct,
                      INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, read_csv, CsvOptions, scan_csv, ParquetScan, read_parquet,
-                     Frame, Catalog, sql, MORSELS_ON, MORSELS_OFF, AUTO)
+                     Frame, Catalog, sql, MORSELS_ON, MORSELS_OFF, AUTO, scan_csv_job, JOB_DONE, JOB_CANCELLED, JOB_FAILED)
 
 comptime DIR = "mxframe_csv_scan_test/"
 
@@ -440,6 +440,43 @@ def test_header_only_and_empty_scans_query() raises:
     expect(empty.columns() == 0 and empty.rows() == 0, "an empty file: no columns, no rows")
 
 
+def test_read_group_into_writes_the_callers_buffers() raises:
+    """The GPU path hands a scan buffers of its own (pinned memory); the table keeps only validity and null counts."""
+    var path = write_file("into.csv", mixed_csv(500))
+    var scan = scan_csv(path, CsvOptions(group_rows=200))
+    var cols: List[Int] = [0, 3, 4]
+    var bufs = List[List[Int64]]()
+    var dest = List[Int]()
+    for _ in range(3):
+        bufs.append(List[Int64](length=200, fill=-1))
+    for k in range(3):
+        dest.append(Int(bufs[k].unsafe_ptr()))
+    var a = scan.read_group_into(0, cols, dest)
+    var b = scan.read_group(0, cols)
+    for k in range(3):
+        for r in range(200):
+            expect(bufs[k][r] == b.get(k, r), "buffer " + String(k) + " row " + String(r))
+            expect(a.is_null(k, r) == b.is_null(k, r), "validity " + String(k) + " row " + String(r))
+        expect(a.null_count(k) == b.null_count(k), "null count of column " + String(k))
+    _ = bufs^
+
+
+def test_the_opening_pass_as_a_job() raises:
+    var path = write_file("job.csv", mixed_csv(20000))
+    var job = scan_csv_job(path, CsvOptions(group_rows=1000))
+    expect(job.wait() == JOB_DONE, "the job ends done")
+    var scan = job.result()
+    expect(scan.rows() == 20000 and scan.row_groups() == 20, "the scan the job returns: " + String(scan.rows()) + " rows in " + String(scan.row_groups()) + " groups")
+    var p = job.progress()
+    expect(p.bytes and p.done == p.total and p.total > 100000, "progress counts bytes: " + String(p.done) + "/" + String(p.total))
+    var gone = scan_csv_job(DIR + "no-such.csv")
+    expect(gone.wait() == JOB_FAILED, "an unreadable file fails the job")
+    var never = scan_csv_job(path, CsvOptions(group_rows=1))
+    never.cancel()
+    var st = never.wait()
+    expect(st == JOB_CANCELLED or st == JOB_DONE, "a cancelled opening ends cancelled (or finished first)")
+
+
 def main() raises:
     test_every_cell_equals_read_csv()
     test_queries_equal_the_table()
@@ -452,4 +489,6 @@ def main() raises:
     test_files_it_refuses()
     test_a_file_that_changed_is_refused()
     test_header_only_and_empty_scans_query()
+    test_read_group_into_writes_the_callers_buffers()
+    test_the_opening_pass_as_a_job()
     print("test_csv_scan ok")

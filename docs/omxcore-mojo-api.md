@@ -83,7 +83,38 @@ var shared = r.take_table().share()             # moves the table out; the repor
 | Speed | today 1M rows: 0.5 s; 100M rows: 106 s on a loaded machine (pyarrow, multi-threaded). Parity or better, streaming (no full-file copy in memory). |
 | **Parquet read/write with key-value metadata** | the `.omx` document is one Parquet file; its JSON metadata holds formats, formulas, charts, pivots and the Report. Edits are baked into the columns on save (D-138). |
 | **Bigger than RAM** (F-140) | `var scan = scan_parquet(path)`; `Query(scan).where(...).group_by(col("region"), groups=scan.word_count(scan.index("region"))).agg(...).compute()` decodes one row group at a time (only the columns the plan reads) and equals `read_parquet` + the same query exactly; TEXT codes are the whole-file read's (`scan.code_of(c, word)`); CPU only. `count_distinct` and `top_k` stream too, exactly, by merging their state per row group; `percentile` / `median` keep every non-null value (12 bytes a row), see §5 | Edit it with `Frame(scan)` (§3, F-147) |
+| **A CSV bigger than RAM** (F-178) | `var scan = scan_csv(path, CsvOptions(group_rows=..., block_bytes=...))`: the same scan as `scan_parquet` (queries, SQL, `Frame(scan)` with edits and `save`), over a CSV or TSV; kinds from a sample, a failed-row report, memory bounded by a row group. Section 2b |
 | Later | XLSX, JSON lines, Arrow IPC; the Arrow C Data Interface both ways (zero-copy hand-over) |
+
+### 2b. A CSV bigger than memory (F-178, `csvscan.mojo`)
+
+```mojo
+var scan = scan_csv("sales.csv", CsvOptions(group_rows=262_144, block_bytes=16 << 20, infer_rows=100_000))   # a ParquetScan (alias CsvScan)
+scan.rows(); scan.row_groups(); scan.columns(); scan.name(c); scan.kind(c); scan.scale(c); scan.is_csv()
+var report = scan.csv_report()                        # what opening found: the import report of read_csv, for the whole file
+report.rows; report.columns[c].empty / .failed_count / .failed / .rounded / .sample; report.ragged / .ragged_count; report.skipped
+for f in report.failures(): f.row, f.column, f.text, f.reason; f.message()    # "row 41,207, column `qty`: `12.x` isn't a whole number"
+Query(scan).where(...).group_by(col("region"), groups=scan.word_count(scan.index("region"))).agg(...).compute()
+cat.add_scan("sales", scan); sql(cat, "SELECT region, sum(qty) FROM sales GROUP BY region")
+var f = Frame(scan); f.set(...); f.save("edited.parquet", metadata)           # as section 3 (F-147): the edited rows stream out as Parquet
+var job = scan_csv_job(path, options)                 # Job[ParquetScan]: the opening pass in the background (progress counts bytes, cancel between row groups)
+```
+
+A scan over a CSV **is** a `ParquetScan` (`scan_csv` returns it; `CsvScan` is another name for the type): everything section 2 says about a scan, section 3 says about a Frame over one, and sections 5 and 8 say about queries and SQL over one holds, because
+the engine asks a scan for row groups and only the decoding differs. The notes of a SQL plan call it a "CSV scan".
+
+| What | How it behaves |
+|---|---|
+| **Opening** | Reads the file once, a block at a time, and keeps an index: the header and kinds (from the first `infer_rows` rows, as many as fit in `block_bytes`, at least the header and one row), then for each **row group** its byte range, row count and null count per column. The pass also parses every cell once, for the report and the null counts. Nothing but the index and the report stays in memory. ~160 MB/s on one thread (a 326 MB file: 2.1 s). `scan_csv_job` runs it in the background |
+| **Row groups** | About `group_rows` rows (262,144), never more than `block_bytes` bytes (16 MiB), found at a row boundary with the quote state machine `read_csv` splits its chunks with (a newline ends a row only outside quotes), so a quoted field with newlines in it is never cut and the rows are exactly the whole-file reader's, whatever the block boundaries (tested with groups of one row and blocks of one byte). A row longer than the block makes its window grow (doubling), up to `max_row_bytes` (64 MiB): past that, a readable error ("row 1 is longer than ... an unmatched quote makes the rest of the file one row"), since one open quote would otherwise make the rest of the file one row. Blank lines are not rows |
+| **Kinds** | `read_csv`'s rules and options (INT, DECIMAL, FLOAT, DATE, BOOL, TEXT; `float_columns`, `decimal_columns`, `max_columns`, `has_header`, `delimiter`), decided by the sample. **A DECIMAL's scale covers the whole column:** inferred 2, it becomes 4 when any later value has 3 or 4 places; the opening pass finds that and is run again at the wider scale, so a column's kind and scale never change under a query |
+| **Failed rows** | As `read_csv`: a cell that does not fit its column's kind (a value past the sample) is a **null**, the rest of the row is read, and the report names it: row number (data rows from 1), column, the text (cut at 200 bytes) and why. The first 1,000 per column are kept, `failed_count` is the true number; `failures()` lists them all in file order. Rows with more cells than the header and rows that end in an unmatched quote are in `ragged`. Nothing about bad values raises. A file that is not UTF-8 raises ("is not valid UTF-8 (byte N)"; UTF-16 is named), as `read_csv` does |
+| **Exactness** | A scan gives **exactly** what `read_csv` of the same bytes and options gives: every cell, every TEXT code (first seen in file order), the report; and a query, SQL, `Frame` edits and `save` over it give what the same call over that table gives (tested for 5 block shapes, with and without morsels, against `read_csv`, and SQL against DuckDB's `read_csv`). The two exceptions are the ones of a Parquet scan: a float sum is added row group by row group (the last bits can differ), and a failed cell of a column that had to widen its scale reads "isn't a number" |
+| **Reading a group** | Maps the group's bytes, parses the columns the plan reads (the others are skipped, not parsed), unmaps. Peak: the group's columns (8 bytes a value) and its mapped bytes, per worker thread. The TEXT dictionary of a column is built the first time the column is read (one extra pass over the file for that column, in file order, as `ensure_words`) and stays in memory, as for Parquet: **a high-cardinality text column that is read costs memory in its distinct words**; a column no query reads is never touched (a SQL plan no longer builds the dictionary of a TEXT column it does not read: that was a full pass here, and a Parquet dictionary read before) |
+| **Statistics** | A CSV has none beyond the null counts (exact, from the opening pass): INT and DATE keys are grouped by hash, not by dense slots, and `column_range` says "unknown" |
+| **Memory** | **Bounded by the options, not the file.** Measured (326 MB, 4.4M rows, 7 columns, one TEXT column of 4.4M distinct 24-byte words that no query read; `mojo/tools/csv_scan_probe.mojo`, a fresh process each): opening 59 MB peak resident, then `GROUP BY region` with 4 aggregates 60 MB peak (`group_rows` 262,144, 16 MiB blocks) or 32 MB (`group_rows` 50,000, 2 MiB blocks), the same answer as the whole-file read, which peaks at 2.07 GB. `tests/test_csv_scan_memory.py`: files of 50 MB and 150 MB have the same peak, under 100 MB |
+| **Edits and save** | `Frame(scan)` is section 3 unchanged (row groups through the chunk cache, `cache_limit` 128 MiB by default; `save` streams one row group in and one out, to **Parquet**; the file it reads may be replaced). `save` writes a TEXT column as the file's dictionary words, a DECIMAL as DECIMAL(18, s), a FLOAT as DOUBLE |
+| **Not there** | Saving back to CSV; a CSV scan in the CLI (`mx` reads a `.csv` whole); the GPU is as for Parquet (`read_group_into` works; a scan runs on the CPU); a lone `\r` as a line end, thousands separators (as `read_csv`); a file changed while it is open is refused at the next read ("the file changed since it was opened": size only, as for Parquet); opening is one thread |
 
 ## 3. Edits, rows and undo (a session's overlay on shared data)
 
@@ -608,6 +639,7 @@ An app runs a query, a file read or a save off its UI thread, polls it (or takes
 var job = compute_job(query, AUTO)                                  # Job[QueryResult]  : Query.compute
 var job = sql_job(catalog, "SELECT ...", options)                   # Job[SqlResult]    : sql(catalog, text, options)
 var job = read_csv_job(path, options)                               # Job[CsvResult]    : read_csv
+var job = scan_csv_job(path, options)                               # Job[ParquetScan]  : scan_csv, the pass that finds a CSV's row groups (F-178)
 var job = read_parquet_job(path)                                    # Job[ParquetResult]: read_parquet
 var job = save_job(frame, path, metadata, compression, allow_narrowing)   # Job[Int]     : Frame.save, the result is the rows written
 var job = write_parquet_job(table, path, metadata, compression, row_group_rows)   # Job[Int]: write_parquet
@@ -633,7 +665,7 @@ Nothing of the job's is the caller's address: the job's body (a struct) owns its
 - *over a Parquet file or a Frame over one*: the blocks of a morsel (32,768 rows by default), the waves of row groups, the row groups;
 - *SQL*: the chunks (a scan's row groups), and inside a big table chunk ranges of 2M rows: dense and hashed group-bys (the ranges' groups are merged with `_merge_hashed`, as a scan's row groups are), the probe side of a fused join, row queries (slices of 1M rows). Same rule as queries: a float sum or a reproducible plan keeps its one call. A materialized join's pair building and gather run to their end; the steps between them check. A cancel is noticed within about one range (about 10 ms at the engine's speed);
 - *sorts* (`permutation_job`): every 1M elements of the key pass and of each radix pass;
-- *CSV*: the chunks the file is cut into (`CsvOptions.chunk_bytes`, 4 MB; a file read by one thread is one chunk);
+- *CSV*: the chunks the file is cut into (`CsvOptions.chunk_bytes`, 4 MB; a file read by one thread is one chunk); `scan_csv_job`: between row groups, progress in bytes;
 - *Parquet read and write*: row groups.
 The thread that notices unwinds (everything it owns is freed on the way) and the job ends. Dropping the handle is a cancel that waits for nothing: the thread ends by itself and frees the rest.
 A save writes a temporary file and renames it; `cancel()` before the rename removes the temporary file and the old file stays whole. Just before the rename the save passes its point of no return

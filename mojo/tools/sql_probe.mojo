@@ -1,7 +1,10 @@
 # F-150: runs one SQL string over Parquet files and prints the result as typed JSON (tests/test_mojo_sql.py compares it with DuckDB).
 #
 #   sql_probe [--mode table|scan|frame|framescan] [--edits FILE] [--group auto|dense|hashed] [--dense-limit N]
-#             [--threads N] [--repeat N] "<SQL>" name=path.parquet [name=path.parquet ...]
+#             [--threads N] [--repeat N] [--group-rows N] [--block-bytes N] [--infer-rows N]
+#             "<SQL>" name=path.parquet|path.csv [name=path ...]
+# A path ending in .csv or .tsv is read with read_csv (table, frame) or streamed with scan_csv (scan, framescan; F-178: --group-rows,
+# --block-bytes and --infer-rows are its CsvOptions).
 #
 # --mode  table: read the file whole; scan: stream it a row group at a time; frame: read it whole, then apply the edit script
 #         to a Frame over it; framescan: the same over a streamed file. The edits go to the first file.
@@ -13,7 +16,23 @@
 from std.sys import argv
 from std.time import perf_counter_ns
 from omxcore import (Catalog, sql, PlannerOptions, GROUP_AUTO, GROUP_DENSE, GROUP_HASHED, Frame, Table, SharedTable, read_parquet,
-                     scan_parquet, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT)
+                     scan_parquet, scan_csv, read_csv, CsvOptions, ParquetScan, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT)
+
+
+def is_csv(path: String) -> Bool:
+    return path.endswith(".csv") or path.endswith(".tsv")
+
+
+def read_whole(path: String, options: CsvOptions) raises -> SharedTable:
+    if is_csv(path):
+        var r = read_csv(path, options)
+        return r.take_table().share()
+    var rp = read_parquet(path)
+    return rp.take_table().share()
+
+
+def open_scan(path: String, options: CsvOptions) raises -> ParquetScan:
+    return scan_csv(path, options) if is_csv(path) else scan_parquet(path)
 
 
 def hex_digit(d: Int) -> String:
@@ -170,6 +189,7 @@ def main() raises:
     var edits = String()
     var opts = PlannerOptions()
     var repeat = 1
+    var csv = CsvOptions()
     var positional = List[String]()
     var i = 1
     while i < len(args):
@@ -190,6 +210,15 @@ def main() raises:
         elif a == "--threads":
             opts.threads = Int(String(args[i + 1]))
             i += 2
+        elif a == "--group-rows":
+            csv.group_rows = Int(String(args[i + 1]))
+            i += 2
+        elif a == "--block-bytes":
+            csv.block_bytes = Int(String(args[i + 1]))
+            i += 2
+        elif a == "--infer-rows":
+            csv.infer_rows = Int(String(args[i + 1]))
+            i += 2
         elif a == "--repeat":
             repeat = Int(String(args[i + 1]))
             i += 2
@@ -203,18 +232,16 @@ def main() raises:
         var name = kv[0]
         var path = kv[1]
         if mode == "table" or (mode == "frame" and k > 1):
-            var rp = read_parquet(path)
-            cat.add_table(name, rp.take_table().share())
+            cat.add_table(name, read_whole(path, csv))
         elif mode == "scan" or (mode == "framescan" and k > 1):
-            cat.add_scan(name, scan_parquet(path))
+            cat.add_scan(name, open_scan(path, csv))
         elif mode == "frame":
-            var rp = read_parquet(path)
-            var f = Frame(rp.take_table().share())
+            var f = Frame(read_whole(path, csv))
             if edits.byte_length() > 0:
                 apply_edits(f, edits)
             cat.add_frame(name, f)
         else:
-            var f = Frame(scan_parquet(path))
+            var f = Frame(open_scan(path, csv))
             if edits.byte_length() > 0:
                 apply_edits(f, edits)
             cat.add_frame(name, f)

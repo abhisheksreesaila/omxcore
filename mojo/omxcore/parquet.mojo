@@ -2460,6 +2460,10 @@ struct ParquetScan(Copyable, Movable):
     def row_groups(self) -> Int:
         return len(self._info[].groups)
 
+    def is_csv(self) -> Bool:
+        """The rows are a CSV file's (`scan_csv`, F-178), not a Parquet file's."""
+        return self._info[].is_csv
+
     def csv_report(self) raises -> CsvReport:
         """A CSV scan's import report (F-178): the columns' kinds, empty and failed cells, the failed cells themselves (`failures()`: row,
         column, the text, why), the ragged rows. Raises for a Parquet scan."""
@@ -2938,10 +2942,10 @@ def scan_parquet(path: String) raises -> ParquetScan:
 comptime CsvScan = ParquetScan           # F-178: `scan_csv` gives the same type: every ParquetScan call and every Query / SQL / Frame source works
 
 
-def scan_csv(path: String, options: CsvOptions = CsvOptions()) raises -> ParquetScan:
+def scan_csv(path: String, options: CsvOptions = CsvOptions(), job: JobCtl = JobCtl()) raises -> ParquetScan:
     """Opens a CSV or TSV file for streaming (csvscan.mojo): the header and the kinds from its first rows (the rules of `read_csv`), one pass
     over the file that finds its row groups and fills `scan.csv_report()`, no column data kept. A query, `Catalog.add_scan`, `Frame(scan)`
-    and `save` then work as on a Parquet scan, one row group (`options.group_rows` rows) at a time."""
+    and `save` then work as on a Parquet scan, one row group (`options.group_rows` rows) at a time. `job` (F-175): see `scan_csv_job`."""
     var file = _open_file(path)
     var fd = file._get_raw_fd()
     var one = List[UInt8](length=1, fill=0)
@@ -2950,7 +2954,7 @@ def scan_csv(path: String, options: CsvOptions = CsvOptions()) raises -> Parquet
     if got < 0:                                                       # a directory opens, but cannot be read
         raise Error("couldn't read `" + path + "`: not a regular file")
     var size = _file_size(file, path)
-    var src = csv_open(fd, size, path, options)
+    var src = csv_open(fd, size, path, options, job)
     var leaves = List[_Leaf]()
     var schema = Table.empty()
     var dicts = Table.empty()

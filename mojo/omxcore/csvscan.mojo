@@ -19,6 +19,7 @@ in it is never split, whatever the block boundary. Reading a group maps its byte
 from std.memory import Pointer
 from .csv import (BP, CsvOptions, CsvColumn, FailedRow, ChunkSink, CsvShape, _Fail, _walk, _infer_shape, _delimiter, _step, _A, _Q, _NL,
                   _MAX_FAILED, _CR, first_invalid_utf8)
+from .job import JobCtl, STAGE_READ
 from .mapped import _Mapped
 from .table import Table, SharedTable, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
 
@@ -143,14 +144,18 @@ def _too_long(path: String, row: Int, limit: Int) -> Error:
                  "Fix the quote, or raise CsvOptions.max_row_bytes")
 
 
-def csv_open(fd: Int, size: Int, path: String, options: CsvOptions) raises -> CsvSource:
-    """Opens a CSV for streaming (see the top of this file). `fd` is the open file, `size` its length."""
+def csv_open(fd: Int, size: Int, path: String, options: CsvOptions, job: JobCtl = JobCtl()) raises -> CsvSource:
+    """Opens a CSV for streaming (see the top of this file). `fd` is the open file, `size` its length. `job` (F-175): the background job this runs
+    for; its progress counts the file's bytes, and a cancel is seen between row groups."""
     if options.max_columns < 1:
         raise Error("max_columns must be at least 1, not " + String(options.max_columns))
     if options.group_rows < 1 or options.block_bytes < 1 or options.max_row_bytes < 1:
         raise Error("group_rows, block_bytes and max_row_bytes must be at least 1")
     var src = CsvSource()
     src.delim = _delimiter(path, options.delimiter)
+    job.stage(STAGE_READ)
+    job.count_bytes()
+    job.add_total(size)
     if size == 0:
         return src^
     # the sample: the first rows that fit in a block (a longer first row makes the window grow)
@@ -186,13 +191,15 @@ def csv_open(fd: Int, size: Int, path: String, options: CsvOptions) raises -> Cs
     var samples = List[List[String]]()
     for c in range(len(src.names)):
         samples.append(shape.infer.cols[c].sample.copy())
-    for _ in range(2):                # the second pass only when a DECIMAL column had to widen
-        if not _sweep(fd, size, path, options, src, samples, shape.skipped):
+    for pass_no in range(2):          # the second pass only when a DECIMAL column had to widen
+        if pass_no == 1:
+            job.add_total(size - src.first_row)
+        if not _sweep(fd, size, path, options, src, samples, shape.skipped, job):
             break
     return src^
 
 
-def _sweep(fd: Int, size: Int, path: String, options: CsvOptions, mut src: CsvSource, samples: List[List[String]], skipped: List[String]) raises -> Bool:
+def _sweep(fd: Int, size: Int, path: String, options: CsvOptions, mut src: CsvSource, samples: List[List[String]], skipped: List[String], job: JobCtl) raises -> Bool:
     """One pass over the data rows: finds the row groups and parses every cell once for the report and the null counts. True: a DECIMAL
     column of scale 2 met a value with 3 or 4 places; its scale is now 4 and the pass has to be run again."""
     src.offs.clear()
@@ -210,7 +217,9 @@ def _sweep(fd: Int, size: Int, path: String, options: CsvOptions, mut src: CsvSo
     var any_widen = False
     var at = src.first_row
     var row_base = 0
+    job.advance(at)                   # (the bytes before the first row count as done)
     while at < size:
+        job.check()
         var window = min(options.block_bytes, size - at)
         var m = _Mapped()
         var cut = 0
@@ -256,6 +265,7 @@ def _sweep(fd: Int, size: Int, path: String, options: CsvOptions, mut src: CsvSo
                     src.report.ragged.append(FailedRow(row_base + sink.ragged[k].row + 1, sink.ragged[k].text, sink.ragged[k].reason))
         row_base += sink.rows
         at += cut
+        job.advance(cut)
     src.report.rows = row_base
     if any_widen:
         for c in range(ncols):

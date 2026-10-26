@@ -205,15 +205,18 @@ def make_stats(src: SqlSource, q: BoundQuery, dicts: DictAccess, trust: Bool = T
     st.edits = len(src.overlay.delta)
     st.version = src.version
     st.distrusted = not trust
+    var scan_cols = collect_columns(q) if src.kind == SRC_SCAN else List[Int]()
     if src.scan:
         st.row_groups = src.scan.value().row_groups()
+        if src.scan.value().is_csv():
+            st.scan_name = "CSV scan"
     for c in range(src.table.columns()):
         var cs = ColStat(src.table.kind(c).value, src.table.scale(c))
         if src.kind == SRC_SCAN:
             cs.nullable = not trust or src.scan.value().null_count(c) != 0 or _delta_nulls(src, c)
         else:
             cs.nullable = src.table.null_count(c) > 0 or _delta_nulls(src, c)
-        if cs.kind == TEXT.value:
+        if cs.kind == TEXT.value and (src.kind != SRC_SCAN or c in scan_cols):      # (a scan builds a TEXT column's dictionary on first use: not for a column the query never reads, F-178)
             cs.words = dicts.count(c)
         for i in range(len(src.range_cols)):
             if src.range_cols[i] == c and src.range_has[i] and (trust or src.kind != SRC_SCAN):

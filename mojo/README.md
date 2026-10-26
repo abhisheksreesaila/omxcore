@@ -46,6 +46,15 @@ Rules and paths: `docs/omxcore-mojo-api.md` section 8b.
 `mojo/tools/float_probe.mojo` runs builder plans for `tests/test_mojo_float_builder.py`; `mojo/tests/test_float.mojo` is the pure-Mojo test.
 `strtod` (libSystem) parses the digits a fast path cannot: `check_mac_link.sh` lists it for the app's stub.
 
+## A CSV bigger than memory (F-178)
+
+`scan_csv(path, CsvOptions(group_rows=..., block_bytes=...))` opens a CSV or TSV as a scan (`ParquetScan`, also named `CsvScan`): one pass finds its
+row groups (`csvscan.mojo`: byte ranges cut where a newline ends a row outside quotes, the state machine `read_csv` uses) and keeps the kinds (from a
+sample), the null counts and a failed-row report (`scan.csv_report()`); a group is parsed with `csv.mojo`'s `ChunkSink` when a query reads it, so
+queries, SQL, `Frame(scan)` with edits and `save` are the Parquet scan's, and the peak memory is a row group, whatever the file (`docs/omxcore-mojo-api.md`
+section 2b). Tests: `mojo/tests/test_csv_scan.mojo` (against `read_csv`), `tests/test_mojo_csv_scan.py` (SQL against DuckDB's `read_csv`, via
+`mojo/tools/sql_probe.mojo`), `tests/test_csv_scan_memory.py` (`mojo/tools/csv_scan_probe.mojo`: peak resident memory on 50 MB and 150 MB files).
+
 ## SQL expressions (F-156)
 
 CASE, COALESCE / NULLIF, IS DISTINCT FROM, CAST, LIKE, text functions, dates and intervals, IN lists of any length (rules and the table of what is supported: `docs/omxcore-mojo-api.md`,

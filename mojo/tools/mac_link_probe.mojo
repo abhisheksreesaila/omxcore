@@ -4,9 +4,9 @@
 # and open). `mojo_entry` is the entry point the app's Mac build links with (`-e _mojo_entry`).
 from std.ffi import c_int
 from omxcore import (Table, SharedTable, Frame, INT, DECIMAL, TEXT, Query, col, sum, count, CPU, GPU, AUTO,
-                     DeviceTable, gpu_available, read_csv, write_parquet, read_parquet, scan_parquet, UNCOMPRESSED, ZSTD,
+                     DeviceTable, gpu_available, read_csv, scan_csv, CsvOptions, write_parquet, read_parquet, scan_parquet, UNCOMPRESSED, ZSTD,
                      count_distinct, median, percentile, top_k, Catalog, PlannerOptions, GROUP_HASHED, sql, range_aggregate, read_block,
-                     compute_job, sql_job, read_csv_job, read_parquet_job, save_job, write_parquet_job, permutation_job, JOB_DONE)
+                     compute_job, sql_job, read_csv_job, scan_csv_job, read_parquet_job, save_job, write_parquet_job, permutation_job, JOB_DONE)
 
 
 def run() raises:
@@ -90,6 +90,16 @@ def run() raises:
     print(j7.wait(), j7.result().__len__())
     print(j1.wait() == JOB_DONE, j2.wait(), j3.wait(), j4.wait(), j5.wait(), j6.wait())
     print(j1.result().counts[0], j2.result().table.rows(), j3.result().rows, j4.result().table.rows(), j5.result(), j6.result(), j1.progress().stage)
+    # F-178: a CSV streamed a row group at a time: opened (kinds, row groups, the failed-row report), queried, edited and saved
+    var cs = scan_csv("probe.csv", CsvOptions(group_rows=4, block_bytes=64))
+    print(cs.rows(), cs.row_groups(), cs.csv_report().failed_count(), Query(cs).group_by(col("k"), 3).agg(sum(col("v")), count()).compute(AUTO).counts[0])
+    cat.add_scan("c", cs)
+    print(sql(cat, "SELECT k, count(*), sum(v) FROM c GROUP BY k ORDER BY k").table.rows())
+    var j8 = scan_csv_job("probe.csv", CsvOptions(group_rows=4))
+    print(j8.wait(), j8.result().rows())
+    var cf = Frame(cs)
+    cf.set(1, 0, Int64(5))
+    cf.save("probe-csv.parquet", "{}", ZSTD)
 
 
 @export("mojo_entry")
