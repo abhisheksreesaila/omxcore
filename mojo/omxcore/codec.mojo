@@ -9,7 +9,8 @@ mojo/tests/test_codec.mojo). No symbol from outside the package is used, so the 
 snappy: raw format (what Parquet stores), a greedy matcher over a hash of four bytes.
 zstd, reading: the whole format but dictionaries (all block and literal types, Huffman tables with direct or FSE coded
 weights, the three FSE modes and repeat tables, repeat offsets, skippable and concatenated frames). The content
-checksum, when a frame has one, is skipped, not verified. The input is untrusted: every length is checked against
+checksum, when a frame has one, is verified (xxHash64). Offsets reach back no further than the frame's start and
+its declared window. The input is untrusted: every length is checked against
 the input and the stated output size before anything is written.
 zstd, writing: one frame, 128 KB blocks, a 1 MB window. The matcher tries the last offset one byte on first, then a
 table of four-byte keys (4 candidates per bucket, the key stored beside the position), with a one-step lazy choice
@@ -763,7 +764,7 @@ def _seq_table(mode: Int, mut cur: _Fse, default_norm: List[Int], default_log: I
             raise Error("zstd: sequences reuse a table that was never sent")
 
 
-def _decode_block(mut st: _ZstdState, p: Ptr, n: Int, op: Ptr, o_in: Int, size: Int) raises -> Int:
+def _decode_block(mut st: _ZstdState, p: Ptr, n: Int, op: Ptr, o_in: Int, size: Int, frame_start: Int, window: Int) raises -> Int:
     """A compressed block's bytes at p into the output at op from o_in; returns the new output position."""
     var lits = List[UInt8]()
     var used = 0
@@ -868,7 +869,7 @@ def _decode_block(mut st: _ZstdState, p: Ptr, n: Int, op: Ptr, o_in: Int, size: 
                 op[o + k] = lp[lpos + k]
             lpos += llv
             o += llv
-            if off > o or off == 0:
+            if off > o - frame_start or off > window or off == 0:
                 raise Error("zstd: offset past the start")
             _copy_match(op, o, off, mlv)
             o += mlv
@@ -885,9 +886,71 @@ def _decode_block(mut st: _ZstdState, p: Ptr, n: Int, op: Ptr, o_in: Int, size: 
     return o + left
 
 
+# ── xxHash64, the zstd content checksum ──────────────────────────────────────────────────────────────
+
+comptime XXP1 = UInt64(11400714785074694791)
+comptime XXP2 = UInt64(14029467366897019727)
+comptime XXP3 = UInt64(1609587929392839161)
+comptime XXP4 = UInt64(9650029242287828579)
+comptime XXP5 = UInt64(2870177450012600261)
+
+
+@always_inline
+def _rotl(x: UInt64, r: Int) -> UInt64:
+    return (x << UInt64(r)) | (x >> UInt64(64 - r))
+
+
+@always_inline
+def _xx_round(acc: UInt64, v: UInt64) -> UInt64:
+    return _rotl(acc + v * XXP2, 31) * XXP1
+
+
+def _xxh64(p: Ptr, n: Int) -> UInt64:
+    var i = 0
+    var h = UInt64(0)
+    if n >= 32:
+        var v1 = XXP1 + XXP2
+        var v2 = XXP2
+        var v3 = UInt64(0)
+        var v4 = UInt64(0) - XXP1
+        while i + 32 <= n:
+            v1 = _xx_round(v1, _load64(p, i))
+            v2 = _xx_round(v2, _load64(p, i + 8))
+            v3 = _xx_round(v3, _load64(p, i + 16))
+            v4 = _xx_round(v4, _load64(p, i + 24))
+            i += 32
+        h = _rotl(v1, 1) + _rotl(v2, 7) + _rotl(v3, 12) + _rotl(v4, 18)
+        h = (h ^ _xx_round(0, v1)) * XXP1 + XXP4
+        h = (h ^ _xx_round(0, v2)) * XXP1 + XXP4
+        h = (h ^ _xx_round(0, v3)) * XXP1 + XXP4
+        h = (h ^ _xx_round(0, v4)) * XXP1 + XXP4
+    else:
+        h = XXP5
+    h += UInt64(n)
+    while i + 8 <= n:
+        h = _rotl(h ^ _xx_round(0, _load64(p, i)), 27) * XXP1 + XXP4
+        i += 8
+    if i + 4 <= n:
+        h = _rotl(h ^ (UInt64(_load32(p, i)) * XXP1), 23) * XXP2 + XXP3
+        i += 4
+    while i < n:
+        h = _rotl(h ^ (UInt64(p[i]) * XXP5), 11) * XXP1
+        i += 1
+    h ^= h >> 33
+    h *= XXP2
+    h ^= h >> 29
+    h *= XXP3
+    h ^= h >> 32
+    return h
+
+
 def zstd_decompress(src_addr: Int, n: Int, size: Int) raises -> List[UInt8]:
     """`n` zstd bytes at `src_addr` (one frame, or several in a row, skippable frames ignored) into exactly `size`
-    bytes. The content checksum, when a frame has one, is not verified. No dictionaries."""
+    bytes. A frame's content checksum, when it has one, is verified. No dictionaries. `size` comes from a page header
+    the file's writer chose: it is refused before any allocation when `n` bytes cannot hold that much (a zstd block of 4
+    bytes makes 128 KB at most), and each frame's own stated size must fit it."""
+    if size < 0 or size > (n // 4 + 1) * ZSTD_BLOCK_MAX:
+        raise Error("zstd: the stated size is impossible for this much input")
     var sp = _ptr(src_addr)
     var out = List[UInt8](unsafe_uninit_length=max(size, 1))
     var op = _ptr(Int(out.unsafe_ptr()))
@@ -918,7 +981,13 @@ def zstd_decompress(src_addr: Int, n: Int, size: Int) raises -> List[UInt8]:
         var checksum = (fhd >> 2) & 1
         if fhd & 3 != 0:
             raise Error("zstd: dictionaries are not supported")
+        var window = 0
         if single == 0:
+            if i >= n:
+                raise Error("zstd: truncated")
+            var wd = Int(sp[i])
+            var base = 1 << (10 + (wd >> 3))
+            window = base + (base >> 3) * (wd & 7)
             i += 1                              # the window descriptor
         var fcs_bytes = 0
         var fcs_flag = fhd >> 6
@@ -938,6 +1007,8 @@ def zstd_decompress(src_addr: Int, n: Int, size: Int) raises -> List[UInt8]:
             if content < 0 or content > size - o:
                 raise Error("zstd: frame larger than its stated size")
         i += fcs_bytes
+        if single == 1:
+            window = content                    # a single segment's window is its whole content
         var st = _ZstdState()
         var frame_start = o
         while True:
@@ -966,7 +1037,7 @@ def zstd_decompress(src_addr: Int, n: Int, size: Int) raises -> List[UInt8]:
             elif btype == 2:
                 if bsize > ZSTD_BLOCK_MAX or bsize > n - i:
                     raise Error("zstd: bad compressed block")
-                o = _decode_block(st, sp + i, bsize, op, o, size)
+                o = _decode_block(st, sp + i, bsize, op, o, size, frame_start, window)
                 i += bsize
             else:
                 raise Error("zstd: reserved block type")
@@ -977,6 +1048,8 @@ def zstd_decompress(src_addr: Int, n: Int, size: Int) raises -> List[UInt8]:
         if checksum == 1:
             if i + 4 > n:
                 raise Error("zstd: truncated")
+            if _load32(sp, i) != UInt32(_xxh64(op + frame_start, o - frame_start) & 0xFFFFFFFF):
+                raise Error("zstd: the content checksum does not match")
             i += 4
     if o != size:
         raise Error("zstd: output does not match its stated size")

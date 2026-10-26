@@ -104,7 +104,8 @@ like one saved on Linux and each build opens the other's files. No source is ven
 the code is written from RFC 8878 (zstd) and snappy's `format_description.txt`, and tested against the C libraries
 (`mojo/tests/test_codec.mojo`: both directions, zstd levels 1 / 3 / 9 / 19, damaged input) and against pyarrow and DuckDB
 (`tests/test_codec_mojo.py`, through `mojo/tools/pq_recode.mojo` built with `-D MXFRAME_NO_CODECS`). The decoder reads
-all of zstd but dictionaries (an untrusted file is checked at every length); the encoder writes one frame with a 1 MB
+all of zstd but dictionaries, and is strict: checksums verified, offsets bounded by frame start and window, sizes
+checked before allocating; the encoder writes one frame with a 1 MB
 window. Against libzstd level 3 / libsnappy on a realistic table (`mojo/tools/bench_codec_write.mojo`: 2 million
 orders, 8 columns with nulls, text and dates, 74.6 MB plain; Linux, best of three, a lightly loaded machine):
 

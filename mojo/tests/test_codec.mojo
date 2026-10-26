@@ -190,6 +190,97 @@ def check_snappy(src: List[UInt8], what: String) raises:
     same(snappy_decompress(c_snappy(src), n), src, n, what + ": libsnappy encode, Mojo decode")
 
 
+def refusal(f: List[UInt8], size: Int) -> String:
+    """What zstd_decompress says about `f`, or "" when it decodes."""
+    try:
+        _ = zstd_decompress(f, size)
+    except e:
+        return String(e)
+    return String("")
+
+
+def block_header(mut f: List[UInt8], last: Bool, kind: Int, size: Int):
+    var bh = (1 if last else 0) | (kind << 1) | (size << 3)
+    f.append(UInt8(bh & 255))
+    f.append(UInt8((bh >> 8) & 255))
+    f.append(UInt8((bh >> 16) & 255))
+
+
+def one_sequence_block(ll: Int, ml: Int, offset: Int, lits: List[UInt8]) raises -> List[UInt8]:
+    var body = _literals_section(_ptr(Int(lits.unsafe_ptr())), len(lits))
+    var one = _Seqs(List[Int](), List[Int](), List[Int](), List[UInt8]())
+    one.ll.append(ll)
+    one.ml.append(ml)
+    one.ov.append(offset + 3)
+    body.extend(_sequences_section(_ZEnc(), one))
+    return body^
+
+
+def c_zstd_checksummed(src: List[UInt8]) raises -> List[UInt8]:
+    var cctx = external_call["ZSTD_createCCtx", Int]()
+    _ = external_call["ZSTD_CCtx_setParameter", Int](cctx, Int32(201), Int32(1))       # ZSTD_c_checksumFlag
+    var cap = external_call["ZSTD_compressBound", Int](len(src))
+    var out = List[UInt8](length=cap + 1, fill=0)
+    var n = external_call["ZSTD_compress2", Int](cctx, out.unsafe_ptr(), cap, src.unsafe_ptr(), len(src))
+    _ = external_call["ZSTD_freeCCtx", Int](cctx)
+    expect(external_call["ZSTD_isError", UInt32](n) == 0, "libzstd compresses with a checksum")
+    return List[UInt8](out[:n])
+
+
+def check_strict_decoder() raises:
+    # a page header that claims about 2 GB for a small frame is refused before anything is allocated
+    var small = zstd_compress(make(WORDS, 5000))
+    expect(refusal(small, 2000000000) == "zstd: the stated size is impossible for this much input", "a 2 GB claim for a small frame: `" + refusal(small, 2000000000) + "`")
+    var tiny: List[UInt8] = [0x28, 0xB5, 0x2F, 0xFD, 0x80, 0x50, 0, 0, 0, 0x7F, 1, 0, 0]       # claims 2^31 - 1 bytes of content
+    expect(refusal(tiny, 2147483647) == "zstd: the stated size is impossible for this much input", "a claim of 2^31 - 1 bytes: `" + refusal(tiny, 2147483647) + "`")
+    expect(refusal(small, 5000) == "", "and the true size still decodes")
+
+    # a match reaches back no further than its own frame began
+    var wxyz: List[UInt8] = [119, 120, 121, 122]
+    var first = zstd_compress(make(RANDOM, 8))                              # 8 bytes of output
+    var second: List[UInt8] = [0x28, 0xB5, 0x2F, 0xFD, 0x80, 0x50, 8, 0, 0, 0]
+    var seq = one_sequence_block(4, 4, 8, wxyz.copy())
+    block_header(second, True, 2, len(seq))
+    second.extend(seq^)
+    var both = first.copy()
+    both.extend(second.copy())
+    expect(refusal(second, 8).startswith("zstd: offset past the start"), "a match before its frame: `" + refusal(second, 8) + "`")
+    expect(refusal(both, 16).startswith("zstd: offset past the start"), "a match into the frame before: `" + refusal(both, 16) + "`")
+    var ok_seq = one_sequence_block(4, 4, 4, wxyz.copy())
+    var good: List[UInt8] = [0x28, 0xB5, 0x2F, 0xFD, 0x80, 0x50, 8, 0, 0, 0]
+    block_header(good, True, 2, len(ok_seq))
+    good.extend(ok_seq^)
+    expect(refusal(good, 8) == "", "a match inside its frame decodes")
+
+    # ... and no further than the window the frame declares
+    var data = make(RANDOM, 2000)
+    for wd in [0, 8]:                                                      # windows of 1 KB and 2 KB
+        var f: List[UInt8] = [0x28, 0xB5, 0x2F, 0xFD, 0x80, UInt8(wd), 0xD4, 7, 0, 0]      # 2004 bytes
+        block_header(f, False, 0, 2000)
+        f.extend(data.copy())
+        var blk = one_sequence_block(0, 4, 1500, List[UInt8]())
+        block_header(f, True, 2, len(blk))
+        f.extend(blk^)
+        var said = refusal(f, 2004)
+        if wd == 0:
+            expect(said.startswith("zstd: offset past the start"), "an offset past a 1 KB window: `" + said + "`")
+        else:
+            expect(said == "", "the same offset inside a 2 KB window: `" + said + "`")
+
+    # the content checksum is verified
+    var content = make(RANDOM, 3000)
+    var summed = c_zstd_checksummed(content)
+    same(zstd_decompress(summed, 3000), content, 3000, "a frame with a checksum decodes")
+    var bad_data = summed.copy()
+    bad_data[40] = bad_data[40] ^ 1
+    expect(refusal(bad_data, 3000) == "zstd: the content checksum does not match", "damaged content: `" + refusal(bad_data, 3000) + "`")
+    var bad_sum = summed.copy()
+    bad_sum[len(bad_sum) - 1] = bad_sum[len(bad_sum) - 1] ^ 1
+    expect(refusal(bad_sum, 3000) == "zstd: the content checksum does not match", "damaged checksum: `" + refusal(bad_sum, 3000) + "`")
+    var texty = c_zstd_checksummed(make(WORDS, 200000))
+    same(zstd_decompress(texty, 200000), make(WORDS, 200000), 200000, "a checksummed multi-block frame decodes (xxhash64 over 200 KB)")
+
+
 def main() raises:
     var seen = Seen()
     for kind in range(KINDS):
@@ -309,5 +400,6 @@ def main() raises:
     except:
         wrong = True
     expect(wrong, "a snappy page is refused when the page size is not the one it states")
+    check_strict_decoder()
     print("ok: zstd and snappy in Mojo; blocks stored/run/compressed", seen.c[0], seen.c[1], seen.c[2], "huffman 1/4 streams", seen.c[3], seen.c[4],
           "sequence tables predefined/rle/built", seen.c[7], seen.c[8], seen.c[9])
