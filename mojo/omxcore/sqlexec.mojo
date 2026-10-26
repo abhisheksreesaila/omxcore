@@ -1685,14 +1685,45 @@ def _unresolved_bins(q: BoundQuery) -> List[Int]:
     return out^
 
 
+def _reaches(q: BoundQuery, root: Int, target: Int) -> Bool:
+    """Whether row-level expression `target` is `root` or inside it."""
+    if root < 0:
+        return False
+    if root == target:
+        return True
+    ref x = q.rexprs[root]
+    if _reaches(q, x.a, target) or _reaches(q, x.b, target):
+        return True
+    for it in x.items:
+        if _reaches(q, it, target):
+            return True
+    return False
+
+
 def _resolve_bins[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: P, opts: PlannerOptions) raises -> BoundQuery:
     """quantile_bin(x, n) needs the n - 1 edges of equal-count bins of x: edge k is the value at sorted place ceil(k * N / n) among the N non-NULL values
     of x that the query's WHERE lets through. They are found by a query of their own (n - 1 exact order statistics of x, one pass over the source, the
     holistic machinery) before the real one is planned, and written into the node as literals of x's own type."""
     if q.joined or q.rows:
         raise Error("quantile_bin() is supported in an aggregate query over one table (GROUP BY quantile_bin(x, n)), not in a join or a row query yet")
+    var todo = _unresolved_bins(q)
+    for i in todo:                                       # only as (part of) a GROUP BY key: not in WHERE, an aggregate's argument, or another quantile_bin
+        var forbidden = List[Int]()
+        forbidden.append(q.where)
+        for a in q.aggs:
+            forbidden.append(a.arg)
+        for j in todo:
+            forbidden.append(q.rexprs[j].a)
+        var keyed = False
+        for k in q.keys:
+            keyed = keyed or _reaches(q, k.expr, i)
+        var bad = not keyed
+        for r in forbidden:
+            bad = bad or _reaches(q, r, i)
+        if bad:
+            raise Error("quantile_bin() is supported only in GROUP BY (a key of an aggregate query over one table), not in WHERE, inside an aggregate or another quantile_bin")
     var out = copy_query(q)
-    for i in _unresolved_bins(q):
+    for i in todo:
         var node = q.rexprs[i].copy()
         var n = Int(node.value)
         var x = q.rexprs[node.a].copy()

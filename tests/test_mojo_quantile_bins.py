@@ -149,6 +149,14 @@ def test_it_is_refused_where_it_means_nothing(probe, sets):
                       ("SELECT quantile_bin(s, 4) FROM t GROUP BY 1", "needs numbers or dates"),
                       ("SELECT quantile_bin(x) FROM t", "takes a value and the number of bins"),
                       ("SELECT quantile_bin(sum(x), 4) FROM t", "cannot take an aggregate"),
-                      ("SELECT quantile_bin(x, 4) FROM t", "not in a join or a row query")):
+                      ("SELECT quantile_bin(x, 4) FROM t", "not in a join or a row query"),
+                      ("SELECT count(*) FROM t WHERE quantile_bin(x, 2) = 1", "supported only in GROUP BY"),
+                      ("SELECT count(*) FROM t WHERE quantile_bin(x, 2) = 1 GROUP BY k", "supported only in GROUP BY"),
+                      ("SELECT quantile_bin(quantile_bin(x, 3), 2), count(*) FROM t GROUP BY 1", "supported only in GROUP BY"),
+                      ("SELECT k, sum(quantile_bin(x, 4)) FROM t GROUP BY k", "supported only in GROUP BY"),
+                      ("SELECT k, count(*) FROM t GROUP BY k HAVING sum(CASE WHEN quantile_bin(x, 2) = 1 THEN 1 ELSE 0 END) > 1", "supported only in GROUP BY"),
+                      ("SELECT k, CASE WHEN quantile_bin(x, 2) = 1 THEN 1 ELSE 0 END FROM t GROUP BY k", "quantile_bin"),
+                      ("SELECT k, count(*) FROM t GROUP BY k ORDER BY quantile_bin(x, 2)", "quantile_bin"),
+                      ("SELECT count(*) FROM t a JOIN t b ON a.id = b.id GROUP BY quantile_bin(a.x, 2)", "quantile_bin")):
         res = run_probe(probe, sql, {"t": ds.path}, expect_error=True)
         assert text in res["error"], (sql, res)

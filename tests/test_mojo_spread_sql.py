@@ -1,4 +1,4 @@
-"""F-177: stddev / stddev_samp / stddev_pop / variance / var_samp / var_pop in SQL, equal to DuckDB.
+"""F-177: stddev / stddev_samp / stddev_pop / variance / var_samp / var_pop in SQL: equal to DuckDB where DuckDB is stable, exact (more accurate than DuckDB) on cancellation-heavy data.
 
 The Mojo side is mojo/tools/sql_probe.mojo (the harness of tests/test_mojo_sql.py). Every query runs over a table read whole, a Parquet
 file streamed as 13 row groups, a Frame after 300 edits and a streamed file with the same edits, against DuckDB's answer. DuckDB's own
@@ -268,3 +268,19 @@ def test_nan_and_infinity_as_in_duckdb(probe, tmp_path):
         assert res["error"].startswith(f"{'stddev_samp' if fn == 'stddev' else fn} is out of range"), res
         with pytest.raises(duckdb.OutOfRangeException):
             duckdb.connect().execute(f"select {fn}(f) from read_parquet('{p}')")
+
+
+def test_1e15_plus_1_2_3_over_100k_rows_equals_exact_arithmetic(probe, tmp_path):
+    """DuckDB's var_pop on this column is 0.68168; the exact value is 0.66629 (checked here with Fractions). The engine gives the exact one."""
+    import random
+    rng = random.Random(3)
+    vals = [10**15 + rng.randint(1, 3) for _ in range(100_000)]
+    path = tmp_path / "c100k.parquet"
+    pq.write_table(pa.table({"v": pa.array(vals, pa.int64())}), path)
+    res = run_probe(probe, "SELECT var_pop(v), variance(v), stddev_pop(v), stddev(v) FROM t", {"t": path})
+    n = len(vals)
+    mean = Fraction(sum(vals), n)
+    m2 = sum((Fraction(v) - mean) ** 2 for v in vals)
+    want = (float(m2 / n), float(m2 / (n - 1)), math.sqrt(float(m2 / n)), math.sqrt(float(m2 / (n - 1))))
+    got = got_rows(res)[0]
+    assert all(abs(g - w) <= 1e-12 * w for g, w in zip(got, want)), (got, want)
