@@ -24,6 +24,9 @@ Semantics, as the app's stand-in (mojoui frame_gpu.group_sum), plus nulls:
 - `count_distinct(e)`, `median(e)` (DuckDB's median, exact at scale + 1) / `percentile(e, p)` (quantile_disc) and `top_k(e, k)` (F-148) are exact
   per group over a table, a Frame and a scan, ignore nulls, and run on the CPU: the kernel's per-block hook writes the
   (group, value) pairs and holistic.mojo consumes them (`r.values(i)`, `r.present(i, g)`, `r.top(i, g)`).
+- `stddev(e)` / `stddev_pop(e)` / `variance(e)` / `var_pop(e)` (F-177) are float64 aggregates folded from the same pairs into a count, a mean and a sum of squared
+  deviations per group (`r.floats(i)`; `present` is false below the two values the sample variants need). `Query.quantile_bins(e, n)` finds the edges of
+  n equal-count bins (A_QEDGE aggregates, whole-number order statistics) and `QuantileBins.key(e)` is the bin number 0 .. n-1 as a group key.
 """
 from std.time import perf_counter_ns
 from std.atomic import Atomic

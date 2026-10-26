@@ -3,7 +3,7 @@
 # column of 1e12 + small numbers (where a sum-of-squares formula in doubles loses every digit) is checked to 1e-12 relative.
 from std.math import sqrt
 from omxcore import (Table, SharedTable, Query, QueryResult, Frame, col, lit, sum, count, mean, stddev, stddev_pop, variance, var_pop, median,
-                     INT, DECIMAL, TEXT, write_parquet, read_parquet, scan_parquet, ZSTD, CPU, GPU, AUTO)
+                     INT, DECIMAL, TEXT, write_parquet, read_parquet, scan_parquet, ZSTD, CPU, GPU, AUTO, DeviceTable, gpu_available)
 
 
 struct Rng(Movable):
@@ -314,6 +314,29 @@ def test_errors_and_the_cpu() raises:
     expect("need numbers" in msg, "text: " + msg)
 
 
+def test_a_device_table_does_not_move_them_to_the_gpu() raises:
+    """AUTO with a DeviceTable attached and enough rows uses the GPU for plain aggregates; stddev and variance run on the CPU and say why,
+    next to a sum that would have gone to the GPU. compute(GPU) refuses. (Skipped without a GPU.)"""
+    if not gpu_available():
+        return
+    var t = make_table(1_000_000, 8)
+    var dt = DeviceTable(t)
+    var r = Query(t).on_device(dt).group_by(col("carrier"), groups=10).agg(stddev(col("big")), var_pop(col("rev")), sum(col("day"))).compute(AUTO)
+    expect(r.device == CPU and "stddev and variance run on the CPU" in r.fallback_reason, "AUTO ran on the CPU and said why: " + r.fallback_reason)
+    expect(r.present(0, 3) and r.present(1, 3), "a value")
+    var plain = Query(t).group_by(col("carrier"), groups=10).agg(stddev(col("big")), var_pop(col("rev")), sum(col("day"))).compute(CPU)
+    for g in range(10):
+        expect(r.values(0)[g] == plain.values(0)[g] and r.values(1)[g] == plain.values(1)[g] and r.values(2)[g] == plain.values(2)[g],
+               "the same answers as the CPU run, group " + String(g))
+    var msg = String("")
+    try:
+        _ = Query(t).on_device(dt).agg(variance(col("big"))).compute(GPU)
+    except e:
+        msg = String(e)
+    expect("run on the CPU" in msg, "compute(GPU): " + msg)
+    dt.release()
+
+
 def main() raises:
     test_over_a_table()
     test_the_same_bits_for_any_number_of_threads()
@@ -323,4 +346,5 @@ def main() raises:
     test_over_a_frame_with_edits()
     test_over_a_scan_of_several_row_groups()
     test_errors_and_the_cpu()
+    test_a_device_table_does_not_move_them_to_the_gpu()
     print("ok")

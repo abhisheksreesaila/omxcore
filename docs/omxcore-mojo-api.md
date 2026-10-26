@@ -215,6 +215,72 @@ Informal timings (F-148; 12-core Ryzen 9 5900X, 24 threads, load about 3, a 20M-
 
 A scan of the same 20 row-group file (decode included): `sum` 107 ms, `count_distinct` 490 ms (756 MB peak), `median` 187 ms (598 MB), `top_k` 105 ms (77 MB, the scan's own).
 
+### Standard deviation and variance (F-177)
+
+```mojo
+from omxcore import stddev, stddev_pop, variance, var_pop
+
+var r = Query(f).group_by(col("region"), groups=n)
+              .agg(stddev(col("revenue")),         # r.floats(0)[g]   sample standard deviation (DuckDB's stddev = stddev_samp)
+                   var_pop(col("revenue")),        # r.floats(1)[g]   population variance
+                   mean(col("revenue")))
+              .compute()
+# r.present(0, g) is False for a group with fewer than two values (the sample variants are NULL there)
+```
+
+| Builder | SQL | Meaning |
+|---|---|---|
+| `stddev(e)` | `stddev(x)`, `stddev_samp(x)` | square root of `variance(e)`; NULL below two values |
+| `stddev_pop(e)` | `stddev_pop(x)` | square root of `var_pop(e)`; 0 for one value, NULL for none |
+| `variance(e)` | `variance(x)`, `var_samp(x)` | the sum of squared deviations from the mean over `n - 1`; NULL below two values |
+| `var_pop(e)` | `var_pop(x)` | the same over `n`; 0 for one value, NULL for none |
+
+- **Result:** always a float64 (`r.floats(i)`, `r.values(i)` holds its bits; in SQL the column kind is FLOAT), whatever the input kind. INT, DECIMAL and FLOAT inputs are
+  read as DuckDB casts them to DOUBLE (`float(v) / 10^scale`; an int64 past 2^53 is rounded, never an error); TEXT, DATE and BOOL are refused (`stddev() needs numbers, found DATE`).
+  NULLs are skipped, as for every aggregate; a group with no rows or only NULLs has no value (`present` false, SQL NULL).
+- **Numerically stable.** The state is a count, a mean and the sum of squared deviations `M2` per group, O(groups) whatever the data. Values are cut into pieces of 65,536 in
+  their order; each piece is two-pass (a Welford mean, then deviations from it with a correction term, compensated sums), and pieces and windows are merged with Chan's pairwise formula, the
+  means kept as a pair (hi + lo) so that a difference of means near 1e15 stays exact. The variance of `1e15 + 1, 2, 3` is exactly 1; a sum-of-squares formula gives 0 or garbage.
+  Because the pieces are fixed, **the bits do not depend on the number of threads** (`Query.threads(n)`), as for float sums. DuckDB's own Welford is accurate to ~1e-9 relative on
+  such data and 1e-5 on 1e15 + small (checked: the tests compare to exact rational arithmetic there and to DuckDB, to 1e-9, elsewhere).
+- **Non-finite results are DuckDB's error:** one NaN or infinity alone is a spread of 0 (`stddev` NULL); two or more values with a NaN or an infinity among them, or an overflow
+  (`1e308, -1e308`), raise `stddev_samp is out of range: ...` (DuckDB: `STDDEV_SAMP is out of range!`).
+- **Sources:** a table, a Frame with edits (the changed rows are folded in after the kernel pass), a streamed Parquet scan (row group by row group, state per group, so memory does not grow with the file),
+  and SQL over all three; with other holistic aggregates they share the one pass over the values (the kernel hook writes the (group, value) pairs, `holistic.mojo` folds them into the moments).
+- **GPU:** CPU only, like the other holistic aggregates: `compute(AUTO)` runs it on the CPU and says `count_distinct, percentile, top_k, stddev and variance run on the CPU` in `fallback_reason`;
+  `compute(GPU)` raises with the same words. (`pipeline_gpu.mojo` and the pinned NVIDIA PTX are untouched.)
+
+### Quantile bins (F-177)
+
+Equal-count bins of a column as a group key, for histograms with even buckets.
+
+```sql
+SELECT quantile_bin(x, 10) AS decile, count(*), min(x), max(x) FROM t WHERE region = 'West' GROUP BY decile ORDER BY decile
+```
+```mojo
+var b = Query(f).where(col("region") == 2).quantile_bins(col("x"), 10)         # the edges: one exact pass
+var r = Query(f).where(col("region") == 2).group_by(b.key(col("x")), groups=b.bins()).agg(count(), min_of(col("x")), max_of(col("x"))).compute()
+```
+
+**The edge rule.** Take the `N` non-NULL values of `x` that the query's `WHERE` keeps (a frame's edits included), sorted. Edge `k` (`k = 1 .. n-1`) is the value at sorted place
+`ceil(k * N / n)` (1-based; whole-number arithmetic, never a float `p`). A value's bin is `1 + the number of edges below it`, so:
+
+- equal values always share a bin; a run of ties that crosses an edge falls into the lower bin (the first bin it touches), so bins are equal-count only for distinct values;
+- a NULL has no bin: SQL gives it the NULL group, the builder leaves the row out;
+- a value above every edge is in bin `n`; with fewer values than bins the top bins are empty (nothing is raised);
+- this is `quantile_disc(x, k / n)` wherever `k / n` is exact, and for distinct values and an `N` that `n` divides it is exactly `ntile(n) OVER (ORDER BY x)` (the tests check both);
+- FLOAT: NaN is above every number (DuckDB's order), so it is bin `n`, and `-0.0 = 0.0`; DATE and DECIMAL bin on the stored values.
+
+| | SQL | Builder |
+|---|---|---|
+| Call | `quantile_bin(x, n)` in `GROUP BY`, the select list or `HAVING`; `x` a column or an expression of INT, DECIMAL, FLOAT or DATE (not a constant), `n` a whole number 2 .. 32 | `Query.quantile_bins(e, n) -> QuantileBins` (edges, `bins()`, `key(e)`) |
+| Bin numbers | `1 .. n` (INT), dense: the planner uses the dense strategy | `0 .. n-1` (`key(e)` is the number of edges below `e`): `group_by(key, groups=n)` |
+| Edges come from | an exact pass of its own before the query is planned (`n - 1` order statistics over the rows the `WHERE` keeps, the holistic machinery; `EXPLAIN` runs it too), then the bin is one comparison and one add per edge | the same, on `Query.quantile_bins` (CPU) |
+| Not supported | in a join or a row query (no `GROUP BY`/aggregate), `quantile_bin(sum(x), n)`, TEXT or BOOL | after `group_by` / `agg`; TEXT, BOOL |
+
+The most bins is 32: each edge is one of the kernel program's 64 constants. The cost is `n - 1` comparisons a row on top of the pass that finds the edges
+(a second query, so `WHERE`s are evaluated twice); an app that bins the same column often keeps the `QuantileBins` and passes `key` to later queries.
+
 ## 6. Sort
 
 ```mojo
@@ -330,7 +396,7 @@ var h = sql(cat, "SELECT ...", o)
 | `WHERE` | `= <> != < <= > >=`, `BETWEEN`, `IN (literals)` of any length, `LIKE` / `ILIKE`, `IS [NOT] NULL`, `IS [NOT] DISTINCT FROM`, `AND OR NOT`, a BOOL column; text, DATE (`DATE '2024-01-31'` or a string next to a DATE column) and decimal literals (aligned to the column's scale); `+ - *`, `//`, `%` on INT and DECIMAL (scales aligned as DuckDB does) and `date + n`, `date - date` |
 | `GROUP BY` | columns, expressions, ordinals (`GROUP BY 1`), select aliases; none at all (one group) |
 | `HAVING`, `ORDER BY` | aggregates and group keys in any expression (a row query: any column or expression, selected or not, several keys); `ORDER BY` keys, aggregates, aliases, ordinals; `ASC` / `DESC`; `NULLS FIRST` / `LAST` (NULLS LAST by default, also for `DESC`, as DuckDB); `LIMIT n [OFFSET m]` |
-| Aggregates | `SUM`, `COUNT(*)`, `COUNT(x)`, `COUNT(DISTINCT x)`, `MIN`, `MAX` (also of TEXT), `AVG`, `MEDIAN`, `QUANTILE_DISC(x, p)` |
+| Aggregates | `SUM`, `COUNT(*)`, `COUNT(x)`, `COUNT(DISTINCT x)`, `MIN`, `MAX` (also of TEXT), `AVG`, `MEDIAN`, `QUANTILE_DISC(x, p)`, `STDDEV` / `STDDEV_SAMP`, `STDDEV_POP`, `VARIANCE` / `VAR_SAMP`, `VAR_POP` (F-177: a FLOAT, NULL below the count they need; section 5) |
 
 **SQL's rules** (the Query builder above keeps its own; both run on the same kernels):
 three-valued logic in `WHERE` / `HAVING` (a row is kept only when the condition is true; `x IN (1, NULL)` is true or unknown; `NOT` of unknown is unknown);
@@ -409,7 +475,7 @@ generated words per text cast).
 | `CAST(x AS t)`, `TRY_CAST`, `x::t` | to INTEGER, BIGINT, SMALLINT, TINYINT (range checked), DECIMAL(p, s) (p up to 18), DOUBLE, REAL, VARCHAR, DATE, BOOLEAN. INT / DECIMAL / FLOAT / BOOL convert as DuckDB does (DECIMAL to INT or to fewer places and FLOAT to DECIMAL round halves away from zero, DOUBLE to INT rounds halves to even, DOUBLE to REAL past the 32-bit range fails); a value that does not fit raises `a value could not be converted (CAST(...))` (TRY_CAST: NULL). **TEXT to INT / DECIMAL / DOUBLE / REAL / DATE / BOOLEAN** reads each distinct word once, as DuckDB reads it (spaces around, `+` and `-`, `1_000`, `0x1F`, `.5`, exponents for integers and doubles, `YYYY-M-D` with `-` `/` ` ` or `\` as separators and trailing text, the boolean words); a word that is not one is an error where a row holds it (TRY_CAST: NULL). **To VARCHAR**: BOOLEAN, and an INT, DECIMAL or DATE *column* (the words of its lowest-to-highest range, up to 4,194,304 values, are made once). DATE to anything but VARCHAR, INT to DATE and FLOAT to VARCHAR are refused (DuckDB refuses the first two) |
 | Text functions | `lower`, `upper` (DuckDB's own case mapping, generated from it: `İ` lowers to `i`, `ß` uppers to `ẞ`), `trim`, `ltrim`, `rtrim` (spaces, or the characters given), `substr` / `substring` (also `FROM .. FOR ..`; DuckDB's window rules: a negative start counts from the end, a negative length reads backwards), `length` (code points), `left`, `right`, `reverse`, `replace`, `strpos` / `instr`, `starts_with` / `prefix`, `ends_with` / `suffix`, `contains`, `concat` and `\|\|` (`\|\|` is NULL with a NULL, `concat` reads it as ''), `LIKE` / `ILIKE` / `NOT LIKE` with `_`, `%` and `ESCAPE` (no escape character unless named; the pattern is a constant), `IN` lists of words |
 | Text compared with text | `=`, `<>` between two columns or expressions compare bytes (a word is translated into the other's code space once); `<`, `<=`, `>`, `>=` compare in the owner's order (ignoring ASCII case, bytes break ties) through one ranking of the words of both; across the two tables of a join too |
-| Dates | `EXTRACT(part FROM d)`, `date_part('part', d)`, `year()`, `month()`, `day()`, `quarter()`, `dayofweek()`, `isodow()`, `dayofyear()`, `decade()` (parts: year month day dow isodow doy quarter epoch decade century millennium); `date_trunc(part, d)` (year quarter month week day decade century millennium); `date + INTERVAL n DAY / WEEK / MONTH / YEAR` and `date - INTERVAL ...` (the amount a constant or an INT expression; months clamp to the end of the month: Jan 31 + 1 month is Feb 28 / 29); `date - date` (days), `datediff(part, a, b)` / `date_diff` (day, week, month, quarter, year, decade, century, millennium: DuckDB's boundary counting). Constants fold at bind time (`DATE '1998-12-01' - INTERVAL '90' DAY` is one DATE). `EXTRACT(epoch ...)` is a FLOAT, as DuckDB's. All in integer civil-date arithmetic (floor divisions: right before 1970) in the existing opcodes; a date function of one column is instead answered once per day of the column's range (a table the kernel looks the day up in) when that range is short against the rows, and `GROUP BY` of a date part, a truncated date or a date moved by months is dense when the range is known |
+| Dates | `EXTRACT(part FROM d)`, `date_part('part', d)`, `year()`, `month()`, `day()`, `quarter()`, `dayofweek()`, `isodow()`, `dayofyear()`, `decade()` (parts: year month day dow isodow doy quarter epoch decade century millennium **week isoyear weekofyear**, F-177: `week(d)` / `weekofyear(d)` / `EXTRACT(week FROM d)` is the ISO 8601 week number 1 .. 53 and `isoyear(d)` the ISO week-numbering year, DuckDB's, so 2021-01-03 is week 53 of 2020 and 2024-12-30 is week 1 of 2025; computed from the Thursday of the date's week; both are dense group keys: 1 .. 53 and the dates' range of years); `date_trunc(part, d)` (year quarter month week day decade century millennium); `date + INTERVAL n DAY / WEEK / MONTH / YEAR` and `date - INTERVAL ...` (the amount a constant or an INT expression; months clamp to the end of the month: Jan 31 + 1 month is Feb 28 / 29); `date - date` (days), `datediff(part, a, b)` / `date_diff` (day, week, month, quarter, year, decade, century, millennium: DuckDB's boundary counting). Constants fold at bind time (`DATE '1998-12-01' - INTERVAL '90' DAY` is one DATE). `EXTRACT(epoch ...)` is a FLOAT, as DuckDB's. All in integer civil-date arithmetic (floor divisions: right before 1970) in the existing opcodes; a date function of one column is instead answered once per day of the column's range (a table the kernel looks the day up in) when that range is short against the rows, and `GROUP BY` of a date part, a truncated date or a date moved by months is dense when the range is known |
 | Arithmetic | as before, plus: `//` of a DECIMAL or FLOAT is a division of doubles with a zero divisor NULL (DuckDB's, not a floor), `x // 0` and `x % 0` on integers and decimals are NULL, `/` is always a FLOAT, decimal sums and products keep DuckDB's scales (a product past 18 places raises) |
 
 **How the text functions run.** A TEXT column is a dictionary and codes; a function of it is evaluated **once per distinct word**, not per row, and the kernel looks the codes up (`OP_TAB`: a table of

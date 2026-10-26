@@ -5,7 +5,7 @@
 from std.ffi import c_int
 from omxcore import (Table, SharedTable, Frame, INT, DECIMAL, TEXT, Query, col, sum, count, CPU, GPU, AUTO,
                      DeviceTable, gpu_available, read_csv, write_parquet, read_parquet, scan_parquet, UNCOMPRESSED, ZSTD,
-                     count_distinct, median, percentile, top_k, Catalog, PlannerOptions, GROUP_HASHED, sql, range_aggregate, read_block,
+                     count_distinct, median, percentile, top_k, stddev, var_pop, Catalog, PlannerOptions, GROUP_HASHED, sql, range_aggregate, read_block,
                      compute_job, sql_job, read_csv_job, read_parquet_job, save_job, write_parquet_job, permutation_job, JOB_DONE)
 
 
@@ -24,6 +24,9 @@ def run() raises:
     print(r.counts[0], r.device, gpu_available())
     var h = Query(f).group_by(col("k"), 3).agg(count_distinct(col("v")), median(col("v")), percentile(col("v"), 0.9), top_k(col("v"), 2)).compute(AUTO)
     print(h.values(0)[0], h.values(1)[0], h.top(3, 0).__len__())
+    var sp = Query(f).group_by(col("k"), 3).agg(stddev(col("v")), var_pop(col("v"))).compute(AUTO)      # F-177
+    var qbins = Query(f).quantile_bins(col("v"), 4)
+    print(sp.floats(0)[0], sp.present(1, 0), qbins.bins(), Query(f).group_by(qbins.key(col("v")), qbins.bins()).agg(count()).compute(AUTO).counts[0])
     try:
         var d = DeviceTable(shared)                  # raises "no GPU on this build" off Linux
         _ = Query(shared).on_device(d).agg(count()).compute(GPU)
@@ -54,6 +57,9 @@ def run() raises:
     for name in ["t", "f", "s"]:
         var a = sql(cat, "SELECT k, count(*), sum(v), avg(v) FROM " + name + " WHERE v > 0 GROUP BY k ORDER BY 2 DESC LIMIT 2")
         var b = sql(cat, "SELECT k, count(DISTINCT v), median(v), min(v) FROM " + name + " GROUP BY k HAVING count(*) > 1", hashed)
+        var sd = sql(cat, "SELECT quantile_bin(v, 3) AS b, stddev(v), var_pop(v) FROM " + name + " GROUP BY b")                      # F-177
+        var iso = sql(cat, "SELECT count(*) FROM " + name + " WHERE week(DATE '2021-01-03') = 53 AND isoyear(DATE '2021-01-03') = 2020")
+        print(sd.table.rows(), iso.table.rows())
         print(a.table.rows(), b.table.rows(), a.notes[0], sql(cat, "EXPLAIN SELECT count(*) FROM " + name).explain)
         # F-152: row queries: the materialize sink, a top-k, SELECT DISTINCT
         var r1 = sql(cat, "SELECT k, v, v + 1 FROM " + name + " WHERE v > 0 ORDER BY v DESC LIMIT 3")
