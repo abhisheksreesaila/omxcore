@@ -22,10 +22,12 @@ from .query import (Program, QueryResult, _run_cpu, _run_cpu_job, _run_mat, _key
 from .kernels._fpenv import core_count, par_n
 from .kernels.pipeline_cpu import IP, LP, FP, BP, VEC, E_OVERFLOW, _no_front, _no_keys, pipeline_keyed
 from .kernels.hashagg_cpu import hash_aggregate
-from .holistic import HolStates, HolSpec, HolResult, A_DISTINCT, A_PCT, A_MEDIAN, window_blocks, float_key
+from .holistic import (HolStates, HolSpec, HolResult, A_DISTINCT, A_PCT, A_MEDIAN, A_QEDGE, A_VAR_POP, A_VAR_SAMP, A_STDDEV_POP, A_STDDEV_SAMP, window_blocks,
+                           float_key)
 from .sql import sql_error, EXPLAIN_NONE, EXPLAIN_ANALYZE
 from .bind import (copy_query, Catalog, SqlSource, BoundQuery, SortKey, bind_sql, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, F_COUNT_STAR,
-                   F_COUNT, F_SUM, F_MIN, F_MAX, F_AVG, F_COUNT_DISTINCT, F_MEDIAN, pow10_checked)
+                   F_COUNT, F_SUM, F_MIN, F_MAX, F_AVG, F_COUNT_DISTINCT, F_MEDIAN, F_STDDEV_SAMP, F_STDDEV_POP, F_VAR_SAMP, F_VAR_POP, F_QEDGE, B_QBIN, B_LIT, B_AGG,
+                   BExpr, AggSpec, KeySpec, pow10_checked)
 from .plan import LogicalPlan, build_plan, executable
 from .post import run_post
 from .join import (needed_columns, side_query, joined_query, virtual_schema, all_needed, needed_after, table_of_column, filter_query, final_query, count_query,
@@ -325,7 +327,7 @@ def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hre
             var f = sp_a.func
             var arg_float = sp_a.arg >= 0 and q.rexprs[sp_a.arg].kind == FLOAT.value
             if sp_a.hol:                                          # the holistic states: count(DISTINCT), median, quantile_disc, min / max of TEXT
-                var present = hres.counts[h][g] > 0
+                var present = hres.counts[h][g] >= (2 if f == F_STDDEV_SAMP or f == F_VAR_SAMP else 1)       # (the sample variants need two values)
                 if f == F_COUNT_DISTINCT:
                     vc.v[i] = Int64(hres.vals[h][g])
                 elif not present:
@@ -375,6 +377,7 @@ def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hre
 def _holistic_states(q: BoundQuery, groups: Int, sp: SqlProgram, dicts: DictAccess, rows: Int) raises -> HolStates:
     var specs = List[HolSpec]()
     var ranks = List[List[Int64]]()
+    var scales = List[Int](length=sp.n_src, fill=0)                # the decimal places of a stddev / variance source
     for _ in range(sp.n_src):
         ranks.append(List[Int64]())
     for a in range(len(q.aggs)):
@@ -382,14 +385,26 @@ def _holistic_states(q: BoundQuery, groups: Int, sp: SqlProgram, dicts: DictAcce
             continue
         ref sa = q.aggs[a]
         var kind = A_DISTINCT if sa.func == F_COUNT_DISTINCT else A_MEDIAN if sa.func == F_MEDIAN else A_PCT
-        specs.append(HolSpec(a, kind, sa.p, 0, sp.agg_src[a]))
+        if sa.func == F_STDDEV_SAMP:
+            kind = A_STDDEV_SAMP
+        elif sa.func == F_STDDEV_POP:
+            kind = A_STDDEV_POP
+        elif sa.func == F_VAR_SAMP:
+            kind = A_VAR_SAMP
+        elif sa.func == F_VAR_POP:
+            kind = A_VAR_POP
+        if sa.func == F_QEDGE:
+            kind = A_QEDGE
+        specs.append(HolSpec(a, kind, sa.p, sa.bins if sa.func == F_QEDGE else 0, sp.agg_src[a]))
+        if kind >= A_VAR_POP and kind <= A_STDDEV_SAMP and q.rexprs[sa.arg].kind == DECIMAL.value:
+            scales[sp.agg_src[a]] = q.rexprs[sa.arg].scale
         if sa.func != F_COUNT_DISTINCT and q.rexprs[sa.arg].kind == TEXT.value and len(ranks[sp.agg_src[a]]) == 0:
             var c = q.rexprs[sa.arg].src                       # (a derived TEXT value: its own dictionary)
             var words = List[String]()
             for k in range(dicts.count(c)):
                 words.append(dicts.word(c, k))
             ranks[sp.agg_src[a]] = text_ranks(words)
-    return HolStates(groups, specs^, ranks^, rows, sp.p.src_float.copy())
+    return HolStates(groups, specs^, ranks^, rows, sp.p.src_float.copy(), scales^)
 
 
 def _run_dense_fused(t: SharedTable, sp: SqlProgram, mask_addr: Int, threads: Int, fj: ArcPointer[FusedJoin], start: Int = 0, stop: Int = -1) raises -> QueryResult:
@@ -1661,7 +1676,96 @@ def _run_sql_once[P: Planner](mut catalog: Catalog, q0: BoundQuery, planner: P, 
     return res^
 
 
+def _unresolved_bins(q: BoundQuery) -> List[Int]:
+    """The quantile_bin nodes whose edges are not known yet (`b` is -1 and there are no edge literals)."""
+    var out = List[Int]()
+    for i in range(len(q.rexprs)):
+        if q.rexprs[i].op == B_QBIN and q.rexprs[i].b == -1 and len(q.rexprs[i].items) == 0:
+            out.append(i)
+    return out^
+
+
+def _reaches(q: BoundQuery, root: Int, target: Int) -> Bool:
+    """Whether row-level expression `target` is `root` or inside it."""
+    if root < 0:
+        return False
+    if root == target:
+        return True
+    ref x = q.rexprs[root]
+    if _reaches(q, x.a, target) or _reaches(q, x.b, target):
+        return True
+    for it in x.items:
+        if _reaches(q, it, target):
+            return True
+    return False
+
+
+def _resolve_bins[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: P, opts: PlannerOptions) raises -> BoundQuery:
+    """quantile_bin(x, n) needs the n - 1 edges of equal-count bins of x: edge k is the value at sorted place ceil(k * N / n) among the N non-NULL values
+    of x that the query's WHERE lets through. They are found by a query of their own (n - 1 exact order statistics of x, one pass over the source, the
+    holistic machinery) before the real one is planned, and written into the node as literals of x's own type."""
+    if q.joined or q.rows:
+        raise Error("quantile_bin() is supported in an aggregate query over one table (GROUP BY quantile_bin(x, n)), not in a join or a row query yet")
+    var todo = _unresolved_bins(q)
+    for i in todo:                                       # only as (part of) a GROUP BY key: not in WHERE, an aggregate's argument, or another quantile_bin
+        var forbidden = List[Int]()
+        forbidden.append(q.where)
+        for a in q.aggs:
+            forbidden.append(a.arg)
+        for j in todo:
+            forbidden.append(q.rexprs[j].a)
+        var keyed = False
+        for k in q.keys:
+            keyed = keyed or _reaches(q, k.expr, i)
+        var bad = not keyed
+        for r in forbidden:
+            bad = bad or _reaches(q, r, i)
+        if bad:
+            raise Error("quantile_bin() is supported only in GROUP BY (a key of an aggregate query over one table), not in WHERE, inside an aggregate or another quantile_bin")
+    var out = copy_query(q)
+    for i in todo:
+        var node = q.rexprs[i].copy()
+        var n = Int(node.value)
+        var x = q.rexprs[node.a].copy()
+        var aux = copy_query(q)
+        for j in todo:
+            aux.rexprs[j].b = -2                                      # (the query's bins are being resolved: the aux query neither resolves nor checks them again)
+        aux.keys = List[KeySpec]()
+        aux.aggs = List[AggSpec]()
+        aux.pexprs = List[BExpr]()
+        aux.outputs = List[Int]()
+        aux.out_names = List[String]()
+        aux.out_text = List[String]()
+        aux.order = List[SortKey]()
+        aux.order_text = List[String]()
+        aux.having = -1
+        aux.limit = -1
+        aux.offset = 0
+        aux.explain = EXPLAIN_NONE
+        for k in range(1, n):
+            var name = "edge" + String(k)
+            aux.aggs.append(AggSpec(F_QEDGE, node.a, Float64(k), x.kind, x.scale, name, "qedge:" + String(k), True, n))
+            aux.pexprs.append(BExpr(B_AGG, x.kind, x.scale, -1, -1, Int64(k - 1), name, node.line, node.col))
+            aux.outputs.append(k - 1)
+            aux.out_names.append(name)
+            aux.out_text.append(name)
+        var r = run_sql(catalog, aux, planner, opts)
+        for k in range(n - 1):                                        # (no value at all: every x is NULL or filtered out, so no row reaches the bin)
+            var edge = Int64(0) if r.table.is_null(k, 0) else r.table.get(k, 0)
+            out.rexprs.append(BExpr(B_LIT, x.kind, x.scale, -1, -1, edge, "", node.line, node.col))
+            out.rexprs[i].items.append(len(out.rexprs) - 1)
+    return out^
+
+
 def run_sql[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: P, opts: PlannerOptions) raises -> SqlResult:
+    """Runs the query (after finding the edges of any quantile_bin in it)."""
+    if len(_unresolved_bins(q)) > 0:
+        var resolved = _resolve_bins(catalog, q, planner, opts)
+        return _run_sql_resolved(catalog, resolved, planner, opts)
+    return _run_sql_resolved(catalog, q, planner, opts)
+
+
+def _run_sql_resolved[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: P, opts: PlannerOptions) raises -> SqlResult:
     """Runs the query. A Parquet footer's min / max and null counts are a hint that lets the planner use dense groups and skip NULL
     checks; they are verified as the row groups are read (a null count that is wrong, a row outside a stated range), and when one
     is wrong the query runs again without the statistics, which the notes say."""

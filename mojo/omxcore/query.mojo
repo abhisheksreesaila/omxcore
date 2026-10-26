@@ -24,21 +24,25 @@ Semantics, as the app's stand-in (mojoui frame_gpu.group_sum), plus nulls:
 - `count_distinct(e)`, `median(e)` (DuckDB's median, exact at scale + 1) / `percentile(e, p)` (quantile_disc) and `top_k(e, k)` (F-148) are exact
   per group over a table, a Frame and a scan, ignore nulls, and run on the CPU: the kernel's per-block hook writes the
   (group, value) pairs and holistic.mojo consumes them (`r.values(i)`, `r.present(i, g)`, `r.top(i, g)`).
+- `stddev(e)` / `stddev_pop(e)` / `variance(e)` / `var_pop(e)` (F-177) are float64 aggregates folded from the same pairs into a count, a mean and a sum of squared
+  deviations per group (`r.floats(i)`; `present` is false below the two values the sample variants need). `Query.quantile_bins(e, n)` finds the edges of
+  n equal-count bins (A_QEDGE aggregates, whole-number order statistics) and `QuantileBins.key(e)` is the bin number 0 .. n-1 as a group key.
 """
 from std.time import perf_counter_ns
 from std.atomic import Atomic
 from std.memory import Pointer
-from .table import SharedTable, Table, TEXT, FLOAT, INT, DECIMAL
+from .table import SharedTable, Table, TEXT, FLOAT, INT, DECIMAL, DATE, BOOL
 from .parquet import ParquetScan, _GroupPlan, _GroupReader, _open_plan, _copy_bits, _count_bits
 from .frame import Frame, Overlay, _eval_row, _eval_row_t
-from .expr import (Expr, Node, N_COL, N_LIT, N_LITF, N_DIV, N_I2F, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG, N_LEAST, N_GREATEST,
+from .expr import (MAX_QUANTILE_BINS, Expr, Node, N_COL, N_LIT, N_LITF, N_DIV, N_I2F, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG, N_LEAST, N_GREATEST,
                    N_LT, N_LE, N_GT, N_GE, N_EQ, N_NE, N_AND, N_OR, N_NOT, N_BOOL2INT, N_SCALE_TO)
 from .kernels._fpenv import core_count, par_n
 from .kernels.pipeline_cpu import pipeline_keyed, pipeline_plain, E_OVERFLOW, IP, FP, LP, VEC
 from .kernels.pipeline_gpu import run_pipeline_gpu, _choose_mode, scratch_rows, int_word_program_ok, APPLE_GPU, HDR as GPU_HDR
 from max.gpu.host import DeviceContext, DeviceBuffer
 from .gpu import DeviceTable, HAS_GPU, NO_GPU_MESSAGE, gpu_available, _ScanContext, _scan_context, _stage_load, _stage_data, _stage_valid, _pinned_prepare
-from .holistic import HolStates, HolSpec, HolResult, window_blocks, heap_offer, float_key, A_DISTINCT, A_PCT, A_TOPK, A_MEDIAN
+from .holistic import (HolStates, HolSpec, HolResult, window_blocks, heap_offer, float_key, A_DISTINCT, A_PCT, A_TOPK, A_MEDIAN,
+                       A_VAR_POP, A_VAR_SAMP, A_STDDEV_POP, A_STDDEV_SAMP, A_QEDGE, is_spread, spread_needs)
 from .joincore import JoinKeys, JoinSide, normalize_keys, join_pairs, select_rows, gather_join, JOIN_BUDGET_BYTES
 from .kernels.hashjoin_cpu import hj_build, PM_SEMI, PM_ANTI
 from .frame import text_ranks
@@ -168,6 +172,28 @@ def median(e: Expr) -> Agg:
     return Agg(A_MEDIAN, e.copy())
 
 
+def stddev(e: Expr) -> Agg:
+    """The sample standard deviation of the group's non-null values (DuckDB's `stddev` = `stddev_samp`): a float64 (`r.floats(i)`), no value
+    (`r.present(i, g)` false) for a group with fewer than two. INT, DECIMAL and FLOAT values are read as float64 as DuckDB casts them
+    (`float(v) / 10^scale`); the sum of squared deviations is stable against cancellation (F-177)."""
+    return Agg(A_STDDEV_SAMP, e.copy())
+
+
+def stddev_pop(e: Expr) -> Agg:
+    """The population standard deviation (`stddev_pop`): a value for a group of one (0.0), none for an empty one."""
+    return Agg(A_STDDEV_POP, e.copy())
+
+
+def variance(e: Expr) -> Agg:
+    """The sample variance (DuckDB's `variance` = `var_samp`); see `stddev`."""
+    return Agg(A_VAR_SAMP, e.copy())
+
+
+def var_pop(e: Expr) -> Agg:
+    """The population variance (`var_pop`); see `stddev_pop`."""
+    return Agg(A_VAR_POP, e.copy())
+
+
 def top_k(e: Expr, k: Int) -> Agg:
     """The k largest non-null values of e in the group, largest first, repeats kept (`r.top(i, g)`)."""
     return Agg(A_TOPK, e.copy(), 0.0, k)
@@ -180,6 +206,32 @@ struct PlanNode(Copyable, Movable):
     var exprs: List[Expr]         # Filter: the predicate; Aggregate: the group key (none for one group)
     var aggs: List[Agg]
     var groups: Int
+
+
+struct QuantileBins(Copyable, Movable):
+    """The edges of equal-count bins (`Query.quantile_bins`): edge k is the value at sorted place ceil(k * N / bins). `key(e)` is the bin of a row, 0 ..
+    bins()-1: the number of edges below its value, an `Expr` for `group_by(key, groups=bins())`."""
+    var edges: List[Int64]       # stored values (a FLOAT column's are float64 bits)
+    var is_float: Bool
+
+    def __init__(out self, var edges: List[Int64], is_float: Bool):
+        self.edges = edges^
+        self.is_float = is_float
+
+    def bins(self) -> Int:
+        return len(self.edges) + 1
+
+    def key(self, e: Expr) -> Expr:
+        """The bin of `e` (0 .. bins()-1): the sum over the edges of (e > edge) as 1 or 0."""
+        var acc = Expr(0)
+        for k in range(len(self.edges)):
+            var edge = Expr(Float64(from_bits=UInt64(self.edges[k]))) if self.is_float else Expr(Int(self.edges[k]))
+            var term = (e > edge)._un(N_BOOL2INT)
+            if k == 0:
+                acc = term^
+            else:
+                acc = acc + term
+        return acc^
 
 
 struct Query(Movable):
@@ -273,6 +325,31 @@ struct Query(Movable):
         for a in aggs:
             self.nodes[at].aggs.append(a.copy())
         return self^
+
+    def quantile_bins(var self, e: Expr, bins: Int) raises -> QuantileBins:
+        """Equal-count bins of `e` over the rows this query keeps (its `where`s, a Frame's edits, a scan's row groups): the `bins` - 1 edges, found
+        exactly. Edge k (k = 1 .. bins-1) is the value at sorted place ceil(k * N / bins) of the N non-null values of `e` (whole-number arithmetic);
+        a value's bin is the number of edges below it, 0 .. bins-1, so equal values share a bin and a run of ties across an edge falls in the lower
+        bin. It is SQL's `quantile_bin(e, bins)` minus one. Use it as the key of a second query:
+
+            var b = Query(f).where(...).quantile_bins(col("x"), 10)
+            var r = Query(f).where(...).group_by(b.key(col("x")), groups=b.bins()).agg(count(), sum(col("y"))).compute()
+
+        The bins are of `e` over the rows that pass this query's filters: give both queries the same `where`s. A row whose `e` is null has no bin
+        (the builder leaves a null key out). One pass over the data on the CPU; at most MAX_QUANTILE_BINS (32) bins."""
+        if bins < 2 or bins > MAX_QUANTILE_BINS:
+            raise Error("quantile_bins: the number of bins is a whole number from 2 to " + String(MAX_QUANTILE_BINS) + ", got " + String(bins))
+        if self._aggregate() >= 0:
+            raise Error("quantile_bins comes before group_by and agg: it bins the rows that pass the filters")
+        var aggs = List[Agg]()
+        for k in range(1, bins):
+            aggs.append(Agg(A_QEDGE, e.copy(), Float64(k), bins))
+        self.nodes.append(PlanNode(P_AGGREGATE, self._top(), List[Expr](), aggs^, 1))
+        var r = self.compute(CPU)
+        var out = QuantileBins(List[Int64](), r.is_float(0))
+        for i in range(bins - 1):
+            out.edges.append(Int64(r.values(i)[0]) if r.present(i, 0) else Int64(0))      # (no value at all: no row reaches a bin)
+        return out^
 
     def morsels(var self, mode: Int) -> Self:
         """How a Parquet scan runs: MORSELS_AUTO (by row-range morsels on all cores when the file is big enough),
@@ -400,7 +477,7 @@ struct Query(Movable):
             comptime if not HAS_GPU:
                 raise Error("device GPU: " + NO_GPU_MESSAGE)
             if holistic:
-                raise Error("device GPU: count_distinct, percentile and top_k run on the CPU")
+                raise Error("device GPU: count_distinct, percentile, top_k, stddev and variance run on the CPU")
             if not self.device:
                 raise Error("device GPU: no DeviceTable is attached (Query.on_device(DeviceTable(table)))")
             if not self.device.value().is_live():
@@ -408,7 +485,7 @@ struct Query(Movable):
             use_gpu = True
         elif device == AUTO and self.device and self.device.value().is_live() and self.table.rows() >= AUTO_GPU_MIN_ROWS:
             if holistic:
-                fallback = "count_distinct, percentile and top_k run on the CPU"
+                fallback = "count_distinct, percentile, top_k, stddev and variance run on the CPU"
             else:
                 use_gpu = True
         var t0 = perf_counter_ns()
@@ -430,7 +507,7 @@ struct Query(Movable):
             fallback = "a FLOAT column or float arithmetic runs on the CPU (a float64 sum has one defined order there)"
         var hs = HolStates(1, List[HolSpec](), List[List[Int64]]())
         if prog.mat:
-            hs = _build_states(self.nodes, nodes, self.table, self.overlay.words, None, -1 if self.framed else self.table.rows(), prog.src_float.copy())
+            hs = _build_states(self.nodes, nodes, self.table, self.overlay.words, None, -1 if self.framed else self.table.rows(), prog.src_float.copy(), prog.src_scale.copy())
         var r = QueryResult()
         var done = False
         if use_gpu:
@@ -518,7 +595,7 @@ struct QueryResult(Movable):
     def is_float(self, i: Int) -> Bool:
         """Aggregate i's value is a float64 (`floats(i)`): a float sum, mean, min, max, median or quantile (not count_distinct)."""
         if self.hol_of[i] >= 0:
-            return self.hfloat[self.hol_of[i]] and self.kinds[i] != A_DISTINCT
+            return is_spread(self.kinds[i]) or (self.hfloat[self.hol_of[i]] and self.kinds[i] != A_DISTINCT)
         return len(self.agg_float) > i and self.agg_float[i]
 
     def floats(self, i: Int) -> List[Float64]:
@@ -584,7 +661,7 @@ struct QueryResult(Movable):
         """Aggregate i has a value in group g: a row whose value is not null (a min / max / mean over only nulls
         has none, and its number is meaningless). count_distinct, percentile, top_k: the group has a non-null value."""
         if self.hol_of[i] >= 0:
-            return self.hcount[self.hol_of[i]][g] > 0
+            return self.hcount[self.hol_of[i]][g] >= (spread_needs(self.kinds[i]) if is_spread(self.kinds[i]) else 1)
         if self.count_slot_of[i] >= 0:
             return self.slots[self.count_slot_of[i]][g] > 0
         return self.counts[g] > 0
@@ -624,6 +701,7 @@ struct Program(Movable):
     var agg_float: List[Bool]        # per aggregate: its value is a float64 (sum, mean, min, max of a float expression)
     var nan_slot_of: List[Int]       # per float min / max: the slot counting the NaNs it left out (NaN is above every number), else -1
     var src_float: List[Bool]        # per holistic source: it reads float64 values (the hook turns them into order-preserving keys)
+    var src_scale: List[Int]         # per holistic source: the decimal places of its integer values (stddev / variance read float(v) / 10^scale)
     var conv: List[String]           # F-156: the casts that can fail (OP_FLAG): what the error says when one does
     var text_tabs: Int               # F-156: the per-word tables the program carries (a text function answered once per dictionary word)
     var text_words: Int              # ... and how many words they were evaluated on
@@ -663,6 +741,7 @@ struct Program(Movable):
         self.agg_float = List[Bool]()
         self.nan_slot_of = List[Int]()
         self.src_float = List[Bool]()
+        self.src_scale = List[Int]()
         self.conv = List[String]()
         self.text_tabs = 0
         self.text_words = 0
@@ -1005,6 +1084,7 @@ def _lower(t: SharedTable, nodes: List[PlanNode], force_counts: Bool, masked: Bo
     p.src_vreg = List[Int](length=p.n_src, fill=-1)
     p.src_valid = List[Int](length=p.n_src, fill=-1)
     p.src_float = List[Bool](length=p.n_src, fill=False)
+    p.src_scale = List[Int](length=p.n_src, fill=0)
     if p.mat:                                            # register 1: the address of the control block the hook reads
         p.section = 1
         p.ctl_const = len(p.consts)
@@ -1090,6 +1170,7 @@ def _lower(t: SharedTable, nodes: List[PlanNode], force_counts: Bool, masked: Bo
                 var vs = _compile_typed(p, a.arg, t)
                 p.src_vreg[src] = p.keep(vs.reg, False)
                 p.src_float[src] = vs.fl
+                p.src_scale[src] = vs.scale if vs.scale > 0 else 0
                 p.reset_temps()
             continue
         p.section = 1
@@ -1582,7 +1663,7 @@ def _run_mat(t: SharedTable, p: Program, mask_addr: Int, mut hs: HolStates, wind
 
 
 def _build_states(orig: List[PlanNode], nodes: List[PlanNode], base: SharedTable, extra: List[List[String]],
-                  scan: Optional[ParquetScan] = None, max_rows: Int = -1, var floats: List[Bool] = List[Bool]()) raises -> HolStates:
+                  scan: Optional[ParquetScan] = None, max_rows: Int = -1, var floats: List[Bool] = List[Bool](), var scales: List[Int] = List[Int]()) raises -> HolStates:
     """The states for the plan's holistic aggregates (none: an empty set). `nodes` are the plan with a frame's formulas
     and merges expanded (they decide which aggregates share a value source), `orig` the plan as built (to see which
     values are a plain TEXT column, whose percentile / top_k order is the words' alphabetical order, not the codes').
@@ -1607,6 +1688,12 @@ def _build_states(orig: List[PlanNode], nodes: List[PlanNode], base: SharedTable
             continue
         ref a = nodes[at].aggs[i]
         specs.append(HolSpec(i, a.kind, a.p, a.k, src_of[i]))
+        if is_spread(a.kind) or a.kind == A_QEDGE:         # numbers only (bins also dates): a word or a flag has no spread, and no order worth cutting
+            for name in orig[at].aggs[i].arg.columns():
+                var c = base.index(name)
+                if c >= 0 and (base.kind(c) == TEXT or base.kind(c) == BOOL or (base.kind(c) == DATE and a.kind != A_QEDGE)):
+                    raise Error(("quantile bins" if a.kind == A_QEDGE else "stddev / variance") + " need numbers" + (" or dates" if a.kind == A_QEDGE else "") + ": column `" + name + "` is not one")
+            continue
         if a.kind == A_DISTINCT or len(ranks[src_of[i]]) > 0:
             continue
         ref oa = orig[at].aggs[i].arg
@@ -1626,7 +1713,7 @@ def _build_states(orig: List[PlanNode], nodes: List[PlanNode], base: SharedTable
                     for w in extra[c]:
                         words.append(w)
                 ranks[src_of[i]] = text_ranks(words)
-    return HolStates(nodes[at].groups, specs^, ranks^, max_rows, floats^)
+    return HolStates(nodes[at].groups, specs^, ranks^, max_rows, floats^, scales^)
 
 
 def _finish_holistic(mut r: QueryResult, mut hs: HolStates) raises:
@@ -2364,7 +2451,7 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int, orig: L
     job.check()
     for c in used:                           # every dictionary the plan needs is built before groups decode beside the kernel
         scan.ensure_words(c)
-    var hs = _build_states(orig, nodes, scan.schema, o.words, Optional[ParquetScan](scan.copy()), -1 if framed else scan.rows(), shape.src_float.copy())    # (text order needs the words)
+    var hs = _build_states(orig, nodes, scan.schema, o.words, Optional[ParquetScan](scan.copy()), -1 if framed else scan.rows(), shape.src_float.copy(), shape.src_scale.copy())    # (text order needs the words)
     var sm = _ScanMask()                                                      # F-147
     if len(o.mask) > 0:
         sm.addr = Int(o.mask.unsafe_ptr())

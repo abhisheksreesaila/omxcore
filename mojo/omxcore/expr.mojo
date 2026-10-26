@@ -12,6 +12,8 @@ above every number, -0.0 equals 0.0). Comparisons and `&` / `|` / `~` give boole
     (col("region") == 2) & col("day").between(0, 364)
 """
 
+comptime MAX_QUANTILE_BINS = 32      # quantile bins (F-177): every edge is one constant of the kernel program, which holds 64
+
 comptime N_COL = 1
 comptime N_LIT = 2
 comptime N_LITF = 3          # a float64 literal: value = its bits (F-157)

@@ -23,6 +23,11 @@ is not null, packed block by block (a `Window`). This file consumes those pairs:
   counting sort, then each group is selected, not sorted: quickselect (three-way, O(n)) for small groups, and for a
   group of 262,144 values or more a parallel most-significant-byte radix select, which reads the values
   without moving them (about two passes for values in a small range, at most eight).
+- variance and standard deviation (F-177): O(groups) state, a count, a mean and the sum of squared deviations M2 per group. A window's values
+  are grouped, each group is cut into pieces of SPREAD_PIECE values in their order, each piece is two-pass (a Welford mean, then
+  deviations from it with a correction term, sums compensated), and pieces and windows are merged left to right with Chan's formula: stable
+  against cancellation (1e9 + 1, 1e9 + 2 ...), and the same bits for any number of threads. Integers and decimals become float64 as DuckDB
+  casts them (`float(v) / 10^scale`, past 2^53 rounded, never an error); float64 NaN / inf make the result NaN.
 - text: percentile and top-k order words alphabetically (the column's sort order, `Frame.permutation`'s) not by code:
   the values are mapped to their rank before ordering and back to the code after (`ranks`, `unranks`).
 """
@@ -30,7 +35,7 @@ from std.memory import Pointer
 from std.sys import prefetch, PrefetchOptions
 from std.atomic import Atomic
 from std.bit import count_leading_zeros
-from std.math import ceil, log
+from std.math import ceil, log, sqrt, isfinite
 from .kernels._fpenv import core_count, par_n
 
 comptime LP = Pointer[Int64, MutUntrackedOrigin]
@@ -44,6 +49,12 @@ comptime A_DISTINCT = 6
 comptime A_PCT = 7
 comptime A_TOPK = 8
 comptime A_MEDIAN = 9                 # DuckDB's `median` (quantile_cont): the mean of the two middle values, at scale + 1
+comptime A_VAR_POP = 10               # var_pop / var_samp / stddev_pop / stddev_samp (F-177): a float64 from the group's count, mean and sum of squared deviations
+comptime A_VAR_SAMP = 11
+comptime A_STDDEV_POP = 12
+comptime A_STDDEV_SAMP = 13
+comptime A_QEDGE = 14                # edge k of n quantile bins (F-177): the value at sorted place ceil(k * N / n), by integer arithmetic (`p` holds k, `k` holds n)
+comptime SPREAD_PIECE = 65536        # values folded into one (count, mean, M2) piece: fixed, so the bits do not depend on the number of threads
 comptime UPPER_MIDDLE = 2.0          # a `p` that asks _percentiles for the upper middle value, index n // 2
 
 comptime BLOCK = 65536               # entries in a block made from a flat array
@@ -442,8 +453,11 @@ def _radix_select(addr: Int, n: Int, k: Int, threads: Int) -> Int64:
 
 
 @always_inline
-def _percentile_index(p: Float64, n: Int) -> Int:
-    """DuckDB's `quantile_disc` index in n sorted values: ceil(p * n) - 1, at least 0."""
+def _percentile_index(p: Float64, n: Int, bins: Int = 0) -> Int:
+    """DuckDB's `quantile_disc` index in n sorted values: ceil(p * n) - 1, at least 0. With `bins` > 0, `p` is a whole number k: the index of
+    bin edge k of `bins` bins, ceil(k * n / bins) - 1, in integers (a float p = k / bins could land on the wrong side of a whole product)."""
+    if bins > 0:
+        return min(max((Int(p) * n + bins - 1) // bins - 1, 0), n - 1)
     if p > 1.5:                                  # UPPER_MIDDLE: the lower middle, or the one after it when n is even
         return n // 2
     var i = Int(ceil(p * Float64(n))) - 1
@@ -459,13 +473,14 @@ struct Percentiles(Movable):
         self.counts = List[Int]()
 
 
-def _percentiles(b: Blocks, groups: Int, ps: List[Float64], rank: Int, unrank: Int, threads: Int) -> Percentiles:
+def _percentiles(b: Blocks, groups: Int, ps: List[Float64], bins: List[Int], rank: Int, unrank: Int, threads: Int) -> Percentiles:
     """Every p in `ps` for every group over the pairs: group them, then select (see the file comment)."""
     var gr = _group(b, groups, rank, threads)
     var np = len(ps)
     var out_at = List[Int](length=max(np * groups, 1), fill=0)
     var out_p = Int(out_at.unsafe_ptr())
     var ps_p = Int(ps.unsafe_ptr())
+    var bins_p = Int(bins.unsafe_ptr())
     var off_at = Int(gr.off.unsafe_ptr())
     var vals_at = Int(gr.vals.unsafe_ptr())
     # small groups: balanced chunks of groups, one task each; big groups are left for the parallel select below
@@ -492,12 +507,13 @@ def _percentiles(b: Blocks, groups: Int, ps: List[Float64], rank: Int, unrank: I
         var vals = _lp(vals_at)
         var out = _np(out_p)
         var pp = Pointer[Float64, MutUntrackedOrigin](unsafe_from_address=ps_p)
+        var bp = _np(bins_p)
         for g in range(_np(cuts_at)[ci], _np(cuts_at)[ci + 1]):
             var m = off[g + 1] - off[g]
             if m == 0 or (big_ok and m >= RADIX_MIN):
                 continue
             for q in range(np):
-                var v = _select_nth(vals + off[g], m, _percentile_index(pp[q], m))
+                var v = _select_nth(vals + off[g], m, _percentile_index(pp[q], m, bp[q]))
                 if unrank != 0:
                     v = _lp(unrank)[Int(v)]
                 out[q * groups + g] = Int(v)
@@ -508,7 +524,7 @@ def _percentiles(b: Blocks, groups: Int, ps: List[Float64], rank: Int, unrank: I
             var m = gr.off[g + 1] - gr.off[g]
             if m >= RADIX_MIN:
                 for q in range(np):
-                    var v = _radix_select(vals_at + gr.off[g] * 8, m, _percentile_index(ps[q], m), threads)
+                    var v = _radix_select(vals_at + gr.off[g] * 8, m, _percentile_index(ps[q], m, bins[q]), threads)
                     if unrank != 0:
                         v = _lp(unrank)[Int(v)]
                     out_at[q * groups + g] = Int(v)
@@ -523,6 +539,192 @@ def _percentiles(b: Blocks, groups: Int, ps: List[Float64], rank: Int, unrank: I
     _ = gr^
     _ = cuts^
     return res^
+
+
+# ── variance and standard deviation (F-177) ──────────────────────────────────────────────────────────
+
+@always_inline
+def is_spread(kind: Int) -> Bool:
+    """The aggregate is var_pop, var_samp, stddev_pop or stddev_samp."""
+    return kind >= A_VAR_POP and kind <= A_STDDEV_SAMP
+
+
+def spread_needs(kind: Int) -> Int:
+    """How many non-null values the sample variants need for a number (they answer NULL below): 2; the population ones 1."""
+    return 2 if kind == A_VAR_SAMP or kind == A_STDDEV_SAMP else 1
+
+
+def spread_name(kind: Int) -> String:
+    return "var_pop" if kind == A_VAR_POP else "var_samp" if kind == A_VAR_SAMP else "stddev_pop" if kind == A_STDDEV_POP else "stddev_samp"
+
+
+def spread_value(kind: Int, n: Int, m2: Float64) raises -> Float64:
+    """The aggregate from a group's count and sum of squared deviations (the caller checks `spread_needs`). As DuckDB, a result that is not a
+    finite number (a NaN or an infinity among two or more values, or an overflow) is an error, not a value."""
+    var v = m2 / Float64(n) if kind == A_VAR_POP or kind == A_STDDEV_POP else m2 / Float64(n - 1)
+    if kind == A_STDDEV_POP or kind == A_STDDEV_SAMP:
+        v = sqrt(v)
+    if not isfinite(v):
+        raise Error(spread_name(kind) + " is out of range: the values give a result that is not a finite number (a NaN or an infinity among them, or an overflow), as in DuckDB")
+    return v
+
+
+@always_inline
+def _dbl(v: Int64, is_float: Bool, div: Float64) -> Float64:
+    if is_float:
+        return Float64(from_bits=UInt64(float_unkey(v)))
+    return Float64(v) / div
+
+
+@always_inline
+def _neumaier(mut sum: Float64, mut comp: Float64, x: Float64):
+    var t = sum + x
+    if abs(sum) >= abs(x):
+        comp += (sum - t) + x
+    else:
+        comp += (x - t) + sum
+    sum = t
+
+
+def _piece_moments(p: LP, m: Int, is_float: Bool, div: Float64) -> Tuple[Float64, Float64, Float64]:
+    """(mean, the mean's remainder, M2) of the m values at p: a Welford mean, then the deviations from it (compensated sums of d and d*d;
+    M2 = sum d*d - (sum d)^2 / m). The mean is returned as a pair (hi + lo) because the pieces are merged by their difference: means of 1e12 + small
+    numbers are only good to 1e-4 as one double, and the merge would lose the small part."""
+    var mean = 0.0
+    for i in range(m):
+        mean += (_dbl(p[i], is_float, div) - mean) / Float64(i + 1)
+    if m == 1:                                     # (DuckDB: one value is a spread of 0, even when the value is NaN or infinite)
+        return (mean, 0.0, 0.0)
+    var s1 = 0.0
+    var c1 = 0.0
+    var s2 = 0.0
+    var c2 = 0.0
+    for i in range(m):
+        var d = _dbl(p[i], is_float, div) - mean
+        _neumaier(s1, c1, d)
+        _neumaier(s2, c2, d * d)
+    var t1 = s1 + c1
+    var m2 = (s2 + c2) - t1 * t1 / Float64(m)
+    if m2 < 0.0:
+        m2 = 0.0
+    return (mean, t1 / Float64(m), m2)
+
+
+@always_inline
+def _chan(mut n: Int, mut mean: Float64, mut lo: Float64, mut m2: Float64, nb: Int, mean_b: Float64, lo_b: Float64, m2_b: Float64):
+    """Folds the moments of nb more values into (n, mean + lo, M2): Chan's pairwise formula, the means kept as pairs so that their difference is exact."""
+    if nb == 0:
+        return
+    if n == 0:
+        n = nb
+        mean = mean_b
+        lo = lo_b
+        m2 = m2_b
+        return
+    var tot = n + nb
+    var delta = (mean_b - mean) + (lo_b - lo)
+    m2 = m2 + m2_b + delta * delta * Float64(n) * Float64(nb) / Float64(tot)
+    var step = delta * Float64(nb) / Float64(tot)
+    var hi = mean + step                           # (mean + lo) + step, renormalized into a pair
+    var bb = hi - mean
+    var err = (mean - (hi - bb)) + (step - bb)
+    var l2 = lo + err
+    var top = hi + l2
+    lo = l2 - (top - hi)
+    mean = top
+    n = tot
+
+
+struct VarState(Movable):
+    """Per group the count, mean and sum of squared deviations of the values seen so far (one per value source that a spread aggregate reads)."""
+    var n: List[Int]
+    var mean: List[Float64]
+    var lo: List[Float64]            # the mean is mean + lo
+    var m2: List[Float64]
+
+    def __init__(out self, groups: Int):
+        self.n = List[Int](length=groups, fill=0)
+        self.mean = List[Float64](length=groups, fill=0.0)
+        self.lo = List[Float64](length=groups, fill=0.0)
+        self.m2 = List[Float64](length=groups, fill=0.0)
+
+    def absorb(mut self, b: Blocks, is_float: Bool, div: Float64, threads: Int):
+        var groups = len(self.n)
+        var gr = _group(b, groups, 0, threads)
+        var off_at = Int(gr.off.unsafe_ptr())
+        var vals_at = Int(gr.vals.unsafe_ptr())
+        var n_at = Int(self.n.unsafe_ptr())
+        var mean_at = Int(self.mean.unsafe_ptr())
+        var lo_at = Int(self.lo.unsafe_ptr())
+        var m2_at = Int(self.m2.unsafe_ptr())
+        var tp = _tasks(b.total, groups, threads)
+        var chunks = max(1, tp * 4) if tp > 1 else 1
+        var big = 4 * SPREAD_PIECE if threads > 1 else Int.MAX            # a group this big is cut over the threads, piece by piece
+        # balanced chunks of groups, one task each
+        var cuts = List[Int](length=chunks + 1, fill=groups)
+        cuts[0] = 0
+        if chunks > 1:
+            var c = 1
+            var g = 0
+            while g < groups and c < chunks:
+                if gr.off[g] >= b.total * c // chunks:
+                    cuts[c] = g
+                    c += 1
+                else:
+                    g += 1
+            for k in range(c, chunks):
+                cuts[k] = groups
+        var cuts_at = Int(cuts.unsafe_ptr())
+
+        def small(ci: Int) {imm}:
+            var off = _np(off_at)
+            var vals = _lp(vals_at)
+            var cn = _np(n_at)
+            var cmean = Pointer[Float64, MutUntrackedOrigin](unsafe_from_address=mean_at)
+            var clo = Pointer[Float64, MutUntrackedOrigin](unsafe_from_address=lo_at)
+            var cm2 = Pointer[Float64, MutUntrackedOrigin](unsafe_from_address=m2_at)
+            for g in range(_np(cuts_at)[ci], _np(cuts_at)[ci + 1]):
+                var m = off[g + 1] - off[g]
+                if m == 0 or m >= big:
+                    continue
+                var at = 0
+                while at < m:
+                    var k = min(SPREAD_PIECE, m - at)
+                    var pm = _piece_moments(vals + off[g] + at, k, is_float, div)
+                    _chan(cn[g], cmean[g], clo[g], cm2[g], k, pm[0], pm[1], pm[2])
+                    at += k
+
+        par_n(small, chunks, threads)
+        for g in range(groups):
+            var m = gr.off[g + 1] - gr.off[g]
+            if m < big:
+                continue
+            var pieces = (m + SPREAD_PIECE - 1) // SPREAD_PIECE
+            var pmean = List[Float64](length=pieces, fill=0.0)
+            var plo = List[Float64](length=pieces, fill=0.0)
+            var pm2 = List[Float64](length=pieces, fill=0.0)
+            var pmean_at = Int(pmean.unsafe_ptr())
+            var plo_at = Int(plo.unsafe_ptr())
+            var pm2_at = Int(pm2.unsafe_ptr())
+            var base = vals_at + gr.off[g] * 8
+            var tpc = min(threads, pieces)
+
+            def piece(t: Int) {imm}:
+                for k in range(_cut(pieces, tpc, t), _cut(pieces, tpc, t + 1)):
+                    var len_k = min(SPREAD_PIECE, m - k * SPREAD_PIECE)
+                    var r = _piece_moments(_lp(base) + k * SPREAD_PIECE, len_k, is_float, div)
+                    Pointer[Float64, MutUntrackedOrigin](unsafe_from_address=pmean_at)[k] = r[0]
+                    Pointer[Float64, MutUntrackedOrigin](unsafe_from_address=plo_at)[k] = r[1]
+                    Pointer[Float64, MutUntrackedOrigin](unsafe_from_address=pm2_at)[k] = r[2]
+
+            par_n(piece, tpc, tpc)
+            for k in range(pieces):
+                _chan(self.n[g], self.mean[g], self.lo[g], self.m2[g], min(SPREAD_PIECE, m - k * SPREAD_PIECE), pmean[k], plo[k], pm2[k])
+            _ = pmean^
+            _ = plo^
+            _ = pm2^
+        _ = gr^
+        _ = cuts^
 
 
 # ── count distinct ───────────────────────────────────────────────────────────────────────────────────
@@ -999,22 +1201,30 @@ struct HolStates(Movable):
     var ranks: List[List[Int64]]         # per source: code -> its place in the text order (empty: not text)
     var floats: List[Bool]               # per source: its values are float64s, held as `float_key`s (the kernel hook made them)
     var unranks: List[List[Int64]]       # per source: the place -> code
+    var scales: List[Int]                # per source: the decimal places of its integer values (a spread aggregate reads them as float(v) / 10^scale)
     var has_distinct: List[Bool]
     var has_raw: List[Bool]
+    var has_var: List[Bool]
+    var spread: List[VarState]           # per source
     var distinct: List[DistinctState]    # per source
     var raw: List[RawState]              # per source
     var topk: List[TopKState]            # per spec (k = 0 for the others)
 
     def __init__(out self, groups: Int, var specs: List[HolSpec], var ranks: List[List[Int64]], max_rows: Int = -1,
-                 var floats: List[Bool] = List[Bool]()) raises:
+                 var floats: List[Bool] = List[Bool](), var scales: List[Int] = List[Int]()) raises:
         self.groups = groups
         while len(floats) < len(ranks):
             floats.append(False)
         self.floats = floats^
+        while len(scales) < len(ranks):
+            scales.append(0)
+        self.scales = scales^
         self.threads = core_count()
         var nsrc = len(ranks)
         self.has_distinct = List[Bool](length=nsrc, fill=False)
         self.has_raw = List[Bool](length=nsrc, fill=False)
+        self.has_var = List[Bool](length=nsrc, fill=False)
+        self.spread = List[VarState]()
         self.distinct = List[DistinctState]()
         self.raw = List[RawState]()
         self.topk = List[TopKState]()
@@ -1031,12 +1241,16 @@ struct HolStates(Movable):
             if specs[i].kind == A_TOPK and specs[i].k >= 1 and max_rows >= 0:
                 specs[i].k = min(specs[i].k, max(max_rows, 1))        # no group holds more values than the input has rows
         for spec in specs:
-            if spec.kind == A_PCT or spec.kind == A_MEDIAN:
+            if spec.kind == A_PCT or spec.kind == A_MEDIAN or spec.kind == A_QEDGE:
+                if spec.kind == A_QEDGE and (spec.k < 2 or spec.p < 1.0 or spec.p >= Float64(spec.k)):
+                    raise Error("quantile bins: edge " + String(Int(spec.p)) + " of " + String(spec.k) + " bins does not exist")
                 if spec.kind == A_PCT and not (spec.p >= 0.0 and spec.p <= 1.0):
                     raise Error("percentile: p must be between 0 and 1, got " + String(spec.p))
                 self.has_raw[spec.src] = True
             elif spec.kind == A_DISTINCT:
                 self.has_distinct[spec.src] = True
+            elif is_spread(spec.kind):
+                self.has_var[spec.src] = True
             elif spec.kind == A_TOPK:
                 if spec.k < 1:
                     raise Error("top_k: k must be at least 1, got " + String(spec.k))
@@ -1046,6 +1260,7 @@ struct HolStates(Movable):
         for s in range(nsrc):
             self.distinct.append(DistinctState(parts if self.has_distinct[s] else 1))
             self.raw.append(RawState())
+            self.spread.append(VarState(groups if self.has_var[s] else 0))
         for spec in specs:
             self.topk.append(TopKState(spec.k if spec.kind == A_TOPK else 1, groups if spec.kind == A_TOPK else 1))
         self.specs = specs^
@@ -1084,6 +1299,11 @@ struct HolStates(Movable):
             self.distinct[s].absorb(b, self.threads)
         if self.has_raw[s]:
             self.raw[s].absorb(b, self.threads)
+        if self.has_var[s]:
+            var div = 1.0
+            for _ in range(self.scales[s]):
+                div *= 10.0
+            self.spread[s].absorb(b, self.floats[s], div, self.threads)
         for h in range(len(self.specs)):
             if self.specs[h].kind == A_TOPK and self.specs[h].src == s:
                 self.topk[h].absorb(b, self.rank_of(s), self.threads)
@@ -1099,7 +1319,7 @@ struct HolStates(Movable):
     def _entries(self, h: Int) -> Int:
         """How many selections aggregate h asks of its source's raw values: a percentile one, a median of numbers two
         (the lower and the upper middle), a median of text one (the lower middle: words have no mean)."""
-        if self.specs[h].kind == A_PCT:
+        if self.specs[h].kind == A_PCT or self.specs[h].kind == A_QEDGE:
             return 1
         if self.specs[h].kind == A_MEDIAN:
             return 1 if len(self.ranks[self.specs[h].src]) > 0 else 2
@@ -1114,13 +1334,17 @@ struct HolStates(Movable):
         var pct_of = List[Percentiles]()           # per source
         for s in range(len(self.distinct)):
             var ps = List[Float64]()
+            var bins = List[Int]()                  # per p: the number of bins when it is the k of a bin edge, else 0
             for h in range(len(self.specs)):
                 if self.specs[h].src == s and self._entries(h) > 0:
-                    ps.append(self.specs[h].p if self.specs[h].kind == A_PCT else 0.5)
+                    var edge = self.specs[h].kind == A_QEDGE
+                    ps.append(self.specs[h].p if self.specs[h].kind == A_PCT or edge else 0.5)
+                    bins.append(self.specs[h].k if edge else 0)
                     if self._entries(h) == 2:
                         ps.append(UPPER_MIDDLE)
+                        bins.append(0)
             if self.has_raw[s]:
-                pct_of.append(_percentiles(self.raw[s].blocks(), G, ps, self.rank_of(s), self._unrank(s), self.threads))
+                pct_of.append(_percentiles(self.raw[s].blocks(), G, ps, bins, self.rank_of(s), self._unrank(s), self.threads))
             else:
                 pct_of.append(Percentiles())
         for h in range(len(self.specs)):
@@ -1130,7 +1354,18 @@ struct HolStates(Movable):
                 res.counts.append(distinct_of[spec.src].copy())
                 res.top.append(List[Int]())
                 res.top_off.append(List[Int]())
-            elif spec.kind == A_PCT or spec.kind == A_MEDIAN:
+            elif is_spread(spec.kind):
+                # a float64 per group (its bits); the count is the group's non-null values (the sample variants answer NULL below two)
+                var m = List[Int](length=G, fill=0)
+                for g in range(G):
+                    var n = self.spread[spec.src].n[g]
+                    if n >= spread_needs(spec.kind):
+                        m[g] = Int(Int64(spread_value(spec.kind, n, self.spread[spec.src].m2[g]).to_bits()))
+                res.vals.append(m^)
+                res.counts.append(self.spread[spec.src].n.copy())
+                res.top.append(List[Int]())
+                res.top_off.append(List[Int]())
+            elif spec.kind == A_PCT or spec.kind == A_MEDIAN or spec.kind == A_QEDGE:
                 var q = 0                          # this aggregate's first selection among its source's
                 for h2 in range(h):
                     if self.specs[h2].src == spec.src:

@@ -29,9 +29,9 @@ from .frame import _text_less, text_ranks
 from .bind import (BoundQuery, BExpr, B_DIV, B_I2F, B_FDIV, B_FMOD, B_LEAST, B_GREATEST, B_COL, B_LIT, B_NULL, B_ADD, B_SUB, B_MUL,
                    B_IDIV, B_IMOD, B_NEG, B_RESCALE, B_CMP, B_AND, B_OR, B_NOT, B_ISNULL, B_IN, C_LT, C_GE, C_LE, C_GT, C_EQ,
                    C_NE, F_SUM, F_MIN, F_MAX, F_AVG, pow10_checked,
-                   B_STR, B_CASE, B_COALESCE, B_DISTINCT, B_CAST, B_DATEPART, B_DATETRUNC, B_ADDMONTHS, B_DATEDIFF, B_BOOLIS, B_TFN, B_CONCAT, DERIVED_BASE)
+                   B_STR, B_CASE, B_COALESCE, B_DISTINCT, B_CAST, B_DATEPART, B_DATETRUNC, B_ADDMONTHS, B_DATEDIFF, B_BOOLIS, B_TFN, B_CONCAT, B_QBIN, DERIVED_BASE)
 from .sqlfn import (TFn, CaseTables, parse_text, reverse_is_exact, date_text, decimal_text, date_part, date_trunc_days, add_months, date_diff_days, TF_LOWER, TF_UPPER, TF_LIKE, TF_REVERSE, DP_YEAR, DP_MONTH, DP_DAY, DP_DOW, DP_ISODOW, DP_DOY, DP_QUARTER, DP_EPOCH,
-                    DP_DECADE, DP_WEEK, DP_CENTURY, DP_MILLENNIUM)
+                    DP_DECADE, DP_WEEK, DP_ISOYEAR, DP_CENTURY, DP_MILLENNIUM)
 from .planner import PhysicalPlan, G_DENSE, G_HASHED
 
 comptime OP_F32 = 34
@@ -470,6 +470,8 @@ struct _Emitter(Movable):
             return self.coalesce_generic(e, False)
         if x.op == B_CAST:
             return self.cast_value(e)
+        if x.op == B_QBIN:
+            return self.qbin_value(x)
         if x.op == B_TFN:
             return self.tfn_value(e)
         if x.op == B_CONCAT:
@@ -1775,6 +1777,26 @@ struct _Emitter(Movable):
             self.p.has_float = True
         return V(v.reg, v.nul, False, self.rx[e].kind == FLOAT.value)
 
+    def qbin_value(mut self, x: BExpr) raises -> V:
+        """quantile_bin(a, n): 1 + the number of edges below a (the edges are literals, n - 1 of them, non-decreasing), by one comparison and one add per edge."""
+        if len(x.items) == 0:
+            raise Error("internal: quantile_bin reached the program before its edges were found")
+        var acc = self.const_i(1)
+        var nul = -1
+        for k in range(len(x.items)):
+            var t = self.cmp_raw(x.a, x.items[k], C_GT)
+            self.ins(OP_F2I, t[0], t[0])
+            self.ins(OP_IADD, acc, acc, t[0])
+            self.free(t[0])
+            if k == 0:
+                nul = self.or_nul(t[1], t[2])
+            else:
+                if t[1] >= 0:
+                    self.free(t[1])
+                if t[2] >= 0:
+                    self.free(t[2])
+        return V(acc, nul, False)
+
     def datepart_value(mut self, x: BExpr) raises -> V:
         var v = self.date_operand_value(x.a)
         var part = Int(x.value)
@@ -1797,6 +1819,34 @@ struct _Emitter(Movable):
             self.p.has_float = True
             self.ins(OP_I2F, v.reg, v.reg)
             return V(v.reg, v.nul, False, True)
+        if part == DP_WEEK or part == DP_ISOYEAR:                    # ISO week and year: from the Thursday of the date's week, th = z - (z + 3) mod 7 + 3
+            var th = self.tmp()
+            var k3 = self.const_i(3)
+            self.ins(OP_IADD, th, v.reg, k3)
+            var k7 = self.const_i(7)
+            self.ins(OP_IMOD, th, th, k7)
+            self.ins(OP_ISUB, th, v.reg, th)
+            self.ins(OP_IADD, th, th, k3)
+            self.free(k3)
+            var ct = self.civil(th)
+            var wk = self.tmp()
+            if part == DP_ISOYEAR:
+                self.p.emit(OP_IMAX, wk, ct[0], ct[0])
+            else:
+                var one = self.const_i(1)
+                var jan = self.days_from_civil_regs(ct[0], one, one)
+                self.ins(OP_ISUB, wk, th, jan)
+                self.ins(OP_IDIV, wk, wk, k7)
+                self.ins(OP_IADD, wk, wk, one)
+                self.free(jan)
+                self.free(one)
+            self.free(k7)
+            self.free(ct[0])
+            self.free(ct[1])
+            self.free(ct[2])
+            self.free(th)
+            self.free(v.reg)
+            return V(wk, v.nul, False)
         var c = self.civil(v.reg)
         var y = c[0]
         var m = c[1]
