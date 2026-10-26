@@ -53,6 +53,7 @@ comptime A_VAR_POP = 10               # var_pop / var_samp / stddev_pop / stddev
 comptime A_VAR_SAMP = 11
 comptime A_STDDEV_POP = 12
 comptime A_STDDEV_SAMP = 13
+comptime A_QEDGE = 14                # edge k of n quantile bins (F-177): the value at sorted place ceil(k * N / n), by integer arithmetic (`p` holds k, `k` holds n)
 comptime SPREAD_PIECE = 65536        # values folded into one (count, mean, M2) piece: fixed, so the bits do not depend on the number of threads
 comptime UPPER_MIDDLE = 2.0          # a `p` that asks _percentiles for the upper middle value, index n // 2
 
@@ -452,8 +453,11 @@ def _radix_select(addr: Int, n: Int, k: Int, threads: Int) -> Int64:
 
 
 @always_inline
-def _percentile_index(p: Float64, n: Int) -> Int:
-    """DuckDB's `quantile_disc` index in n sorted values: ceil(p * n) - 1, at least 0."""
+def _percentile_index(p: Float64, n: Int, bins: Int = 0) -> Int:
+    """DuckDB's `quantile_disc` index in n sorted values: ceil(p * n) - 1, at least 0. With `bins` > 0, `p` is a whole number k: the index of
+    bin edge k of `bins` bins, ceil(k * n / bins) - 1, in integers (a float p = k / bins could land on the wrong side of a whole product)."""
+    if bins > 0:
+        return min(max((Int(p) * n + bins - 1) // bins - 1, 0), n - 1)
     if p > 1.5:                                  # UPPER_MIDDLE: the lower middle, or the one after it when n is even
         return n // 2
     var i = Int(ceil(p * Float64(n))) - 1
@@ -469,13 +473,14 @@ struct Percentiles(Movable):
         self.counts = List[Int]()
 
 
-def _percentiles(b: Blocks, groups: Int, ps: List[Float64], rank: Int, unrank: Int, threads: Int) -> Percentiles:
+def _percentiles(b: Blocks, groups: Int, ps: List[Float64], bins: List[Int], rank: Int, unrank: Int, threads: Int) -> Percentiles:
     """Every p in `ps` for every group over the pairs: group them, then select (see the file comment)."""
     var gr = _group(b, groups, rank, threads)
     var np = len(ps)
     var out_at = List[Int](length=max(np * groups, 1), fill=0)
     var out_p = Int(out_at.unsafe_ptr())
     var ps_p = Int(ps.unsafe_ptr())
+    var bins_p = Int(bins.unsafe_ptr())
     var off_at = Int(gr.off.unsafe_ptr())
     var vals_at = Int(gr.vals.unsafe_ptr())
     # small groups: balanced chunks of groups, one task each; big groups are left for the parallel select below
@@ -502,12 +507,13 @@ def _percentiles(b: Blocks, groups: Int, ps: List[Float64], rank: Int, unrank: I
         var vals = _lp(vals_at)
         var out = _np(out_p)
         var pp = Pointer[Float64, MutUntrackedOrigin](unsafe_from_address=ps_p)
+        var bp = _np(bins_p)
         for g in range(_np(cuts_at)[ci], _np(cuts_at)[ci + 1]):
             var m = off[g + 1] - off[g]
             if m == 0 or (big_ok and m >= RADIX_MIN):
                 continue
             for q in range(np):
-                var v = _select_nth(vals + off[g], m, _percentile_index(pp[q], m))
+                var v = _select_nth(vals + off[g], m, _percentile_index(pp[q], m, bp[q]))
                 if unrank != 0:
                     v = _lp(unrank)[Int(v)]
                 out[q * groups + g] = Int(v)
@@ -518,7 +524,7 @@ def _percentiles(b: Blocks, groups: Int, ps: List[Float64], rank: Int, unrank: I
             var m = gr.off[g + 1] - gr.off[g]
             if m >= RADIX_MIN:
                 for q in range(np):
-                    var v = _radix_select(vals_at + gr.off[g] * 8, m, _percentile_index(ps[q], m), threads)
+                    var v = _radix_select(vals_at + gr.off[g] * 8, m, _percentile_index(ps[q], m, bins[q]), threads)
                     if unrank != 0:
                         v = _lp(unrank)[Int(v)]
                     out_at[q * groups + g] = Int(v)
@@ -1235,7 +1241,9 @@ struct HolStates(Movable):
             if specs[i].kind == A_TOPK and specs[i].k >= 1 and max_rows >= 0:
                 specs[i].k = min(specs[i].k, max(max_rows, 1))        # no group holds more values than the input has rows
         for spec in specs:
-            if spec.kind == A_PCT or spec.kind == A_MEDIAN:
+            if spec.kind == A_PCT or spec.kind == A_MEDIAN or spec.kind == A_QEDGE:
+                if spec.kind == A_QEDGE and (spec.k < 2 or spec.p < 1.0 or spec.p >= Float64(spec.k)):
+                    raise Error("quantile bins: edge " + String(Int(spec.p)) + " of " + String(spec.k) + " bins does not exist")
                 if spec.kind == A_PCT and not (spec.p >= 0.0 and spec.p <= 1.0):
                     raise Error("percentile: p must be between 0 and 1, got " + String(spec.p))
                 self.has_raw[spec.src] = True
@@ -1311,7 +1319,7 @@ struct HolStates(Movable):
     def _entries(self, h: Int) -> Int:
         """How many selections aggregate h asks of its source's raw values: a percentile one, a median of numbers two
         (the lower and the upper middle), a median of text one (the lower middle: words have no mean)."""
-        if self.specs[h].kind == A_PCT:
+        if self.specs[h].kind == A_PCT or self.specs[h].kind == A_QEDGE:
             return 1
         if self.specs[h].kind == A_MEDIAN:
             return 1 if len(self.ranks[self.specs[h].src]) > 0 else 2
@@ -1326,13 +1334,17 @@ struct HolStates(Movable):
         var pct_of = List[Percentiles]()           # per source
         for s in range(len(self.distinct)):
             var ps = List[Float64]()
+            var bins = List[Int]()                  # per p: the number of bins when it is the k of a bin edge, else 0
             for h in range(len(self.specs)):
                 if self.specs[h].src == s and self._entries(h) > 0:
-                    ps.append(self.specs[h].p if self.specs[h].kind == A_PCT else 0.5)
+                    var edge = self.specs[h].kind == A_QEDGE
+                    ps.append(self.specs[h].p if self.specs[h].kind == A_PCT or edge else 0.5)
+                    bins.append(self.specs[h].k if edge else 0)
                     if self._entries(h) == 2:
                         ps.append(UPPER_MIDDLE)
+                        bins.append(0)
             if self.has_raw[s]:
-                pct_of.append(_percentiles(self.raw[s].blocks(), G, ps, self.rank_of(s), self._unrank(s), self.threads))
+                pct_of.append(_percentiles(self.raw[s].blocks(), G, ps, bins, self.rank_of(s), self._unrank(s), self.threads))
             else:
                 pct_of.append(Percentiles())
         for h in range(len(self.specs)):
@@ -1353,7 +1365,7 @@ struct HolStates(Movable):
                 res.counts.append(self.spread[spec.src].n.copy())
                 res.top.append(List[Int]())
                 res.top_off.append(List[Int]())
-            elif spec.kind == A_PCT or spec.kind == A_MEDIAN:
+            elif spec.kind == A_PCT or spec.kind == A_MEDIAN or spec.kind == A_QEDGE:
                 var q = 0                          # this aggregate's first selection among its source's
                 for h2 in range(h):
                     if self.specs[h2].src == spec.src:

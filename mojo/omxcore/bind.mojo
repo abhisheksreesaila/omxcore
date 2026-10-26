@@ -11,7 +11,7 @@ DATE) and raises with the position of the offending text. Nothing here reads dat
 from .table import SharedTable, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, F32_COLUMN
 from .parquet import ParquetScan
 from .frame import Frame, Overlay, Formula
-from .expr import N_COL, N_LIT, N_LITF, N_DIV, N_I2F, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG, N_LEAST, N_GREATEST, N_SCALE_TO
+from .expr import MAX_QUANTILE_BINS, N_COL, N_LIT, N_LITF, N_DIV, N_I2F, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG, N_LEAST, N_GREATEST, N_SCALE_TO
 from .csv import days_from_civil, _days_in_month, parse_float_text, F_OK, F_RANGE
 from .sql import (SqlStatement, parse_sql, sql_error, closest, lower_ascii, X_INT, X_DEC, X_STR, X_NULL, X_TRUE, X_FALSE,
                   X_DATE, X_COL, X_NEG, X_BIN, X_NOT, X_ISNULL, X_BETWEEN, X_IN, X_CALL, X_FLT, EXPLAIN_NONE, SqlExpr, SelectItem,
@@ -165,6 +165,7 @@ comptime B_DATEDIFF = 57     # a, b: DATEs; value: the part; INT
 comptime B_BOOLIS = 58       # a: a BOOL; value 0: IS TRUE, 1: IS NOT TRUE, 2: IS FALSE, 3: IS NOT FALSE
 comptime B_TFN = 60          # a function of a TEXT value and constants (`items`: B_STR / B_LIT nodes): value = TF_* | flags << 8; its kind says what it answers
 comptime B_CONCAT = 61       # a || b over TEXT; value 1: concat() (a NULL reads as '')
+comptime B_QBIN = 62         # F-177 quantile_bin(a, n): INT 1 .. n; value: n; items: the n - 1 edge literals (the executor fills them from an exact pass: `b` is -1 until then, -2 while it does)
 comptime DERIVED_BASE = 1 << 20      # a `src` from here on names the dictionary of node (src - DERIVED_BASE) of the pool it is in
 
 comptime C_LT = 20
@@ -215,6 +216,7 @@ comptime F_STDDEV_SAMP = 9       # F-177: stddev / stddev_samp, stddev_pop, vari
 comptime F_STDDEV_POP = 10
 comptime F_VAR_SAMP = 11
 comptime F_VAR_POP = 12
+comptime F_QEDGE = 13            # internal: edge `p` of `bins` quantile bins of the argument (what quantile_bin(x, n) needs, found by sqlexec.resolve_bins)
 
 
 struct AggSpec(Copyable, Movable):
@@ -226,9 +228,11 @@ struct AggSpec(Copyable, Movable):
     var name: String                 # as the output names it: sum(revenue), count_star()
     var canon: String
     var hol: Bool                    # needs every value of its group: count(DISTINCT), median, quantile_disc, min / max of TEXT
+    var bins: Int                    # F_QEDGE: the number of bins
 
-    def __init__(out self, func: Int, arg: Int, p: Float64, kind: Int, scale: Int, name: String, canon: String, hol: Bool = False):
+    def __init__(out self, func: Int, arg: Int, p: Float64, kind: Int, scale: Int, name: String, canon: String, hol: Bool = False, bins: Int = 0):
         self.hol = hol
+        self.bins = bins
         self.func = func
         self.arg = arg
         self.p = p
@@ -1910,6 +1914,21 @@ struct _Binder(Movable):
             if n != 1:
                 raise self.err(ast, name.lower() + "() takes one date, found " + String(n) + " arguments")
             return self.date_part_expr(ast, part_code(name.lower()), x.items[0], name.lower())
+        if name == "QUANTILE_BIN":
+            if n != 2:
+                raise self.err(ast, "quantile_bin() takes a value and the number of bins, found " + String(n) + " argument" + ("" if n == 1 else "s"))
+            if self.in_post:
+                raise self.err(ast, "quantile_bin() bins the rows of a table: it cannot take an aggregate (bin the column, then aggregate per bin)")
+            var xv = self.value(x.items[0])
+            var xe = self.at(xv)
+            if xe.op == B_NULL or xe.op == B_LIT:
+                raise self.err(x.items[0], "quantile_bin() needs a column or an expression of one, not a constant")
+            if xe.kind != INT.value and xe.kind != DECIMAL.value and xe.kind != FLOAT.value and xe.kind != DATE.value:
+                raise self.err(x.items[0], "quantile_bin() needs numbers or dates, found " + kind_name(xe.kind, xe.scale))
+            var ne = self.at(self.value(x.items[1]))
+            if ne.op != B_LIT or ne.kind != INT.value or ne.value < 2 or ne.value > MAX_QUANTILE_BINS:
+                raise self.err(x.items[1], "the number of bins of quantile_bin() is a whole number from 2 to " + String(MAX_QUANTILE_BINS))
+            return self.mk(B_QBIN, INT.value, 0, xv, -1, ne.value, self.st.render(x.items[0]), ast)
         if name == "DATE_TRUNC" or name == "DATETRUNC":
             if n != 2:
                 raise self.err(ast, "date_trunc() takes a part and a date, found " + String(n) + " argument" + ("" if n == 1 else "s"))
@@ -2254,7 +2273,7 @@ def _aggregate_names() -> List[String]:
 def _scalar_names() -> List[String]:
     return ["coalesce", "ifnull", "nvl", "nullif", "lower", "upper", "trim", "ltrim", "rtrim", "substr", "substring", "length", "starts_with", "ends_with", "contains",
             "strpos", "instr", "left", "right", "reverse", "replace", "concat", "extract", "date_part", "year", "month", "day", "quarter", "dayofweek", "isodow",
-            "dayofyear", "date_trunc", "datediff", "date_diff", "week", "weekofyear", "isoyear"]
+            "dayofyear", "date_trunc", "datediff", "date_diff", "week", "weekofyear", "isoyear", "quantile_bin"]
 
 
 def _is_scalar_name(up: String) -> Bool:
@@ -2263,7 +2282,7 @@ def _is_scalar_name(up: String) -> Bool:
         if n == low:
             return True
     return up == "LCASE" or up == "UCASE" or up == "LEN" or up == "CHAR_LENGTH" or up == "CHARACTER_LENGTH" or up == "PREFIX" or up == "SUFFIX" or \
-           up == "DATEPART" or up == "DATETRUNC" or up == "DECADE"
+           up == "DATEPART" or up == "DATETRUNC" or up == "DECADE" or up == "QUANTILE_BIN"
 
 
 def _is_aggregate_name(up: String) -> Bool:

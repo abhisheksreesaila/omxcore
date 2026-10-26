@@ -17,7 +17,7 @@ from .table import TEXT, BOOL, FLOAT
 from .plan import LogicalPlan, P_SORT, P_LIMIT
 from .bind import (BoundQuery, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, B_LIT, B_NULL, B_ADD, B_SUB, B_MUL, B_IDIV, B_IMOD,
                    B_NEG, B_RESCALE, B_CASE, B_COALESCE, B_DISTINCT, B_BOOLIS, B_CAST, B_TFN, B_CONCAT, B_STR,
-                   B_DATEPART, B_DATETRUNC, B_ADDMONTHS, B_DATEDIFF)
+                   B_DATEPART, B_DATETRUNC, B_ADDMONTHS, B_DATEDIFF, B_QBIN)
 from .sqlfn import date_part, date_trunc_days, add_months, DP_YEAR, DP_MONTH, DP_DAY, DP_DOW, DP_ISODOW, DP_DOY, DP_QUARTER, DP_WEEK, DP_ISOYEAR, DP_DECADE, DP_CENTURY, DP_MILLENNIUM
 
 comptime BUILD_AUTO = 0
@@ -183,6 +183,8 @@ def expr_nullable(q: BoundQuery, e: Int, st: Stats) -> Bool:
         return True
     if x.op == B_CAST:                                             # a TRY_CAST can fail into NULL
         return (Int(x.value) & 1) != 0 or expr_nullable(q, x.a, st)
+    if x.op == B_QBIN:                                             # NULL where the value is
+        return expr_nullable(q, x.a, st)
     if x.op == B_CONCAT and x.value != 0:                          # concat() reads NULL as ''
         return False
     if x.op == B_TFN or x.op == B_CONCAT or x.op == B_DATEPART or x.op == B_DATETRUNC or x.op == B_ADDMONTHS or x.op == B_DATEDIFF:
@@ -267,6 +269,8 @@ def interval(q: BoundQuery, e: Int, st: Stats) -> Interval:
         if n.op != B_LIT or n.value > 1000000 or n.value < -1000000:
             return Interval(False)
         return Interval(True, Int64(add_months(Int(da.lo), Int(n.value))), Int64(add_months(Int(da.hi), Int(n.value))))
+    if x.op == B_QBIN:
+        return Interval(True, 1, x.value)
     if x.op == B_NEG or x.op == B_RESCALE:
         var a = interval(q, x.a, st)
         if not a.ok:

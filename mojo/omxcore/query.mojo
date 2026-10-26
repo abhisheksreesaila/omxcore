@@ -31,7 +31,7 @@ from std.memory import Pointer
 from .table import SharedTable, Table, TEXT, FLOAT, INT, DECIMAL, DATE, BOOL
 from .parquet import ParquetScan, _GroupPlan, _GroupReader, _open_plan, _copy_bits, _count_bits
 from .frame import Frame, Overlay, _eval_row, _eval_row_t
-from .expr import (Expr, Node, N_COL, N_LIT, N_LITF, N_DIV, N_I2F, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG, N_LEAST, N_GREATEST,
+from .expr import (MAX_QUANTILE_BINS, Expr, Node, N_COL, N_LIT, N_LITF, N_DIV, N_I2F, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG, N_LEAST, N_GREATEST,
                    N_LT, N_LE, N_GT, N_GE, N_EQ, N_NE, N_AND, N_OR, N_NOT, N_BOOL2INT, N_SCALE_TO)
 from .kernels._fpenv import core_count, par_n
 from .kernels.pipeline_cpu import pipeline_keyed, pipeline_plain, E_OVERFLOW, IP, FP, LP, VEC
@@ -39,7 +39,7 @@ from .kernels.pipeline_gpu import run_pipeline_gpu, _choose_mode, scratch_rows, 
 from max.gpu.host import DeviceContext, DeviceBuffer
 from .gpu import DeviceTable, HAS_GPU, NO_GPU_MESSAGE, gpu_available, _ScanContext, _scan_context, _stage_load, _stage_data, _stage_valid, _pinned_prepare
 from .holistic import (HolStates, HolSpec, HolResult, window_blocks, heap_offer, float_key, A_DISTINCT, A_PCT, A_TOPK, A_MEDIAN,
-                       A_VAR_POP, A_VAR_SAMP, A_STDDEV_POP, A_STDDEV_SAMP, is_spread, spread_needs)
+                       A_VAR_POP, A_VAR_SAMP, A_STDDEV_POP, A_STDDEV_SAMP, A_QEDGE, is_spread, spread_needs)
 from .joincore import JoinKeys, JoinSide, normalize_keys, join_pairs, select_rows, gather_join, JOIN_BUDGET_BYTES
 from .kernels.hashjoin_cpu import hj_build, PM_SEMI, PM_ANTI
 from .frame import text_ranks
@@ -205,6 +205,32 @@ struct PlanNode(Copyable, Movable):
     var groups: Int
 
 
+struct QuantileBins(Copyable, Movable):
+    """The edges of equal-count bins (`Query.quantile_bins`): edge k is the value at sorted place ceil(k * N / bins). `key(e)` is the bin of a row, 0 ..
+    bins()-1: the number of edges below its value, an `Expr` for `group_by(key, groups=bins())`."""
+    var edges: List[Int64]       # stored values (a FLOAT column's are float64 bits)
+    var is_float: Bool
+
+    def __init__(out self, var edges: List[Int64], is_float: Bool):
+        self.edges = edges^
+        self.is_float = is_float
+
+    def bins(self) -> Int:
+        return len(self.edges) + 1
+
+    def key(self, e: Expr) -> Expr:
+        """The bin of `e` (0 .. bins()-1): the sum over the edges of (e > edge) as 1 or 0."""
+        var acc = Expr(0)
+        for k in range(len(self.edges)):
+            var edge = Expr(Float64(from_bits=UInt64(self.edges[k]))) if self.is_float else Expr(Int(self.edges[k]))
+            var term = (e > edge)._un(N_BOOL2INT)
+            if k == 0:
+                acc = term^
+            else:
+                acc = acc + term
+        return acc^
+
+
 struct Query(Movable):
     """A plan over one shared table, or over a session's view of it (`Query(frame)`: its edits, appended and removed
     rows, merges and formula columns, copied when the query is built), built by chaining; `compute` runs it."""
@@ -296,6 +322,31 @@ struct Query(Movable):
         for a in aggs:
             self.nodes[at].aggs.append(a.copy())
         return self^
+
+    def quantile_bins(var self, e: Expr, bins: Int) raises -> QuantileBins:
+        """Equal-count bins of `e` over the rows this query keeps (its `where`s, a Frame's edits, a scan's row groups): the `bins` - 1 edges, found
+        exactly. Edge k (k = 1 .. bins-1) is the value at sorted place ceil(k * N / bins) of the N non-null values of `e` (whole-number arithmetic);
+        a value's bin is the number of edges below it, 0 .. bins-1, so equal values share a bin and a run of ties across an edge falls in the lower
+        bin. It is SQL's `quantile_bin(e, bins)` minus one. Use it as the key of a second query:
+
+            var b = Query(f).where(...).quantile_bins(col("x"), 10)
+            var r = Query(f).where(...).group_by(b.key(col("x")), groups=b.bins()).agg(count(), sum(col("y"))).compute()
+
+        The bins are of `e` over the rows that pass this query's filters: give both queries the same `where`s. A row whose `e` is null has no bin
+        (the builder leaves a null key out). One pass over the data on the CPU; at most MAX_QUANTILE_BINS (32) bins."""
+        if bins < 2 or bins > MAX_QUANTILE_BINS:
+            raise Error("quantile_bins: the number of bins is a whole number from 2 to " + String(MAX_QUANTILE_BINS) + ", got " + String(bins))
+        if self._aggregate() >= 0:
+            raise Error("quantile_bins comes before group_by and agg: it bins the rows that pass the filters")
+        var aggs = List[Agg]()
+        for k in range(1, bins):
+            aggs.append(Agg(A_QEDGE, e.copy(), Float64(k), bins))
+        self.nodes.append(PlanNode(P_AGGREGATE, self._top(), List[Expr](), aggs^, 1))
+        var r = self.compute(CPU)
+        var out = QuantileBins(List[Int64](), r.is_float(0))
+        for i in range(bins - 1):
+            out.edges.append(Int64(r.values(i)[0]) if r.present(i, 0) else Int64(0))      # (no value at all: no row reaches a bin)
+        return out^
 
     def morsels(var self, mode: Int) -> Self:
         """How a Parquet scan runs: MORSELS_AUTO (by row-range morsels on all cores when the file is big enough),
@@ -1634,11 +1685,11 @@ def _build_states(orig: List[PlanNode], nodes: List[PlanNode], base: SharedTable
             continue
         ref a = nodes[at].aggs[i]
         specs.append(HolSpec(i, a.kind, a.p, a.k, src_of[i]))
-        if is_spread(a.kind):                              # numbers only: a word, a date or a flag has no spread
+        if is_spread(a.kind) or a.kind == A_QEDGE:         # numbers only (bins also dates): a word or a flag has no spread, and no order worth cutting
             for name in orig[at].aggs[i].arg.columns():
                 var c = base.index(name)
-                if c >= 0 and (base.kind(c) == TEXT or base.kind(c) == DATE or base.kind(c) == BOOL):
-                    raise Error("stddev / variance need numbers: column `" + name + "` is not one")
+                if c >= 0 and (base.kind(c) == TEXT or base.kind(c) == BOOL or (base.kind(c) == DATE and a.kind != A_QEDGE)):
+                    raise Error(("quantile bins" if a.kind == A_QEDGE else "stddev / variance") + " need numbers" + (" or dates" if a.kind == A_QEDGE else "") + ": column `" + name + "` is not one")
             continue
         if a.kind == A_DISTINCT or len(ranks[src_of[i]]) > 0:
             continue

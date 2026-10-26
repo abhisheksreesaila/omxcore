@@ -29,7 +29,7 @@ from .frame import _text_less, text_ranks
 from .bind import (BoundQuery, BExpr, B_DIV, B_I2F, B_FDIV, B_FMOD, B_LEAST, B_GREATEST, B_COL, B_LIT, B_NULL, B_ADD, B_SUB, B_MUL,
                    B_IDIV, B_IMOD, B_NEG, B_RESCALE, B_CMP, B_AND, B_OR, B_NOT, B_ISNULL, B_IN, C_LT, C_GE, C_LE, C_GT, C_EQ,
                    C_NE, F_SUM, F_MIN, F_MAX, F_AVG, pow10_checked,
-                   B_STR, B_CASE, B_COALESCE, B_DISTINCT, B_CAST, B_DATEPART, B_DATETRUNC, B_ADDMONTHS, B_DATEDIFF, B_BOOLIS, B_TFN, B_CONCAT, DERIVED_BASE)
+                   B_STR, B_CASE, B_COALESCE, B_DISTINCT, B_CAST, B_DATEPART, B_DATETRUNC, B_ADDMONTHS, B_DATEDIFF, B_BOOLIS, B_TFN, B_CONCAT, B_QBIN, DERIVED_BASE)
 from .sqlfn import (TFn, CaseTables, parse_text, reverse_is_exact, date_text, decimal_text, date_part, date_trunc_days, add_months, date_diff_days, TF_LOWER, TF_UPPER, TF_LIKE, TF_REVERSE, DP_YEAR, DP_MONTH, DP_DAY, DP_DOW, DP_ISODOW, DP_DOY, DP_QUARTER, DP_EPOCH,
                     DP_DECADE, DP_WEEK, DP_ISOYEAR, DP_CENTURY, DP_MILLENNIUM)
 from .planner import PhysicalPlan, G_DENSE, G_HASHED
@@ -470,6 +470,8 @@ struct _Emitter(Movable):
             return self.coalesce_generic(e, False)
         if x.op == B_CAST:
             return self.cast_value(e)
+        if x.op == B_QBIN:
+            return self.qbin_value(x)
         if x.op == B_TFN:
             return self.tfn_value(e)
         if x.op == B_CONCAT:
@@ -1774,6 +1776,26 @@ struct _Emitter(Movable):
         if self.rx[e].kind == FLOAT.value:
             self.p.has_float = True
         return V(v.reg, v.nul, False, self.rx[e].kind == FLOAT.value)
+
+    def qbin_value(mut self, x: BExpr) raises -> V:
+        """quantile_bin(a, n): 1 + the number of edges below a (the edges are literals, n - 1 of them, non-decreasing), by one comparison and one add per edge."""
+        if len(x.items) == 0:
+            raise Error("internal: quantile_bin reached the program before its edges were found")
+        var acc = self.const_i(1)
+        var nul = -1
+        for k in range(len(x.items)):
+            var t = self.cmp_raw(x.a, x.items[k], C_GT)
+            self.ins(OP_F2I, t[0], t[0])
+            self.ins(OP_IADD, acc, acc, t[0])
+            self.free(t[0])
+            if k == 0:
+                nul = self.or_nul(t[1], t[2])
+            else:
+                if t[1] >= 0:
+                    self.free(t[1])
+                if t[2] >= 0:
+                    self.free(t[2])
+        return V(acc, nul, False)
 
     def datepart_value(mut self, x: BExpr) raises -> V:
         var v = self.date_operand_value(x.a)
