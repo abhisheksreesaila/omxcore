@@ -1,14 +1,14 @@
 # F-178 test tool (tests/test_csv_scan_memory.py): runs one SQL string over a CSV file, either read whole or streamed with scan_csv, and
 # prints one JSON line with the answer and the process's peak memory (VmHWM: the resident set at its highest, file pages included).
 #
-#   csv_scan_probe <table|scan> <path.csv> "<SQL>" [group_rows] [block_bytes]
+#   csv_scan_probe <table|scan> <path.csv> "<SQL>" [group_rows] [block_bytes] [threads]
 #
 # {"rows": N, "checksum": X, "row_groups": G, "open_ms": .., "query_ms": .., "vm_hwm_kb": .., "rss_anon_kb": .., "report_failed": F}
 # checksum: the sum of every INT / DECIMAL / DATE / BOOL cell of the result (a TEXT cell adds the byte length of its word, so a wrong group
 # or a wrong total changes it).
 from std.sys import argv
 from std.time import perf_counter_ns
-from omxcore import Catalog, sql, read_csv, scan_csv, CsvOptions, TEXT, INT, DECIMAL, DATE, BOOL
+from omxcore import Catalog, sql_with, RulePlanner, PlannerOptions, read_csv, scan_csv, CsvOptions, TEXT, INT, DECIMAL, DATE, BOOL
 
 
 def status_kb(key: String) raises -> Int:
@@ -44,6 +44,9 @@ def main() raises:
             total += part.rows()
         print("groups " + String(total) + " hwm " + String(status_kb("VmHWM:")) + " anon " + String(status_kb("RssAnon:")))
         return
+    var popts = PlannerOptions()
+    if len(args) > 6:
+        popts.threads = Int(String(args[6]))
     var cat = Catalog()
     var t0 = perf_counter_ns()
     var groups = 0
@@ -61,7 +64,7 @@ def main() raises:
         cat.add_table("t", r.take_table().share())
     var t1 = perf_counter_ns()
     var open_hwm = status_kb("VmHWM:")
-    var res = sql(cat, text)
+    var res = sql_with(cat, text, RulePlanner(), popts)
     var t2 = perf_counter_ns()
     var sumcheck = 0
     for c in range(res.table.columns()):

@@ -56,8 +56,8 @@ def files(tmp_path_factory):
     return out
 
 
-def run(probe, mode, path):
-    p = subprocess.run([str(probe), mode, str(path), QUERY, str(GROUP_ROWS), str(BLOCK_BYTES)], check=True, capture_output=True, text=True)
+def run(probe, mode, path, threads=2):
+    p = subprocess.run([str(probe), mode, str(path), QUERY, str(GROUP_ROWS), str(BLOCK_BYTES), str(threads)], check=True, capture_output=True, text=True)
     return json.loads(p.stdout)
 
 
@@ -68,7 +68,8 @@ def test_the_streamed_peak_does_not_grow_with_the_file(probe, files):
     assert big["row_groups"] >= 20
     assert big["vm_hwm_kb"] < 100_000, big                                   # a 150 MB file in under 100 MB, runtime included
     assert big["vm_hwm_kb"] < small["vm_hwm_kb"] + 25_000, (small, big)       # three times the file, the same peak (a little for the bigger index)
-    assert big["vm_hwm_kb"] < file_kb / 2
+    # the bound by formula: ~40 MB of runtime and index, then per worker thread one group (100,000 rows x 7 columns x 8 bytes) and its mapped bytes (< 30 MB)
+    assert big["vm_hwm_kb"] < 40_000 + 2 * 30_000 and big["vm_hwm_kb"] < file_kb / 2, big
 
 
 def test_the_whole_file_read_holds_the_file(probe, files):

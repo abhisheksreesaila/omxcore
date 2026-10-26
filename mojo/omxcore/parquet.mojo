@@ -2466,7 +2466,8 @@ struct ParquetScan(Copyable, Movable):
 
     def csv_report(self) raises -> CsvReport:
         """A CSV scan's import report (F-178): the columns' kinds, empty and failed cells, the failed cells themselves (`failures()`: row,
-        column, the text, why), the ragged rows. Raises for a Parquet scan."""
+        column, the text, why), the ragged rows. Raises for a Parquet scan. A failed cell is a null in the data and only this report says it failed. The
+        kinds come from a sample cut at `block_bytes`, so with long rows they can rest on fewer rows than `read_csv`'s `infer_rows` and differ from it."""
         if not self._info[].is_csv:
             raise Error("not a scan of a CSV file")
         return self._info[].csv.report.copy()
