@@ -1720,8 +1720,9 @@ NaN / -0.0 as the engine's other aggregates. Errors are plain sentences. Rules, 
 ## F-178 Streamed CSV [doing] (mxframe #13)
 - [ ] a CSV bigger than memory queried a block at a time (the scan model of F-140 / F-149), types inferred from a sample with a failed-row report; edits and save over it as F-147
 
-## F-179 Undo that covers formula columns [doing] (mxframe #15)
-- [ ] adding, changing or removing a formula is an undo step in the Frame's edit log (one log for cells, merges and formulas)
+## F-179 Undo that covers formula columns [done] (mxframe #15)
+- [x] adding, changing or removing a formula is an undo step in the Frame's edit log (one log for cells, merges and formulas)
+- Built: `frame.mojo` formula steps (add / replace / remove) in the one log, `Frame.redo()` for every step kind (a new edit clears redo, and frees its formula lists), `Frame.remove_formula(m)` (refused while another formula reads it); `edits` advances on every step, undo and redo; snapshots copy the redo state. Tests `mojo/tests/test_frame_formula_undo.mojo` (replay oracle after every undo / redo on table, edited frame and Parquet scan frame; 150 random walks per source; merges; save after undo). Review: PASS (should-fix items done: snapshot redo state, freed swaps, wider fingerprint). Not done: formula columns in `range_aggregate` / `read_block` still raise (batched evaluation in blocks.mojo, a later ticket).
 
 ## F-180 Compressed Parquet writes on every platform [doing] (mxframe #16)
 - [ ] zstd (and snappy) built into the package for macOS and other no-codec targets (vendored static C sources or a Mojo port), so `.omx` files are compressed everywhere; the Mac link check stays green
