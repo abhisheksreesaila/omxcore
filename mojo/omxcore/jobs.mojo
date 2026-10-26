@@ -3,6 +3,7 @@
     compute_job(query, device)               -> Job[QueryResult]    the builder's Query.compute
     sql_job(catalog, text, options)          -> Job[SqlResult]      sql(catalog, text)
     read_csv_job(path, options)              -> Job[CsvResult]      read_csv
+    scan_csv_job(path, options)              -> Job[ParquetScan]    scan_csv (F-178: the pass that finds a CSV's row groups)
     read_parquet_job(path)                   -> Job[ParquetResult]  read_parquet
     save_job(frame, path, ...)               -> Job[Int]            Frame.save (the rows written)
     write_parquet_job(table, path, ...)      -> Job[Int]            write_parquet
@@ -18,7 +19,7 @@ from .bind import Catalog
 from .planner import PlannerOptions, RulePlanner
 from .sqlexec import SqlResult, sql_with
 from .csv import read_csv, CsvOptions, CsvResult
-from .parquet import ParquetResult, read_parquet, write_parquet, ZSTD, DEFAULT_ROW_GROUP
+from .parquet import ParquetResult, ParquetScan, read_parquet, scan_csv, write_parquet, ZSTD, DEFAULT_ROW_GROUP
 from .table import SharedTable
 from .frame import Frame, _ChunkCache
 from std.memory import ArcPointer
@@ -81,6 +82,25 @@ struct CsvJob(JobBody):
 def read_csv_job[CB: JobDone = NoCallback](path: String, options: CsvOptions = CsvOptions(), var done: CB = NoCallback()) -> Job[CsvResult]:
     """`read_csv(path, options)` on a thread of its own; its progress counts the file's bytes."""
     return start_job_then(CsvJob(path, options.copy()), done^)
+
+
+struct ScanCsvJob(JobBody):
+    comptime Out = ParquetScan
+    var path: String
+    var options: CsvOptions
+
+    def __init__(out self, var path: String, var options: CsvOptions):
+        self.path = path^
+        self.options = options^
+
+    def run(mut self, ctl: JobCtl) raises -> ParquetScan:
+        return scan_csv(self.path, self.options, ctl)
+
+
+def scan_csv_job[CB: JobDone = NoCallback](path: String, options: CsvOptions = CsvOptions(), var done: CB = NoCallback()) -> Job[ParquetScan]:
+    """`scan_csv(path, options)` on a thread of its own: opening a big CSV reads all of it once, so it takes a while. Its progress counts the file's
+    bytes; a cancel is seen between row groups (about `options.group_rows` rows)."""
+    return start_job_then(ScanCsvJob(path, options.copy()), done^)
 
 
 struct ParquetJob(JobBody):

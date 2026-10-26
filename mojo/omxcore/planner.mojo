@@ -90,6 +90,7 @@ struct Stats(Movable):
     var rows: Int
     var cols: List[ColStat]
     var row_groups: Int
+    var scan_name: String                    # "Parquet scan" or "CSV scan": what the plan notes call a scan source
     var edits: Int               # a frame: the changed and appended rows that go through the delta
     var version: Int             # a frame: its edit counter when it was registered
     var distrusted: Bool         # a file's footer statistics were found wrong in this query: none is used
@@ -100,6 +101,7 @@ struct Stats(Movable):
         self.rows = rows
         self.cols = List[ColStat]()
         self.row_groups = 0
+        self.scan_name = "Parquet scan"
         self.edits = 0
         self.version = 0
         self.distrusted = False
@@ -576,7 +578,7 @@ struct RulePlanner(Planner, Copyable, Movable):
             if a.hol:
                 plan.holistic = True
         var what = "table" if st.kind == SRC_TABLE else "frame at edit " + String(st.version) + ": the edits as a mask over the shared rows plus " + \
-                   commas(st.edits) + " changed or appended rows" if st.kind == SRC_FRAME else "Parquet scan, " + commas(st.row_groups) + " row groups"
+                   commas(st.edits) + " changed or appended rows" if st.kind == SRC_FRAME else st.scan_name + ", " + commas(st.row_groups) + " row groups"
         plan.notes.append("source: " + st.source + " (" + what + "), " + commas(st.rows) + " rows")
         if q.rows:
             plan.sink = S_ROWS
