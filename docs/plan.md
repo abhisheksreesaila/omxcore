@@ -1714,16 +1714,16 @@ NaN / -0.0 as the engine's other aggregates. Errors are plain sentences. Rules, 
 - Not done, on purpose: formula columns raise (`column `m` is a formula`; the work is per-row evaluation and belongs with F-179); the SQL path gives no row numbers, so an app that orders with `ORDER BY` passes the row ids of its own id column; a long range over a Frame with 300,000 edited cells pays ~120 ms to apply them.
 - Review: PASS (314 adversarial runs equal DuckDB and the per-cell loop over table / scan / edited frame / edited scan frame; exact int64 boundary; FLOAT min / max / NaN as DuckDB; bits equal threaded vs serial; too-small buffers, bad ranges, rows and columns refused with writes inside the block; 8 concurrent callers). Ready for later: formula columns (serial per-row evaluation now, batched in F-179), cache the frame patch arrays by edit counter (a long range over 300k edited cells costs 80-120 ms per call), pin the reviewer's safety cases in test_blocks, a plain C record for RangeAgg
 
-## F-177 More aggregates and keys: stddev / variance, quantile bins, ISO week [todo] (mxframe #10, #11)
+## F-177 More aggregates and keys: stddev / variance, quantile bins, ISO week [doing] (mxframe #10, #11)
 - [ ] `stddev` / `stddev_pop` / `variance` / `var_pop` per group and whole column, as DuckDB (numerically stable, float result); quantile bins (`ntile`-style edges from exact quantiles) as group keys; ISO week and ISO year
 
-## F-178 Streamed CSV [todo] (mxframe #13)
+## F-178 Streamed CSV [doing] (mxframe #13)
 - [ ] a CSV bigger than memory queried a block at a time (the scan model of F-140 / F-149), types inferred from a sample with a failed-row report; edits and save over it as F-147
 
-## F-179 Undo that covers formula columns [todo] (mxframe #15)
+## F-179 Undo that covers formula columns [doing] (mxframe #15)
 - [ ] adding, changing or removing a formula is an undo step in the Frame's edit log (one log for cells, merges and formulas)
 
-## F-180 Compressed Parquet writes on every platform [todo] (mxframe #16)
+## F-180 Compressed Parquet writes on every platform [doing] (mxframe #16)
 - [ ] zstd (and snappy) built into the package for macOS and other no-codec targets (vendored static C sources or a Mojo port), so `.omx` files are compressed everywhere; the Mac link check stays green
 
 Mapped to existing tickets: #7 result cache → F-160; #12 count distinct / median on the GPU and streamed in parallel, approximate or spilling → F-167 (+ F-163 for spill); #14 sort that spills (multi-key sort exists since F-152) → F-167 / F-163; #17 window functions → F-168; #18 versions and the time machine → M9 (parked, Delta-Lake style).
