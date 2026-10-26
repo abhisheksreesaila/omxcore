@@ -1,7 +1,7 @@
 # F-179: adding, replacing and removing a formula column is a step in the Frame's single edit log, next to cell edits,
 # appends, removes and merges: undo and redo walk it in either direction and give back the exact earlier state (formula
 # texts and positions, the values that read them), on a table, an edited frame and a Parquet scan frame.
-from omxcore import (Table, SharedTable, Frame, Query, col, sum, INT, DECIMAL, TEXT, write_parquet, read_parquet, scan_parquet, ZSTD)
+from omxcore import (Table, SharedTable, Frame, Query, col, sum, INT, DECIMAL, TEXT, write_parquet, read_parquet, scan_parquet, ZSTD, frame_snapshot)
 
 
 struct Rng(Movable):
@@ -107,10 +107,16 @@ def fingerprint(f: Frame) raises -> UInt64:
         if c >= f.stored():
             for b in f.formula_text(c).as_bytes():
                 h = mix(h, Int64(b))
+    for c in range(f.stored()):
+        h = mix(h, Int64(f.word_count(c)))
+    for r in f.changed_rows():
+        h = mix(h, Int64(r))
     for row in range(f.rows()):
         if not f.alive(row):
             h = mix(h, -1)
             continue
+        for c in range(f.stored()):
+            h = mix(h, Int64(1) if f.edited(c, row) else Int64(0))
         for c in range(f.columns()):
             if f.is_null(c, row):
                 h = mix(h, -2)
@@ -119,6 +125,11 @@ def fingerprint(f: Frame) raises -> UInt64:
     for c in range(f.stored(), f.columns()):
         var r = Query(f).agg(sum(col(f.name(c)))).compute()
         h = mix(h, Int64(r.values(0)[0]))
+    var q = Query(f).group_by(col("qty"), groups=16).agg(sum(col("revenue")), sum(col("cost"))).compute()
+    for g in range(len(q.counts)):
+        h = mix(h, Int64(q.counts[g]))
+        h = mix(h, Int64(q.values(0)[g]))
+        h = mix(h, Int64(q.values(1)[g]))
     return h
 
 
@@ -302,12 +313,47 @@ def test_merges_redo_with_formulas_between_them(kind: Int) raises:
     expect(fingerprint(f) == want[4], "kind " + String(kind) + ": the top again")
 
 
+def test_a_snapshot_undoes_formula_steps(kind: Int) raises:
+    var f = source(kind)
+    for i in range(STEPS):
+        step(f, i)
+    _ = f.undo()
+    var want = fingerprint(f)
+    var snap = frame_snapshot(f)
+    expect(fingerprint(snap) == want, "the snapshot reads as the frame")
+    f.set(f.column("qty"), 1, 2)                                   # the frame goes on without it
+    expect(snap.redo(), "the snapshot redoes the step the frame had undone")
+    expect(fingerprint(snap) == fingerprint(reference(kind, STEPS)), "kind " + String(kind) + ": snapshot redone")
+    for _ in range(STEPS):
+        expect(snap.undo(), "snapshot undo")
+    expect(fingerprint(snap) == fingerprint(reference(kind, 0)), "kind " + String(kind) + ": snapshot undone through the formula steps")
+
+
+def test_dropping_the_redo_list_frees_the_formula_snapshots() raises:
+    var f = source(0)
+    for i in range(STEPS):
+        step(f, i)
+    var held = 0
+    for _ in range(STEPS):
+        _ = f.undo()
+    for s in f.swaps:
+        held += len(s)
+    expect(held > 0, "undone formula steps keep their lists for redo")
+    f.set(f.column("qty"), 0, 3)                                   # a new edit: nothing can be redone
+    held = 0
+    for s in f.swaps:
+        held += len(s)
+    expect(held == 0, "no list is held for a step that can no longer be redone, " + String(held) + " left")
+
+
 def main() raises:
     for kind in range(3):
         test_every_step_undoes_and_redoes_to_the_exact_earlier_state(kind)
         test_undo_and_redo_in_any_order(kind)
         test_a_new_edit_forgets_what_was_undone(kind)
         test_merges_redo_with_formulas_between_them(kind)
+        test_a_snapshot_undoes_formula_steps(kind)
+    test_dropping_the_redo_list_frees_the_formula_snapshots()
     test_exact_values_around_an_added_formula()
     test_replace_remove_and_position()
     test_saving_after_undo_writes_the_undone_rows()

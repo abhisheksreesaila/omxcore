@@ -474,9 +474,16 @@ struct Frame(Movable):
     def _record(mut self, e: Edit):
         """A new step: it goes on the log, the edit counter moves, and what was undone can no longer be redone."""
         self.log.append(e.copy())
+        self._forget_redo()
+        self.edits += 1
+
+    def _forget_redo(mut self):
+        """What was undone can no longer be redone: free the formula lists its steps held."""
+        for e in self.redo_log:
+            if e.kind == FORMULA:
+                self.swaps[e.row] = List[Formula]()
         self.redo_log.clear()
         self.redo_rows.clear()
-        self.edits += 1
 
     @staticmethod
     def _is_merge(e: Edit) -> Bool:
@@ -607,8 +614,7 @@ struct Frame(Movable):
                 self.log.append(Edit(MERGE, c, number, code, target, False))
             count += 1
         if count > 0:
-            self.redo_log.clear()
-            self.redo_rows.clear()
+            self._forget_redo()
             self.edits += 1
         return count
 

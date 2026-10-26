@@ -100,7 +100,7 @@ def read_parquet_job[CB: JobDone = NoCallback](path: String, var done: CB = NoCa
 
 
 def frame_snapshot(f: Frame) -> Frame:
-    """A frame of its own with `f`'s edits as they are now (cells, appended and removed rows, words, merges, log, formulas): the
+    """A frame of its own with `f`'s edits as they are now (cells, appended and removed rows, words, merges, log and what was undone, formulas): the
     caller may go on editing and reading `f` while a job works on the snapshot. A frame over a file shares the file (a
     `ParquetScan` is a shared handle), not its chunk cache."""
     var out = Frame(f.base)
@@ -117,6 +117,9 @@ def frame_snapshot(f: Frame) -> Frame:
     out.log = f.log.copy()
     out.edits = f.edits
     out.formulas = f.formulas.copy()
+    out.redo_log = f.redo_log.copy()
+    out.redo_rows = f.redo_rows.copy()
+    out.swaps = f.swaps.copy()
     return out^
 
 
