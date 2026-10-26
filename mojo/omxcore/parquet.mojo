@@ -38,6 +38,9 @@ from .kernels._fpenv import par_n, core_count
 from std.collections import Dict
 from std.memory import ArcPointer
 from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, F32_COLUMN
+from .mapped import _Mapped, _MAP_ALIGN
+from .csv import CsvOptions
+from .csvscan import CsvSource, CsvReport, csv_open, csv_parse_group, csv_table
 from .thrift import ThriftWriter, ThriftReader, T_I32, T_I64, T_BINARY, T_LIST, T_STRUCT, T_TRUE, T_FALSE, T_STOP, _valid_utf8
 
 # Parquet enums (parquet.thrift)
@@ -2354,41 +2357,6 @@ def _decode_group(bases: List[Int], ns: List[Int], metas: List[_ChunkMeta], leaf
 
 # ── scanning: a file bigger than memory, one row group at a time (F-140) ─────────────────────────────
 
-comptime _MAP_ALIGN = 16384          # mmap offsets must be page multiples: 4 KB (Linux x86), 16 KB (Apple arm64)
-
-
-struct _Mapped(Movable):
-    """A read-only mapping of `length` bytes of a file from `offset`; unmapped when released or dropped, so a
-    chunk's pages are in the process only while it is decoded."""
-    var addr: Int
-    var span: Int
-    var data: Int                    # the address of the byte at `offset`
-
-    def __init__(out self):
-        self.addr = 0
-        self.span = 0
-        self.data = 0
-
-    def __init__(out self, fd: Int, offset: Int, length: Int, path: String) raises:
-        var start = offset - offset % _MAP_ALIGN
-        self.span = length + (offset - start)
-        self.addr = external_call["mmap", Int](Int(0), self.span, Int32(1), Int32(2), fd, start)
-        self.data = 0
-        if self.addr == -1:
-            self.span = 0
-            raise Error("couldn't read `" + path + "`: part of the file could not be mapped into memory")
-        self.data = self.addr + (offset - start)
-
-    def release(mut self):
-        if self.span > 0:
-            _ = external_call["munmap", Int32](self.addr, self.span)
-            self.span = 0
-
-    def __del__(deinit self):
-        if self.span > 0:
-            _ = external_call["munmap", Int32](self.addr, self.span)
-
-
 def _open_file(path: String) raises -> FileHandle:
     var file: FileHandle
     try:
@@ -2434,6 +2402,8 @@ struct _ScanInfo(Movable):
     var loaded: List[Int64]          # 1 once the dictionary is built: written with a release store, read with an acquire load (F-175: a job's thread and its caller)
     var extra: List[String]          # the file's other key-value metadata (key, value, ...)
     var build_lock: List[Int64]      # F-175: one word, 1 while a thread builds a dictionary (a job and its caller share a scan)
+    var is_csv: Bool                 # F-178: the rows are a CSV file's (`scan_csv`): `csv` holds its row groups, and `leaves` / `groups` are made from it
+    var csv: CsvSource
 
     def __init__(out self, path: String, var file: FileHandle, size: Int, var leaves: List[_Leaf],
                  var groups: List[List[_ChunkMeta]], var rows_of: List[Int], var metadata: String, var dicts: Table):
@@ -2442,6 +2412,8 @@ struct _ScanInfo(Movable):
         self.size = size
         self.loaded = List[Int64](length=len(leaves), fill=0)
         self.build_lock = List[Int64](length=1, fill=0)
+        self.is_csv = False
+        self.csv = CsvSource()
         self.extra = List[String]()
         self.widx = List[_WordIndex]()
         for _ in range(len(leaves)):
@@ -2487,6 +2459,13 @@ struct ParquetScan(Copyable, Movable):
 
     def row_groups(self) -> Int:
         return len(self._info[].groups)
+
+    def csv_report(self) raises -> CsvReport:
+        """A CSV scan's import report (F-178): the columns' kinds, empty and failed cells, the failed cells themselves (`failures()`: row,
+        column, the text, why), the ragged rows. Raises for a Parquet scan."""
+        if not self._info[].is_csv:
+            raise Error("not a scan of a CSV file")
+        return self._info[].csv.report.copy()
 
     def group_rows(self, g: Int) -> Int:
         return self._info[].rows_of[g]
@@ -2622,12 +2601,20 @@ struct ParquetScan(Copyable, Movable):
             if Atomic[Scalar[DType.int64]].load(Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=Int(info.loaded.unsafe_ptr())) + c) == 0:
                 info.check_unchanged()
                 info.widx[c].col = Int(info.dicts.cols.unsafe_ptr() + c)
-                for g in range(len(info.groups)):
-                    var maps = List[_Mapped]()
-                    var src = _chunk_source(info.file._get_raw_fd(), info.size, info.path, info.groups[g][c], info.leaves[c], maps)
-                    _decode_group([src[0]], [src[1]], [info.groups[g][c].copy()], [c], [c], [Int(info.widx.unsafe_ptr() + c)], True,
-                                  info.leaves, 0, info.dicts, words_only=True)
-                    _ = maps^
+                if info.is_csv:
+                    var want = List[Bool](length=len(info.leaves), fill=False)
+                    want[c] = True
+                    for g in range(len(info.groups)):
+                        var sink = csv_parse_group(info.csv, info.file._get_raw_fd(), info.path, g, want, True)
+                        for w in range(len(sink.cols[c].words.starts)):
+                            _ = info.dicts.add_word(c, sink.cols[c].words.word(w))
+                else:
+                    for g in range(len(info.groups)):
+                        var maps = List[_Mapped]()
+                        var src = _chunk_source(info.file._get_raw_fd(), info.size, info.path, info.groups[g][c], info.leaves[c], maps)
+                        _decode_group([src[0]], [src[1]], [info.groups[g][c].copy()], [c], [c], [Int(info.widx.unsafe_ptr() + c)], True,
+                                      info.leaves, 0, info.dicts, words_only=True)
+                        _ = maps^
                 Atomic[Scalar[DType.int64]].store(Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=Int(info.loaded.unsafe_ptr())) + c, 1)
         except e:
             Atomic[Scalar[DType.int64]].store(lock, 0)
@@ -2668,6 +2655,12 @@ struct ParquetScan(Copyable, Movable):
             self.ensure_words(c)
         ref info = self._info[]
         info.check_unchanged()
+        if info.is_csv:
+            var want = List[Bool](length=len(info.leaves), fill=False)
+            for c in cols:
+                want[c] = True
+            var sink = csv_parse_group(info.csv, info.file._get_raw_fd(), info.path, g, want, True)
+            return csv_table(sink, cols, self.schema, info.dicts, ext)
         var t = Table.empty()
         var maps = List[_Mapped]()
         var bases = List[Int]()
@@ -2701,8 +2694,10 @@ struct _GroupPlan(Movable):
     var pages: List[_Page]
     var of_col: List[List[Int]]      # per column read: its data pages, in row order
     var rows: Int
+    var decoded: Table               # a CSV scan (F-178): the group's columns, parsed whole when it is opened; the readers copy blocks of it
 
     def __init__(out self, var scan: ParquetScan, cols: List[Int]):
+        self.decoded = Table.empty()
         self.scan = scan^
         self.cols = cols.copy()
         self.ctxs = List[_Ctx]()
@@ -2717,6 +2712,10 @@ def _open_plan(scan: ParquetScan, g: Int, cols: List[Int]) raises -> _GroupPlan:
     var plan = _GroupPlan(scan.copy(), cols)
     ref info = scan._info[]
     info.check_unchanged()
+    if info.is_csv:
+        plan.decoded = scan._read(g, cols, 0)
+        plan.rows = plan.decoded.rows()
+        return plan^
     var maps = List[_Mapped]()                           # the chunks, while the headers are walked and the dictionaries decoded
     var rows = -1
     for k in range(len(cols)):
@@ -2796,6 +2795,26 @@ struct _GroupReader(Movable):
         var b1 = min(self.stop, b0 + self.block)
         ref info = self.scan._info[]
         ref plan = UnsafePointer[_GroupPlan, MutAnyOrigin](unsafe_from_address=self.plan)[]
+        if info.is_csv:
+            for k in range(len(self.cols)):
+                ref col = t.cols[k]
+                ref src = plan.decoded.cols[k]
+                for j in range(b0, b1):
+                    col.values[j - b0] = src.values[j]
+                var nulls = 0
+                if len(src.validity) > 0:
+                    col.validity.clear()
+                    col.validity.resize((self.block + 7) // 8, 0xFF)
+                    var vptr = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(col.validity.unsafe_ptr()))
+                    _copy_bits(vptr, 0, UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(src.validity.unsafe_ptr())), b0, b1 - b0)
+                    for j in range(b0, b1):
+                        if src.is_null(j):
+                            nulls += 1
+                if nulls == 0:
+                    col.validity.clear()
+                col.nulls = nulls
+            self.at = b1
+            return b1 - b0
         for k in range(len(self.cols)):
             ref col = t.cols[k]
             ref ctx = plan.ctxs[k]
@@ -2914,3 +2933,46 @@ def scan_parquet(path: String) raises -> ParquetScan:
     var info = _ScanInfo(path, file^, size, cols^, groups^, rows_of^, footer.omx.copy(), dicts^)
     info.extra = footer.extra.copy()
     return ParquetScan(info^, schema^.share())
+
+
+comptime CsvScan = ParquetScan           # F-178: `scan_csv` gives the same type: every ParquetScan call and every Query / SQL / Frame source works
+
+
+def scan_csv(path: String, options: CsvOptions = CsvOptions()) raises -> ParquetScan:
+    """Opens a CSV or TSV file for streaming (csvscan.mojo): the header and the kinds from its first rows (the rules of `read_csv`), one pass
+    over the file that finds its row groups and fills `scan.csv_report()`, no column data kept. A query, `Catalog.add_scan`, `Frame(scan)`
+    and `save` then work as on a Parquet scan, one row group (`options.group_rows` rows) at a time."""
+    var file = _open_file(path)
+    var fd = file._get_raw_fd()
+    var one = List[UInt8](length=1, fill=0)
+    var got = external_call["read", Int](fd, one.unsafe_ptr(), Int(1))
+    _ = one^
+    if got < 0:                                                       # a directory opens, but cannot be read
+        raise Error("couldn't read `" + path + "`: not a regular file")
+    var size = _file_size(file, path)
+    var src = csv_open(fd, size, path, options)
+    var leaves = List[_Leaf]()
+    var schema = Table.empty()
+    var dicts = Table.empty()
+    for c in range(len(src.names)):
+        var k = ColumnKind(src.kinds[c])
+        var total = 0
+        for g in range(len(src.rows)):
+            total += src.nulls[g][c]
+        var ptype = PT_BYTE_ARRAY if k == TEXT else PT_DOUBLE if k == FLOAT else PT_INT64
+        leaves.append(_Leaf(src.names[c], ptype, 0, OPTIONAL if total > 0 else REQUIRED, -1, src.scales[c], 0, -1, 0, 0, False))
+        _ = schema.add_column(src.names[c], k, scale=src.scales[c])
+        _ = dicts.add_column(src.names[c], k, scale=src.scales[c])
+    var groups = List[List[_ChunkMeta]]()
+    var rows_of = List[Int]()
+    for g in range(len(src.rows)):
+        var metas = List[_ChunkMeta]()
+        for c in range(len(src.names)):
+            metas.append(_ChunkMeta(leaves[c].ptype, UNCOMPRESSED, src.rows[g], 0, 0, 0, src.rows[g], src.nulls[g][c], 0, 0, 0, 0, 0))
+        groups.append(metas^)
+        rows_of.append(src.rows[g])
+    var info = _ScanInfo(path, file^, size, leaves^, groups^, rows_of^, String(), dicts^)
+    info.is_csv = True
+    info.csv = src^
+    return ParquetScan(info^, schema^.share())
+

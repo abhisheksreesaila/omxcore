@@ -6,8 +6,9 @@ from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, D
 from .expr import Expr, col, lit, lit_float, lit_f32, least, greatest
 from .query import (Query, QueryResult, Agg, sum, count, mean, min_of, max_of, count_distinct, percentile, median, top_k,
                     CPU, GPU, AUTO, MORSELS_AUTO, MORSELS_ON, MORSELS_OFF)
-from .parquet import write_parquet, read_parquet, scan_parquet, ParquetResult, ParquetScan, ParquetWriter, UNCOMPRESSED, SNAPPY, ZSTD
+from .parquet import write_parquet, read_parquet, scan_parquet, scan_csv, CsvScan, ParquetResult, ParquetScan, ParquetWriter, UNCOMPRESSED, SNAPPY, ZSTD
 from .csv import read_csv, CsvOptions, CsvResult, CsvColumn, FailedRow
+from .csvscan import CsvReport, CsvFailure
 from .frame import Frame, Formula
 from .floatfmt import float_text
 from .gpu import DeviceTable, gpu_available, gpu_device

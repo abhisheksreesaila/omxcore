@@ -90,7 +90,11 @@ comptime _MAX_CHUNKS = 512
 struct CsvOptions(Copyable, Movable):
     """`delimiter`: one byte, "" picks a tab for `.tsv` / `.tab` files and a comma for the rest. `threads` 0 uses
     every core, 1 parses on one thread (the reference the tests compare to). `chunk_bytes`: the smallest piece
-    given to a thread (lower it only to test). `float_columns`: header names read as FLOAT whatever the first rows show. `decimal_columns`: header names read as an exact DECIMAL at the scale their first rows need (up to 18 places), raising when a value of the first rows is not a plain number or does not fit int64."""
+    given to a thread (lower it only to test). `float_columns`: header names read as FLOAT whatever the first rows show. `decimal_columns`: header names read as an exact DECIMAL at the scale their first rows need (up to 18 places), raising when a value of the first rows is not a plain number or does not fit int64.
+
+    Only `scan_csv` (a file read a block at a time, csvscan.mojo) uses the last three: `group_rows`: the rows of one row group (the unit a
+    query decodes), `block_bytes`: the most bytes of the file looked at at once (the sample for the kinds, and the window a row group is
+    found in), `max_row_bytes`: the longest row accepted (a quote that never closes would otherwise make the rest of the file one row)."""
 
     var delimiter: String
     var has_header: Bool
@@ -100,10 +104,17 @@ struct CsvOptions(Copyable, Movable):
     var chunk_bytes: Int
     var float_columns: List[String]
     var decimal_columns: List[String]
+    var group_rows: Int
+    var block_bytes: Int
+    var max_row_bytes: Int
 
     def __init__(out self, delimiter: String = "", has_header: Bool = True, max_columns: Int = 4096,
                  infer_rows: Int = 100_000, threads: Int = 0, chunk_bytes: Int = 1 << 22,
-                 var float_columns: List[String] = List[String](), var decimal_columns: List[String] = List[String]()):
+                 var float_columns: List[String] = List[String](), var decimal_columns: List[String] = List[String](),
+                 group_rows: Int = 262_144, block_bytes: Int = 16 << 20, max_row_bytes: Int = 64 << 20):
+        self.group_rows = group_rows
+        self.block_bytes = block_bytes
+        self.max_row_bytes = max_row_bytes
         self.float_columns = float_columns^
         self.decimal_columns = decimal_columns^
         self.delimiter = delimiter
@@ -925,8 +936,12 @@ struct ChunkCol(Movable):
     var wide_rows: List[Int]  # DECIMAL at scale 2: cells with 3 or 4 places, kept at scale 4 here (the column widens)
     var wide_vals: List[Int64]
     var rounded: Int  # cells with more than 4 decimal places
+    var active: Bool  # False: the column is not read at all (a scan reads the columns a query uses)
+    var count_only: Bool  # a TEXT column whose words nobody asked for: its cells are only counted
 
     def __init__(out self, kind: Int, scale: Int):
+        self.active = True
+        self.count_only = False
         self.kind = kind
         self.scale = scale
         self.vals = List[Int64]()
@@ -951,12 +966,17 @@ struct ChunkSink(CellSink, Movable):
     var ragged_count: Int
     var header_cells: Int
 
-    def __init__(out self, kinds: List[Int], scales: List[Int], header_cells: Int):
+    def __init__(out self, kinds: List[Int], scales: List[Int], header_cells: Int, want: List[Bool] = List[Bool](),
+                 text_words: Bool = True):
+        """`want`: the columns to read (empty: all). `text_words` False: a TEXT column's words are not collected (its empty cells are still counted)."""
         self.header_cells = header_cells
         self.ncols = len(kinds)
         self.cols = List[ChunkCol]()
         for c in range(len(kinds)):
             self.cols.append(ChunkCol(kinds[c], scales[c]))
+            if len(want) > 0 and not want[c]:
+                self.cols[c].active = False
+            self.cols[c].count_only = kinds[c] == TEXT.value and not text_words
         self.rows = 0
         self.ragged = List[_Fail]()
         self.ragged_count = 0
@@ -965,6 +985,8 @@ struct ChunkSink(CellSink, Movable):
         if col >= self.ncols:
             return
         ref c = self.cols[col]
+        if not c.active:
+            return
         if n == 0:
             c.vals.append(0)
             c.nulls.append(self.rows)
@@ -974,7 +996,7 @@ struct ChunkSink(CellSink, Movable):
         var ok = True
         var reason = String()
         if c.kind == TEXT.value:
-            v = Int64(c.words.code_of(p, n))
+            v = 0 if c.count_only else Int64(c.words.code_of(p, n))
         elif c.kind == INT.value:
             ok = _parse_int(p, n, v)
         elif c.kind == DECIMAL.value:
@@ -1012,6 +1034,8 @@ struct ChunkSink(CellSink, Movable):
 
     def end_row(mut self, ncells: Int, row: BP, row_len: Int):
         for col in range(ncells, self.ncols):  # a short row: the missing cells are empty
+            if not self.cols[col].active:
+                continue
             self.cols[col].vals.append(0)
             self.cols[col].nulls.append(self.rows)
             self.cols[col].empty += 1
@@ -1090,7 +1114,29 @@ def _delimiter(path: String, requested: String) raises -> UInt8:
     return b
 
 
-def _parse(data: BP, size: Int, delim: UInt8, options: CsvOptions, mut result: CsvResult, job: JobCtl = JobCtl()) raises:
+struct CsvShape(Movable):
+    """What the first rows say about a file: the columns' names, kinds and scales, and where the data starts."""
+    var names: List[String]
+    var kinds: List[Int]
+    var scales: List[Int]
+    var header_cells: Int            # 0: nothing but blank lines
+    var first_row: Int               # the byte offset of the first data row
+    var skipped: List[String]        # header names past `max_columns`
+    var infer: InferSink
+
+    def __init__(out self):
+        self.names = List[String]()
+        self.kinds = List[Int]()
+        self.scales = List[Int]()
+        self.header_cells = 0
+        self.first_row = 0
+        self.skipped = List[String]()
+        self.infer = InferSink(0)
+
+
+def _infer_shape(data: BP, size: Int, delim: UInt8, options: CsvOptions) raises -> CsvShape:
+    """The header and the kinds, from the first `infer_rows` rows of `data[:size]` (which ends at a row boundary)."""
+    var shape = CsvShape()
     var body = 0
     if size >= 3 and data[0] == 0xEF and data[1] == 0xBB and data[2] == 0xBF:
         body = 3
@@ -1099,7 +1145,8 @@ def _parse(data: BP, size: Int, delim: UInt8, options: CsvOptions, mut result: C
     var head = HeaderSink()
     var after_first = _walk(data, body, size, delim, 1, head)
     if head.cells == 0:  # nothing but blank lines
-        return
+        return shape^
+    shape.header_cells = head.cells
     var ncols = min(head.cells, options.max_columns)
     var names = List[String]()
     var seen = Dict[String, Int]()
@@ -1122,9 +1169,8 @@ def _parse(data: BP, size: Int, delim: UInt8, options: CsvOptions, mut result: C
         names.append(name)
     if options.has_header:
         for c in range(ncols, head.cells):
-            result.skipped.append(head.names[c])
+            shape.skipped.append(head.names[c])
     var first_row = after_first if options.has_header else body
-    job.advance(first_row)                                       # (the bytes before the first row count as done)
 
     # kinds from the first `infer_rows` rows
     var infer = InferSink(ncols)
@@ -1179,6 +1225,26 @@ def _parse(data: BP, size: Int, delim: UInt8, options: CsvOptions, mut result: C
                         raise Error("column `" + names[c] + "` cannot be read as an exact DECIMAL: a value in its first rows does not fit int64 at " + String(scales[c]) + " decimal places")
                 kinds[c] = FLOAT.value if infer.cols[c].can_float and infer.cols[c].numeric else TEXT.value     # too wide at its scale
                 scales[c] = 0
+    shape.names = names^
+    shape.kinds = kinds^
+    shape.scales = scales^
+    shape.first_row = first_row
+    shape.infer = infer^
+    return shape^
+
+
+def _parse(data: BP, size: Int, delim: UInt8, options: CsvOptions, mut result: CsvResult, job: JobCtl = JobCtl()) raises:
+    var shape = _infer_shape(data, size, delim, options)
+    if shape.header_cells == 0:  # nothing but blank lines
+        return
+    result.skipped = shape.skipped.copy()
+    var names = shape.names.copy()
+    var kinds = shape.kinds.copy()
+    var scales = shape.scales.copy()
+    var first_row = shape.first_row
+    var head = HeaderSink()
+    head.cells = shape.header_cells
+    job.advance(first_row)                                       # (the bytes before the first row count as done)
 
     # chunks: safe row boundaries found with a parallel pre-scan of the quote state machine
     var workers = options.threads if options.threads > 0 else core_count()
@@ -1272,7 +1338,7 @@ def _parse(data: BP, size: Int, delim: UInt8, options: CsvOptions, mut result: C
     _ = rstart^  # (the tasks read it by address)
     job.check()                                                  # a cancelled round left chunks unparsed: none is used
     job.stage(STAGE_FINISH)
-    _stitch(sinks, names, kinds, scales, infer, result, job)
+    _stitch(sinks, names, kinds, scales, shape.infer, result, job)
 
 
 def _stitch(mut sinks: List[ChunkSink], names: List[String], kinds: List[Int], mut scales: List[Int],
