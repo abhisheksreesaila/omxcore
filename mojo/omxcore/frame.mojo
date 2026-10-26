@@ -4,7 +4,7 @@ sections 3, 4 and 6).
     var f = Frame(shared)
     f.set(c, row, 1250); f.set_text(c, row, "West")       # typed text is parsed by the column's kind
     var row = f.append(["12.50", "East"]); f.remove(row)
-    f.undo(); f.edits                                      # one log for sets, appends, removes and merges
+    f.undo(); f.redo(); f.edits                            # one log for sets, appends, removes, merges and formula steps
     var m = f.formula("margin = revenue - cost")           # decimal-aware, never materialised
     f.get(m, row); f.permutation(c, descending=False)
     Query(f).group_by(col("region"), groups=n).agg(sum(col("margin"))).compute()   # includes the edits
@@ -35,6 +35,7 @@ comptime APPEND = 1
 comptime REMOVE = 2
 comptime MERGE = 3
 comptime REPOINT = 4
+comptime FORMULA = 5                # a formula added, replaced or removed: `row` indexes `swaps`, the list of formulas the step left behind
 comptime NULL_EDIT = Int64(0x7FF8000000000001)   # marks an EDITED cell or an APPENDED value that is null (never a base cell: those are null by the
                                                  # validity bitmap, so a base INT / DECIMAL / DATE / FLOAT value may be any int64, this one too). `set`
                                                  # refuses it as a value. A quiet NaN's bits, so a FLOAT cell edited to exactly this NaN is stored as the
@@ -182,6 +183,9 @@ struct Frame(Movable):
     var log: List[Edit]
     var edits: Int                        # moves on every edit and undo: hosts re-aggregate when it moves
     var formulas: List[Formula]
+    var redo_log: List[Edit]              # undone steps, the next one to redo last; any new edit empties it
+    var redo_rows: List[List[Int64]]      # the appended rows that undo took back, the next to redo last
+    var swaps: List[List[Formula]]        # per formula step: the formulas on the other side of it (undo and redo swap them in)
 
     def __init__(out self, base: SharedTable):
         self.base = base
@@ -201,6 +205,9 @@ struct Frame(Movable):
         self.log = List[Edit]()
         self.edits = 0
         self.formulas = List[Formula]()
+        self.redo_log = List[Edit]()
+        self.redo_rows = List[List[Int64]]()
+        self.swaps = List[List[Formula]]()
 
     def __init__(out self, scan: ParquetScan):
         """A session over a Parquet file that stays on disk: the same API as `Frame(shared)`."""
@@ -439,8 +446,7 @@ struct Frame(Movable):
         var had = key in self.cells
         var old = self._raw(c, row)
         self.cells[key] = value
-        self.log.append(Edit(SET, c, row, old, value, had))
-        self.edits += 1
+        self._record(Edit(SET, c, row, old, value, had))
 
     def set_null(mut self, c: Int, row: Int) raises:
         self._set(c, row, NULL_EDIT)
@@ -457,18 +463,27 @@ struct Frame(Movable):
             r.append(self.parse(c, values[c]) if c < len(values) else NULL_EDIT)
         self.added.append(r^)
         var row = self.rows() - 1
-        self.log.append(Edit(APPEND, -1, row, 0, 0, False))
-        self.edits += 1
+        self._record(Edit(APPEND, -1, row, 0, 0, False))
         return row
 
     def remove(mut self, row: Int):
         if self.alive(row):
             self.removed.add(row)
-            self.log.append(Edit(REMOVE, -1, row, 0, 0, False))
-            self.edits += 1
+            self._record(Edit(REMOVE, -1, row, 0, 0, False))
+
+    def _record(mut self, e: Edit):
+        """A new step: it goes on the log, the edit counter moves, and what was undone can no longer be redone."""
+        self.log.append(e.copy())
+        self.redo_log.clear()
+        self.redo_rows.clear()
+        self.edits += 1
+
+    @staticmethod
+    def _is_merge(e: Edit) -> Bool:
+        return e.kind == MERGE or e.kind == REPOINT
 
     def undo(mut self) -> Bool:
-        """Takes back the last edit (a whole merge at once); False when there is nothing to undo."""
+        """Takes back the last edit (a whole merge at once; a formula added, replaced or removed); False when there is nothing to undo."""
         if len(self.log) == 0:
             return False
         var e = self.log.pop()
@@ -478,17 +493,47 @@ struct Frame(Movable):
                 self.cells[key] = e.old
             else:
                 _ = self.cells.pop(key, 0)
-        elif e.kind == MERGE or e.kind == REPOINT:
-            self._unmerge_step(e)
-            while len(self.log) > 0 and (self.log[len(self.log) - 1].kind == MERGE or
-                                         self.log[len(self.log) - 1].kind == REPOINT) and \
-                    self.log[len(self.log) - 1].row == e.row:
-                var more = self.log.pop()
-                self._unmerge_step(more)
+            self.redo_log.append(e^)
+        elif Self._is_merge(e):
+            var number = e.row
+            self.redo_log.append(self._unmerge_step(e))
+            while len(self.log) > 0 and Self._is_merge(self.log[len(self.log) - 1]) and self.log[len(self.log) - 1].row == number:
+                self.redo_log.append(self._unmerge_step(self.log.pop()))
         elif e.kind == APPEND:
-            _ = self.added.pop()
+            self.redo_rows.append(self.added.pop())
+            self.redo_log.append(e^)
+        elif e.kind == FORMULA:
+            swap(self.formulas, self.swaps[e.row])
+            self.redo_log.append(e^)
         else:
             self.removed.discard(e.row)
+            self.redo_log.append(e^)
+        self.edits += 1
+        return True
+
+    def redo(mut self) -> Bool:
+        """Puts back the step the last `undo` took back; False when there is none (a new edit forgets what was undone)."""
+        if len(self.redo_log) == 0:
+            return False
+        var e = self.redo_log.pop()
+        if e.kind == SET:
+            self.cells[(e.row << 20) | e.col] = e.new
+            self.log.append(e^)
+        elif Self._is_merge(e):
+            var number = e.row
+            self.log.append(self._unmerge_step(e, True))
+            while len(self.redo_log) > 0 and Self._is_merge(self.redo_log[len(self.redo_log) - 1]) and \
+                    self.redo_log[len(self.redo_log) - 1].row == number:
+                self.log.append(self._unmerge_step(self.redo_log.pop(), True))
+        elif e.kind == APPEND:
+            self.added.append(self.redo_rows.pop())
+            self.log.append(e^)
+        elif e.kind == FORMULA:
+            swap(self.formulas, self.swaps[e.row])
+            self.log.append(e^)
+        else:
+            self.removed.add(e.row)
+            self.log.append(e^)
         self.edits += 1
         return True
 
@@ -520,11 +565,18 @@ struct Frame(Movable):
         var hit = self.aliases.get(Self._alias_key(c, code))
         return hit.value() if hit else code
 
-    def _unmerge_step(mut self, e: Edit):
+    def _unmerge_step(mut self, e: Edit, forward: Bool = False) -> Edit:
+        """Undoes one merge step (or, `forward`, redoes it); returns the step as the other direction needs it."""
+        var key = Self._alias_key(e.col, e.old)
         if e.kind == MERGE:
-            _ = self.aliases.pop(Self._alias_key(e.col, e.old), 0)
-        else:
-            self.aliases[Self._alias_key(e.col, e.old)] = e.new
+            if forward:
+                self.aliases[key] = e.new
+            else:
+                _ = self.aliases.pop(key, 0)
+            return e.copy()
+        var now = self.aliases.get(key).value()                        # a repoint swaps the target with the one it names
+        self.aliases[key] = e.new
+        return Edit(REPOINT, e.col, e.row, e.old, now, False)
 
     def merge(mut self, c: Int, codes: List[Int64], into: Int64) raises -> Int:
         """Folds the text values `codes` of column c into `into`: every row reads as `into` from now on. One undo
@@ -555,6 +607,8 @@ struct Frame(Movable):
                 self.log.append(Edit(MERGE, c, number, code, target, False))
             count += 1
         if count > 0:
+            self.redo_log.clear()
+            self.redo_rows.clear()
             self.edits += 1
         return count
 
@@ -576,7 +630,7 @@ struct Frame(Movable):
             if at < 0:
                 self.formulas.append(Formula(name, text, parsed[1].copy(), parsed[2]))
                 _ = self.program(self.columns() - 1)         # a cycle raises here
-                self.edits += 1
+                self._record_formulas(saved)
                 return self.columns() - 1
             var pending = self.dependants(self.stored() + at)    # their scales and factors were built on the old one
             self.formulas[at] = Formula(name, text, parsed[1].copy(), parsed[2])
@@ -597,11 +651,26 @@ struct Frame(Movable):
                 if len(later) == len(pending):
                     raise Error("formulas refer to each other in a cycle")
                 pending = later^
-            self.edits += 1
+            self._record_formulas(saved)
             return self.stored() + at
         except e:
             self.formulas = saved^                           # a refused formula leaves the frame as it was
             raise e^
+
+    def _record_formulas(mut self, before: List[Formula]):
+        self.swaps.append(before.copy())
+        self._record(Edit(FORMULA, -1, len(self.swaps) - 1, 0, 0, False))
+
+    def remove_formula(mut self, m: Int) raises:
+        """Removes the formula column m (the columns after it move up by one); one undo step. Refused while another formula reads it."""
+        if m < self.stored() or m >= self.columns():
+            raise Error("only a formula column is removed")
+        var readers = self.dependants(m)
+        if len(readers) > 0:
+            raise Error("`" + self.name(m) + "` is read by the formula `" + readers[0] + "`: remove that first")
+        var saved = self.formulas.copy()
+        _ = self.formulas.pop(m - self.stored())
+        self._record_formulas(saved)
 
     def _parse_formula(self, text: String) raises -> Tuple[String, Expr, Int]:
         var eq = text.find("=")
