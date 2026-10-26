@@ -92,7 +92,8 @@ var f = Frame(table)              # one session's view: its edits over the share
 f.set(c, row, value); f.set_text(c, row, "West")     # set_text parses by kind; new words get new codes
 f.append(values: List[String]) -> Int                # a new row, returns its number
 f.remove(row)                                        # a tombstone; f.alive(row)
-f.undo() -> Bool; f.edits -> Int                     # edit counter: hosts re-aggregate when it moves
+f.undo() -> Bool; f.redo() -> Bool                   # one log: sets, appends, removes, merges and formulas (F-179); a new edit forgets what was undone
+f.edits -> Int                                       # edit counter: hosts re-aggregate when it moves (every edit, undo and redo, formula steps too)
 f.edited(c, row) -> Bool                              # the cell holds a session edit (grids mark it)
 f.word_count(c) -> Int                                # shared words + words this session added
 f.changed_rows() -> List[Int]                        # rows that differ from the shared base
@@ -104,7 +105,7 @@ f.save(path, metadata="", compression=ZSTD)          # the edited rows to a new 
 | Need | Why |
 |---|---|
 | Sparse cell edits, appended rows and removed rows over a read-only base | many sessions share one 100M-row table |
-| One undo log covering sets, appends, removes and merges | the toolbar's Undo |
+| One undo / redo log covering sets, appends, removes, merges and formula columns (added, replaced, removed) | the toolbar's Undo and Redo |
 | **Edits visible to GPU aggregations without re-uploading** | today: the GPU sums the base, then the CPU applies each changed row as an exact delta (`group_sum` in `frame_gpu.mojo`). omxcore can do this its own way (patch kernel, dirty columns), as long as results include edits. |
 
 ### Editing a file bigger than memory (F-147)
@@ -139,7 +140,14 @@ var m = f.formula("margin = revenue - cost")   # parses, type-checks, returns th
 f.formula_text(m); f.depends(m, c); f.dependants(c) -> List[String]
 f.get(m, row)                                  # evaluated
 f.program(m) -> Expr                           # the expression with other formulas inlined, for aggregation
+f.remove_formula(m)                            # the columns after it move up by one; refused while another formula reads it
 ```
+
+- **Undo and redo (F-179):** `formula(...)` (adding, or replacing the formula of that name) and `remove_formula(m)` are steps of the same log as cell
+  edits, so `undo()` / `redo()` interleave them with sets, appends, removes and merges in the order they were made. Undo restores the exact earlier state: the
+  formula texts, their column positions, and the scale of every formula that read a replaced one; the values that depend on them follow. `f.edits` moves on
+  each of these steps and on every undo and redo. A refused formula (cycle, bad text, a name that is a stored column) adds no step. Any new edit, formula steps
+  included, empties what `undo` took back (`redo()` is then False). Works the same over a table, an edited frame and a Parquet scan frame.
 
 - Column expressions, never cell addresses: `+ - * / // %`, `min`, `max`, unary minus, constants, parentheses.
 - **Decimal-aware:** `revenue / 2` keeps revenue's scale; `revenue * qty` rescales; division rounds the stand-in's way (pre-scaled numerator).
@@ -252,7 +260,7 @@ include it). A Frame is a table with edits, appended rows, removed rows and merg
 | What | Rule |
 |---|---|
 | **Range** | half-open, `0 <= a <= b <= len(order)` (the rows, with no order). `a == b` is an empty range: `count` 0, no sum / min / max (SQL's NULL). Errors are plain sentences: `the range 5..3 ends before it starts`, `the range 0..11 goes past the end: the order has 10 rows`, `position 2 of the order is row 12, but there are only 10 rows`, `row 4 (position 4) was removed`, `column 99 does not exist (the table has 8)`, `the buffers hold 3 cells but the block has 10 (columns x rows)` |
-| **Columns** | stored columns only; a formula column raises `column `twice` is a formula: ranges read the stored columns` (F-179 and the formula work can lift it) |
+| **Columns** | stored columns only; a formula column raises `column `twice` is a formula: ranges read the stored columns` (still: evaluating a formula per row, batched, is not done; F-179 made formulas undoable only) |
 | **Cells** | the stored values, as `Table.get` / `Frame.get` give them: edits applied, merged text codes read as the code they were merged into, appended rows included; a null is skipped by every aggregate |
 | **count** | non-null cells, every kind |
 | **sum, mean** | INT and DECIMAL: the exact int64 sum at the column's own scale (`sum` is the stored integer, a DECIMAL(2) keeps two places); only a total outside int64 raises (`the sum of column `x` passed the int64 range (about 9.2e18)`; partial sums inside the range may pass it). `mean` is a Float64, DuckDB's AVG bit for bit (the exact sum over `count * 10^scale`, `ld_div`). FLOAT: `sum_float()` and `mean` in float64, see below. DATE, BOOL and TEXT have no sum or mean (`has_sum` is False) |
