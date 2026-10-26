@@ -1730,6 +1730,11 @@ NaN / -0.0 as the engine's other aggregates. Errors are plain sentences. Rules, 
 - Built: `codec.mojo`, zstd and snappy written in Mojo (no vendored C), used by every build without C codecs (macOS, iOS; `-D MXFRAME_NO_CODECS` on Linux); Linux keeps libzstd / libsnappy. Same ratio as libzstd level 3 (4.64x), zstd save ~2x slower (0.60 s vs 0.28 s, 2M rows); checksum verified; corrupt sizes refused before allocating. Review: PASS (430k mutated inputs, no crash). Later: parallel column compression (owner decision).
 - [x] zstd (and snappy) built into the package for macOS and other no-codec targets (vendored static C sources or a Mojo port), so `.omx` files are compressed everywhere; the Mac link check stays green
 
+## F-187 Faster zstd saves with the Mojo codec: columns compressed in parallel, a faster matcher [doing] (owner said yes 2026-10-26)
+- [ ] a row group's column chunks (pages) compressed in parallel wherever the build has threads (Linux no-codec build; macOS / iOS with `-D MXFRAME_JOB_THREADS`), serial builds unchanged and byte-identical output regardless of thread count
+- [ ] single-thread zstd encoder speed-up without losing ratio (target: within 1.5x of libzstd level 3 on one thread, ratio within 1%)
+- [ ] the Mac link check stays green (no new libSystem symbol unless behind the existing threads switch)
+
 Mapped to existing tickets: #7 result cache → F-160; #12 count distinct / median on the GPU and streamed in parallel, approximate or spilling → F-167 (+ F-163 for spill); #14 sort that spills (multi-key sort exists since F-152) → F-167 / F-163; #17 window functions → F-168; #18 versions and the time machine → M9 (parked, Delta-Lake style).
 
 ## Apple GPU (owner, 2026-10-24; spec: abhisheksreesaila/omxcode `docs/plans/omxcore-apple-gpu.md`; goal `docs/goals/apple-gpu/GOAL.md`)
