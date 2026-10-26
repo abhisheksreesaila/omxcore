@@ -430,9 +430,16 @@ comptime DP_DOY = 6
 comptime DP_QUARTER = 7
 comptime DP_EPOCH = 8        # seconds since 1970-01-01
 comptime DP_DECADE = 9
-comptime DP_WEEK = 10        # trunc / diff only: weeks start on Monday
+comptime DP_WEEK = 10        # trunc / diff: weeks start on Monday; date_part: the ISO week number
 comptime DP_CENTURY = 11
 comptime DP_MILLENNIUM = 12
+comptime DP_ISOYEAR = 13     # ISO 8601 week-numbering year (F-177); `DP_WEEK` in `date_part` is the ISO week number 1 .. 53 (as a trunc / diff part it is the Monday)
+
+
+def iso_thursday(days: Int) -> Int:
+    """The Thursday of the ISO week the day number falls in (weeks run Monday to Sunday): the ISO year and week number are the year of that day and its
+    day of year counted in sevens."""
+    return days - (days + 3) % 7 + 3
 
 
 def date_part(days: Int, part: Int) -> Int:
@@ -451,6 +458,10 @@ def date_part(days: Int, part: Int) -> Int:
         return days - days_from_civil(c[0], 1, 1) + 1
     if part == DP_QUARTER:
         return (c[1] - 1) // 3 + 1
+    if part == DP_ISOYEAR or part == DP_WEEK:
+        var th = iso_thursday(days)
+        var y = civil_from_days(th)[0]
+        return y if part == DP_ISOYEAR else (th - days_from_civil(y, 1, 1)) // 7 + 1
     if part == DP_EPOCH:
         return days * 86400
     if part == DP_DECADE:
@@ -524,8 +535,10 @@ def part_code(name: String) -> Int:
         return DP_EPOCH
     if name == "decade":
         return DP_DECADE
-    if name == "week" or name == "weeks":
+    if name == "week" or name == "weeks" or name == "weekofyear":
         return DP_WEEK
+    if name == "isoyear":
+        return DP_ISOYEAR
     if name == "century":
         return DP_CENTURY
     if name == "millennium":

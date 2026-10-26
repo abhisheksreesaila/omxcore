@@ -1904,9 +1904,9 @@ struct _Binder(Movable):
         if name == "EXTRACT" or name == "DATE_PART" or name == "DATEPART":
             if n != 2:
                 raise self.err(ast, name.lower() + "() takes a part and a date, found " + String(n) + " argument" + ("" if n == 1 else "s"))
-            var part = self.part_arg(x.items[0], name.lower(), "year month day dow dayofweek isodow doy dayofyear quarter epoch decade century millennium")
+            var part = self.part_arg(x.items[0], name.lower(), "year month day dow dayofweek isodow doy dayofyear quarter epoch decade century millennium week weekofyear isoyear")
             return self.date_part_expr(ast, part, x.items[1], name.lower())
-        if name == "YEAR" or name == "MONTH" or name == "DAY" or name == "QUARTER" or name == "DAYOFWEEK" or name == "ISODOW" or name == "DAYOFYEAR" or name == "DECADE":
+        if name == "YEAR" or name == "MONTH" or name == "DAY" or name == "QUARTER" or name == "DAYOFWEEK" or name == "ISODOW" or name == "DAYOFYEAR" or name == "DECADE" or name == "WEEK" or name == "WEEKOFYEAR" or name == "ISOYEAR":
             if n != 1:
                 raise self.err(ast, name.lower() + "() takes one date, found " + String(n) + " arguments")
             return self.date_part_expr(ast, part_code(name.lower()), x.items[0], name.lower())
@@ -2254,7 +2254,7 @@ def _aggregate_names() -> List[String]:
 def _scalar_names() -> List[String]:
     return ["coalesce", "ifnull", "nvl", "nullif", "lower", "upper", "trim", "ltrim", "rtrim", "substr", "substring", "length", "starts_with", "ends_with", "contains",
             "strpos", "instr", "left", "right", "reverse", "replace", "concat", "extract", "date_part", "year", "month", "day", "quarter", "dayofweek", "isodow",
-            "dayofyear", "date_trunc", "datediff", "date_diff"]
+            "dayofyear", "date_trunc", "datediff", "date_diff", "week", "weekofyear", "isoyear"]
 
 
 def _is_scalar_name(up: String) -> Bool:

@@ -18,7 +18,7 @@ from .plan import LogicalPlan, P_SORT, P_LIMIT
 from .bind import (BoundQuery, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, B_LIT, B_NULL, B_ADD, B_SUB, B_MUL, B_IDIV, B_IMOD,
                    B_NEG, B_RESCALE, B_CASE, B_COALESCE, B_DISTINCT, B_BOOLIS, B_CAST, B_TFN, B_CONCAT, B_STR,
                    B_DATEPART, B_DATETRUNC, B_ADDMONTHS, B_DATEDIFF)
-from .sqlfn import date_part, date_trunc_days, add_months, DP_YEAR, DP_MONTH, DP_DAY, DP_DOW, DP_ISODOW, DP_DOY, DP_QUARTER, DP_DECADE, DP_CENTURY, DP_MILLENNIUM
+from .sqlfn import date_part, date_trunc_days, add_months, DP_YEAR, DP_MONTH, DP_DAY, DP_DOW, DP_ISODOW, DP_DOY, DP_QUARTER, DP_WEEK, DP_ISOYEAR, DP_DECADE, DP_CENTURY, DP_MILLENNIUM
 
 comptime BUILD_AUTO = 0
 comptime BUILD_LEFT = 1
@@ -256,7 +256,9 @@ def interval(q: BoundQuery, e: Int, st: Stats) -> Interval:
                 return Interval(True, 1, 4)
             if part == DP_DOY:
                 return Interval(True, 1, 366)
-            if part == DP_YEAR or part == DP_DECADE or part == DP_CENTURY or part == DP_MILLENNIUM:
+            if part == DP_WEEK:
+                return Interval(True, 1, 53)
+            if part == DP_YEAR or part == DP_ISOYEAR or part == DP_DECADE or part == DP_CENTURY or part == DP_MILLENNIUM:
                 return Interval(True, Int64(date_part(Int(da.lo), part)), Int64(date_part(Int(da.hi), part)))
             return Interval(False)
         if x.op == B_DATETRUNC:
