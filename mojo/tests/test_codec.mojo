@@ -5,7 +5,8 @@
 # to prove that the block types and table modes the compression ratio depends on were really used. Corrupt input must raise or
 # decode, never crash.
 from std.ffi import external_call
-from omxcore.codec import zstd_compress, zstd_decompress, snappy_compress, snappy_decompress
+from omxcore.codec import (zstd_compress, zstd_decompress, snappy_compress, snappy_decompress, _literals_section, _sequences_section, _ZEnc,
+                           _Seqs, _ptr)
 
 
 def expect(cond: Bool, what: String) raises:
@@ -197,21 +198,51 @@ def main() raises:
             var what = "kind " + String(kind) + ", " + String(n) + " bytes"
             check_zstd(src, what, seen)
             check_snappy(src, what)
-    # a second block that is all copies of the first but for "zzz" between them: its literals are one byte repeated
-    var first = make(WORDS, 131072)
-    var wedged = first.copy()
-    for j in range(100):
-        wedged.extend(List[UInt8](first[j * 1000:(j + 1) * 1000]))
-        wedged.append(122)
-        wedged.append(122)
-        wedged.append(122)
-    check_zstd(wedged, "copies wedged apart by zzz", seen)
-    check_snappy(wedged, "copies wedged apart by zzz")
+    # a block whose literals are one byte repeated, then copied: built by hand (a matcher that finds the copies leaves no such block
+    # in ordinary data), so the run-literals path of both coders is tested
+    var xs = List[UInt8](length=4, fill=120)
+    var body = _literals_section(_ptr(Int(xs.unsafe_ptr())), 4)
+    var one = _Seqs(List[Int](), List[Int](), List[Int](), List[UInt8]())
+    one.ll.append(4)
+    one.ml.append(4)
+    one.ov.append(4 + 3)                                  # offset 4
+    body.extend(_sequences_section(_ZEnc(), one))
+    var frame_xs: List[UInt8] = [0x28, 0xB5, 0x2F, 0xFD, 0x80, 0x50, 8, 0, 0, 0]
+    var bh = 1 | (2 << 1) | (len(body) << 3)
+    frame_xs.append(UInt8(bh & 255))
+    frame_xs.append(UInt8((bh >> 8) & 255))
+    frame_xs.append(UInt8((bh >> 16) & 255))
+    frame_xs.extend(body^)
+    var eight = List[UInt8](length=8, fill=120)
+    same(zstd_decompress(frame_xs, 8), eight, 8, "a run-literals block, Mojo decode")
+    same(c_unzstd(frame_xs, 8), eight, 8, "a run-literals block, libzstd decode")
+    inspect(frame_xs, seen)
     # the encoder really used what the ratio depends on
     expect(seen.c[0] > 0 and seen.c[1] > 0 and seen.c[2] > 0, "stored, run and compressed blocks all occur")
     expect(seen.c[3] > 0 and seen.c[4] > 0 and seen.c[5] > 0 and seen.c[6] > 0, "one- and four-stream Huffman literals, raw and run literals occur: " + String(seen.c[3]) + " " + String(seen.c[4]) + " " + String(seen.c[5]) + " " + String(seen.c[6]))
     expect(seen.c[7] > 0 and seen.c[8] > 0 and seen.c[9] > 0, "predefined, repeated-symbol and built sequence tables all occur")
 
+    # 300 inputs made of pieces of every kind, repeated and damaged copies of their own earlier bytes, in all sizes
+    var rs = UInt64(2463534242)
+    for trial in range(300):
+        var src = List[UInt8]()
+        var pieces = 1 + Int(rs % 6)
+        for _ in range(pieces):
+            rs ^= rs << 13
+            rs ^= rs >> 7
+            rs ^= rs << 17
+            var kind = Int(rs % UInt64(KINDS))
+            var plen = Int((rs >> 8) % UInt64(1 << (4 + Int((rs >> 40) % 14))))
+            if (rs >> 50) % 3 == 0 and len(src) > 0:                       # a damaged copy of earlier bytes
+                var from_ = Int((rs >> 12) % UInt64(len(src)))
+                for k in range(min(plen, len(src) - from_)):
+                    var b = src[from_ + k]
+                    src.append(b ^ UInt8(1 if (rs >> UInt64(k % 40)) % 29 == 0 else 0))
+            else:
+                src.extend(make(kind, plen))
+        var what = "fuzz " + String(trial) + " (" + String(len(src)) + " bytes)"
+        check_zstd(src, what, seen)
+        check_snappy(src, what)
     # matches that reach back across 128 KB blocks, and past the 1 MB window
     for gap in [1000, 200000, 700000, 1048576, 1500000]:
         var half = make(RANDOM, gap)
@@ -240,13 +271,15 @@ def main() raises:
     # a page of the wrong stated size, truncated or damaged input: an error or some bytes, never a crash
     var frame = zstd_compress(make(WORDS, 50000))
     var sn = snappy_compress(make(WORDS, 50000))
+    var skew = c_zstd(make(SKEWED_255, 50000), 19)             # Huffman literals with FSE-coded weights, from libzstd
+    var counting = c_zstd(make(INT64S, 50000), 1)
     var refused = 0
     var s = UInt64(12345)
-    for trial in range(4000):
+    for trial in range(8000):
         s ^= s << 13
         s ^= s >> 7
         s ^= s << 17
-        var f = frame.copy()
+        var f = frame.copy() if trial % 3 == 0 else (skew.copy() if trial % 3 == 1 else counting.copy())
         var g = sn.copy()
         var at = Int(s % UInt64(len(f)))
         var at2 = Int((s >> 20) % UInt64(len(g)))
@@ -263,7 +296,7 @@ def main() raises:
             _ = snappy_decompress(g, 50000)
         except:
             refused += 1
-    expect(refused > 1000, "damaged input is mostly refused: " + String(refused) + " of 8000")
+    expect(refused > 2000, "damaged input is mostly refused: " + String(refused) + " of 16000")
     var wrong = False
     try:
         _ = zstd_decompress(frame, 49999)

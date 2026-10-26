@@ -11,10 +11,12 @@ zstd, reading: the whole format but dictionaries (all block and literal types, H
 weights, the three FSE modes and repeat tables, repeat offsets, skippable and concatenated frames). The content
 checksum, when a frame has one, is skipped, not verified. The input is untrusted: every length is checked against
 the input and the stated output size before anything is written.
-zstd, writing: one frame, 128 KB blocks, a 1 MB window. A hash-chain matcher with a one-step lazy choice; literals
-Huffman coded (1 or 4 streams, weights direct or FSE coded) when that is smaller; sequences coded with the
-predefined, a repeated-symbol or a purpose-built FSE table, whichever costs fewer bits; repeat offsets; a block that
-does not shrink is stored, a block of one byte repeated is a run. It does not reuse tables between blocks.
+zstd, writing: one frame, 128 KB blocks, a 1 MB window. The matcher tries the last offset one byte on first, then a
+hash chain of four-byte keys (3 candidates), with a one-step lazy choice priced in bits; literals are Huffman coded (1
+or 4 streams, weights direct or FSE coded) when that is smaller; sequences are coded with the predefined, a
+repeated-symbol or a purpose-built FSE table, whichever costs fewer bits, and with repeat offsets; a block that does
+not shrink is stored, a block of one byte repeated is a run. It does not reuse tables between blocks. On the tables
+omxcore saves, files come out the size of libzstd level 3's or smaller, at about a quarter of its speed.
 """
 from std.bit import count_trailing_zeros
 
@@ -1140,6 +1142,9 @@ def _fse_normalize(counts: List[Int], total: Int, log: Int) -> List[Int]:
             if k < 0:
                 k = len(order) - 1
     while diff < 0:                                  # rounding up the rare ones overshot: take from the biggest
+        for s in range(len(norm)):
+            if norm[s] > norm[biggest]:
+                biggest = s
         norm[biggest] -= 1
         diff += 1
     return norm^
@@ -1397,13 +1402,10 @@ def _huf_compress(p: Ptr, n: Int, mut tree_and_streams: List[UInt8]) raises -> B
 
 comptime ZSTD_WINDOW_LOG = 20
 comptime ZSTD_WINDOW = 1 << ZSTD_WINDOW_LOG
-comptime CHAIN_DEPTH = 12
-comptime GOOD_ENOUGH = 1 << 20          # stop looking once a match is this long
-comptime LAZY_MAX = 1 << 20             # look for a better match one byte on only below this length
-comptime CHAIN_MAX = 1 << 20            # entries of the chain table
-comptime REP_ACCEPT = 1 << 20           # a match at the last offset this long is taken without looking further
-comptime INSERT_MAX = 1 << 20           # positions of a match indexed from its start (and the last two)
+comptime CHAIN_DEPTH = 3                # candidates looked at per position
+comptime LAZY_MAX = 16                  # a match this long is taken at once; a shorter one gives way to a better one a byte on
 comptime MIN_MATCH = 4
+comptime FAR_SHORT = 1 << 12           # a match of MIN_MATCH bytes this far back is not worth its offset
 
 
 @always_inline
@@ -1435,7 +1437,7 @@ struct _Matcher:
         self.hshift = 32 - hbits
         self.head = List[Int32](length=1 << hbits, fill=0)
         var csize = 1 << 12
-        while csize < n and csize < CHAIN_MAX:
+        while csize < n and csize < ZSTD_WINDOW:
             csize <<= 1
         self.chain = List[Int32](length=csize, fill=0)
         self.cmask = csize - 1
@@ -1461,13 +1463,9 @@ struct _Matcher:
         if rep1 <= i and _load32(p, i - rep1) == cur:
             best_len = _match_len(p, i - rep1, i, limit)
             best_off = rep1
-            if best_len >= REP_ACCEPT:
-                self.chain[i & self.cmask] = self.head[h]
-                self.head[h] = Int32(i + 1)
-                return (best_len << 21) | best_off
         var cand = Int(self.head[h]) - 1
         var depth = 0
-        while cand >= 0 and depth < CHAIN_DEPTH and best_len < GOOD_ENOUGH and best_len < limit - i:
+        while cand >= 0 and depth < CHAIN_DEPTH and best_len < limit - i:
             var d = i - cand
             if d > ZSTD_WINDOW:
                 break
@@ -1483,7 +1481,7 @@ struct _Matcher:
             depth += 1
         self.chain[i & self.cmask] = self.head[h]
         self.head[h] = Int32(i + 1)
-        if best_len < MIN_MATCH:
+        if best_len < MIN_MATCH or (best_len == MIN_MATCH and best_off >= FAR_SHORT):
             return 0
         return (best_len << 21) | best_off
 
@@ -1573,29 +1571,48 @@ struct _ZEnc:
         return off + 3
 
 
+@always_inline
+def _gain(len: Int, off: Int, rep1: Int) -> Int:
+    """What a match is worth in bits: eight per byte it covers, less what its offset and the sequence around it cost (a
+    few bits for the offset used last, which a sequence can repeat)."""
+    return len * 8 - (0 if off == rep1 else _highbit(off + 1) + 8)
+
+
 def _find_sequences(mut z: _ZEnc, mut m: _Matcher, p: Ptr, start: Int, end: Int, mut sq: _Seqs):
     var i = start
     var anchor = start
     var skip_step = 0
     while i + MIN_MATCH <= end:
-        var found = m.find(i, end, z.rep1)
-        if found == 0:
-            skip_step = min((i - anchor) >> 8, 3)           # nothing found for a long while: look at fewer positions (but still
-                                                            # index enough of them for a later copy of this data to be found)
-            i += 1 + skip_step
-            continue
-        var len = found >> 21
-        var off = found & ((1 << 21) - 1)
+        var len = 0
+        var off = 0
         var q = i + 1
-        if len < LAZY_MAX and not (off == z.rep1 and len >= REP_ACCEPT) and i + 1 + MIN_MATCH <= end:     # lazy: is the next position clearly better?
-            var next = m.find(i + 1, end, z.rep1)
-            if next != 0 and (next >> 21) > len + 1:
-                i += 1
-                len = next >> 21
-                off = next & ((1 << 21) - 1)
-                q = i + 1
-            else:
-                q = i + 2                                   # i + 1 is indexed already
+        # a match at the offset used last, one byte on, is the cheapest to code: take it before looking further
+        if z.rep1 <= i and i + 1 + MIN_MATCH <= end and _load32(p, i + 1 - z.rep1) == _load32(p, i + 1):
+            m.insert(i)
+            len = _match_len(p, i + 1 - z.rep1, i + 1, end)
+            off = z.rep1
+            i += 1
+            q = i
+        else:
+            var found = m.find(i, end, z.rep1)
+            if found == 0:
+                skip_step = min((i - anchor) >> 8, 3)       # nothing found for a long while: look at fewer positions (but still
+                                                            # index enough of them for a later copy of this data to be found)
+                i += 1 + skip_step
+                continue
+            len = found >> 21
+            off = found & ((1 << 21) - 1)
+            if len < LAZY_MAX and i + 1 + MIN_MATCH <= end:     # lazy: is the next position clearly better?
+                var next = m.find(i + 1, end, z.rep1)
+                var nlen = next >> 21
+                var noff = next & ((1 << 21) - 1)
+                if next != 0 and _gain(nlen, noff, z.rep1) > _gain(len, off, z.rep1) + 8:      # one more literal is 8 bits
+                    i += 1
+                    len = nlen
+                    off = noff
+                    q = i + 1
+                else:
+                    q = i + 2                               # i + 1 is indexed already
         var ll = i - anchor
         for k in range(anchor, i):
             sq.lits.append(p[k])
@@ -1603,15 +1620,9 @@ def _find_sequences(mut z: _ZEnc, mut m: _Matcher, p: Ptr, start: Int, end: Int,
         sq.ml.append(len)
         sq.ov.append(z.offset_value(off, ll))
         var stop = i + len
-        var upto = min(stop, q + INSERT_MAX)
-        while q < upto and q + MIN_MATCH <= end:
+        while q < stop and q + MIN_MATCH <= end:
             m.insert(q)
             q += 1
-        if upto < stop:
-            q = max(stop - 2, upto)
-            while q < stop and q + MIN_MATCH <= end:
-                m.insert(q)
-                q += 1
         i = stop
         anchor = i
     for k in range(anchor, end):

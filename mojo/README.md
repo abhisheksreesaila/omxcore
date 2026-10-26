@@ -6,8 +6,9 @@ omxcore's Python-free API (`docs/omxcore-mojo-api.md`, brief `docs/briefs/mojo-a
   `.so` files from them); `scripts/build_mojo_pkg.sh` copies them into the package as `omxcore/kernels/` with their
   imports made package-relative. Edit kernels in `kernels_aot/`, never in `build/`.
 - **Build:** `pixi run bash scripts/build_mojo_pkg.sh` -> `build/omxcore.mojoc`. A program uses it with
-  `mojo build app.mojo -I build`, plus `-Xlinker -lzstd -Xlinker -lsnappy` (Parquet codecs, C libraries) and their
-  `-L` / `-rpath` (the pixi env's `lib/` here).
+  `mojo build app.mojo -I build`; on Linux also `-Xlinker -lzstd -Xlinker -lsnappy` (the Parquet codecs, C libraries) and
+  their `-L` / `-rpath` (the pixi env's `lib/` here). Every other target, and Linux with `-D MXFRAME_NO_CODECS`, needs
+  no library: it uses the Mojo codecs in `mojo/omxcore/codec.mojo` (below).
 - **Tests:** `pixi run mojo-test` builds the package, then builds and runs each `mojo/tests/test_*.mojo` (a `main()`
   that raises on failure). A test binary that links libpython fails.
 - **Lifetimes:** Mojo frees a value at its last use. A raw address taken from a `List` is dangling once the list
@@ -81,7 +82,7 @@ runs a SQL string through `build/mx` and DuckDB and compares typed values; tests
 save keeps the old file; dropping a handle cancels and frees. Engine functions take `job: JobCtl = JobCtl()` (a plain call passes none; SQL carries it in `PlannerOptions.job`). The serial build runs a job inside its start call.
 Rules, what is checked where, and the tests: `docs/omxcore-mojo-api.md` section 8c; `mojo/tests/test_job.mojo`, `test_jobs.mojo`.
 
-## Build switches (F-138b): the package on an app with no GPU, thread pool or codecs
+## Build switches (F-138b): the package on an app with no GPU, thread pool or C codecs
 
 Three compile-time switches, read when the app builds (`mojo build ... -D NAME`), not when the package is built. Each
 is **on for every target but Linux** (an Apple object needs no flags) and `-D` turns it on for Linux too, which is how
@@ -95,7 +96,18 @@ toolchain at build time. A Linux cross-build for macOS that names only the tripl
 |---|---|---|
 | `MXFRAME_NO_GPU` (`HAS_GPU` in `gpu.mojo`) | `DeviceTable`, `compute(GPU)`, the GPU kernel (Linux, and macOS with an Apple GPU) | `gpu_available()` is False; `DeviceTable(...)` and `compute(GPU)` raise "no GPU on this build"; AUTO is the CPU. No `AsyncRT_Device*` symbol. |
 | `MXFRAME_SERIAL` (`kernels/_fpenv.mojo`) | the thread pool (`par`, `par_n`) | tasks run in a loop on the calling thread, `core_count()` is 1, no `AsyncRT_*` symbol |
-| `MXFRAME_NO_CODECS` (`parquet.mojo`) | zstd and snappy (C libraries) | `write_parquet` saves UNCOMPRESSED whatever `compression` says; `read_parquet` refuses a zstd / snappy column with an error naming it. No `ZSTD_*` / `snappy_*` symbol |
+| `MXFRAME_NO_CODECS` (`parquet.mojo`) | zstd and snappy from the C libraries (libzstd, libsnappy) | zstd and snappy from `codec.mojo` (F-180): `write_parquet` compresses as asked and `read_parquet` reads what any writer made. No `ZSTD_*` / `snappy_*` symbol, nothing to link or ship |
+
+**The Mojo codecs** (F-180, `mojo/omxcore/codec.mojo`). Parquet pages are compressed the same on every target: on Linux
+by libzstd / libsnappy, everywhere else by zstd and snappy written in Mojo, so an `.omx` saved on a Mac is zstd-compressed
+like one saved on Linux and each build opens the other's files. No source is vendored, so there is no licence to carry:
+the code is written from RFC 8878 (zstd) and snappy's `format_description.txt`, and tested against the C libraries
+(`mojo/tests/test_codec.mojo`: both directions, zstd levels 1 / 3 / 9 / 19, damaged input) and against pyarrow and DuckDB
+(`tests/test_codec_mojo.py`, through `mojo/tools/pq_recode.mojo` built with `-D MXFRAME_NO_CODECS`). The decoder reads
+all of zstd but dictionaries (an untrusted file is checked at every length); the encoder writes one frame with a 1 MB
+window. Against libzstd level 3 on a realistic table (`mojo/tools/bench_codec_write.mojo`): files the same size or
+smaller; writing 3 to 5 times slower (about 60 MB/s), reading about as fast. Writing is the slow side: the matcher is
+plain and single-threaded; a Mac build with a thread pool could compress the columns of a row group in parallel.
 
 AUTO and the GPU: `compute(AUTO)` goes to the CPU when the GPU path fails for one of two reasons only, an allocation
 failure for the query's buffers or a program the kernel declines (-5 shared memory, -6 group table; on an Apple GPU
@@ -105,5 +117,5 @@ also a float program), and says which in
 **Link check:** `pixi run bash scripts/check_mac_link.sh` compiles `mojo/tools/mac_link_probe.mojo` over the package
 for `arm64-apple-macosx14.0`, links it with `ld64.lld` against the app's `apple/sdk/macos/*.tbd` and its
 `mojoui/hosts/mojo_rt.mojo` stand-ins, and fails on any AsyncRT, Tracy, KGEN (beyond the stand-ins), zstd, snappy,
-Python or CUDA symbol. It prints the libSystem calls the package adds to the app's list (file I/O: `open`, `read`,
+Python or CUDA symbol (the probe saves and reads both codecs, so the Mojo ones are linked in). It prints the libSystem calls the package adds to the app's list (file I/O: `open`, `read`,
 `mmap`, `rename`, ...): the app's stub and its `ALLOWED` set need them (F-138c).
