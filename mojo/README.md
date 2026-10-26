@@ -105,9 +105,21 @@ the code is written from RFC 8878 (zstd) and snappy's `format_description.txt`, 
 (`mojo/tests/test_codec.mojo`: both directions, zstd levels 1 / 3 / 9 / 19, damaged input) and against pyarrow and DuckDB
 (`tests/test_codec_mojo.py`, through `mojo/tools/pq_recode.mojo` built with `-D MXFRAME_NO_CODECS`). The decoder reads
 all of zstd but dictionaries (an untrusted file is checked at every length); the encoder writes one frame with a 1 MB
-window. Against libzstd level 3 on a realistic table (`mojo/tools/bench_codec_write.mojo`): files the same size or
-smaller; writing 3 to 5 times slower (about 60 MB/s), reading about as fast. Writing is the slow side: the matcher is
-plain and single-threaded; a Mac build with a thread pool could compress the columns of a row group in parallel.
+window. Against libzstd level 3 / libsnappy on a realistic table (`mojo/tools/bench_codec_write.mojo`: 2 million
+orders, 8 columns with nulls, text and dates, 74.6 MB plain; Linux, best of three, a lightly loaded machine):
+
+| | file | save (all of `write_parquet`) | open (`read_parquet`) |
+|---|---|---|---|
+| zstd, libzstd level 3 | 16,058,417 bytes (4.64x) | 0.28 s | 0.031 s |
+| zstd, Mojo | 16,067,618 bytes (4.64x) | 0.60 s | 0.040 s |
+| snappy, libsnappy | 31,411,775 bytes (2.37x) | 0.15 s | 0.034 s |
+| snappy, Mojo | 31,189,911 bytes (2.39x) | 0.18 s | 0.027 s |
+| no codec | 74,587,922 bytes | 0.14 s | 0.014 s |
+
+The same size to a few hundredths of a percent; reading about as fast; snappy as fast; zstd writing about twice the
+time of a whole save (the compression itself roughly three times libzstd's: ~160 MB/s of page bytes against ~500).
+Writing is the slow side: the matcher is plain and single-threaded (a Mac build with a thread pool could compress the
+columns of a row group in parallel).
 
 AUTO and the GPU: `compute(AUTO)` goes to the CPU when the GPU path fails for one of two reasons only, an allocation
 failure for the query's buffers or a program the kernel declines (-5 shared memory, -6 group table; on an Apple GPU

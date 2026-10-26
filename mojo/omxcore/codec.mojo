@@ -12,13 +12,14 @@ weights, the three FSE modes and repeat tables, repeat offsets, skippable and co
 checksum, when a frame has one, is skipped, not verified. The input is untrusted: every length is checked against
 the input and the stated output size before anything is written.
 zstd, writing: one frame, 128 KB blocks, a 1 MB window. The matcher tries the last offset one byte on first, then a
-hash chain of four-byte keys (3 candidates), with a one-step lazy choice priced in bits; literals are Huffman coded (1
-or 4 streams, weights direct or FSE coded) when that is smaller; sequences are coded with the predefined, a
-repeated-symbol or a purpose-built FSE table, whichever costs fewer bits, and with repeat offsets; a block that does
-not shrink is stored, a block of one byte repeated is a run. It does not reuse tables between blocks. On the tables
-omxcore saves, files come out the size of libzstd level 3's or smaller, at about a quarter of its speed.
+table of four-byte keys (4 candidates per bucket, the key stored beside the position), with a one-step lazy choice
+priced in bits; literals are Huffman coded (1 or 4 streams, weights direct or FSE coded) when that is smaller;
+sequences are coded with the predefined, a repeated-symbol or a purpose-built FSE table, whichever costs fewer bits,
+and with repeat offsets; a block that does not shrink is stored, a block of one byte repeated is a run. It does not
+reuse tables between blocks. On the tables omxcore saves, files come out the size of libzstd level 3's or smaller,
+at about a third of its speed (mojo/README.md: Build switches).
 """
-from std.bit import count_trailing_zeros
+from std.bit import count_trailing_zeros, count_leading_zeros
 
 comptime Ptr = UnsafePointer[UInt8, MutAnyOrigin]
 
@@ -111,7 +112,7 @@ def snappy_compress(src: List[UInt8]) raises -> List[UInt8]:
     op[o] = UInt8(v)
     o += 1
     var sp = _ptr(Int(src.unsafe_ptr()))
-    var table = List[Int32](length=1 << SNAPPY_HASH_BITS, fill=-1)
+    var table = List[Int32](length=1 << SNAPPY_HASH_BITS, fill=0)      # position + 1, 0 for none (a zero fill is a plain memset)
     var tp = table.unsafe_ptr()
     var i = 0
     var lit = 0                                  # start of the pending literal
@@ -120,21 +121,19 @@ def snappy_compress(src: List[UInt8]) raises -> List[UInt8]:
     while i <= limit:
         var cur = _load32(sp, i)
         var h = Int((cur * UInt32(0x1E35A7BD)) >> UInt32(32 - SNAPPY_HASH_BITS))
-        var cand = Int(tp[h])
-        tp[h] = Int32(i)
+        var cand = Int(tp[h]) - 1
+        tp[h] = Int32(i + 1)
         if cand >= 0 and i - cand <= SNAPPY_WINDOW and _load32(sp, cand) == cur:
             if i > lit:
                 o = _snappy_literal(op, o, sp, lit, i - lit)
-            var len = 4
-            while i + len < n and sp[cand + len] == sp[i + len]:
-                len += 1
+            var len = _match_len(sp, cand, i, n)
             o = _snappy_copy(op, o, i - cand, len)
             i += len
             lit = i
             skip = 32
             if i >= 1 and i - 1 <= limit:        # index the byte before the next position, as snappy does
                 var c2 = _load32(sp, i - 1)
-                tp[Int((c2 * UInt32(0x1E35A7BD)) >> UInt32(32 - SNAPPY_HASH_BITS))] = Int32(i - 1)
+                tp[Int((c2 * UInt32(0x1E35A7BD)) >> UInt32(32 - SNAPPY_HASH_BITS))] = Int32(i)
         else:
             i += skip >> 5
             skip += 1
@@ -264,14 +263,10 @@ comptime ZSTD_BLOCK_MAX = 1 << 17
 comptime HUF_MAX_BITS = 11
 
 
+@always_inline
 def _highbit(v: Int) -> Int:
     """Index of the highest set bit (v > 0)."""
-    var r = 0
-    var x = v
-    while x > 1:
-        x >>= 1
-        r += 1
-    return r
+    return 63 - Int(count_leading_zeros(UInt64(v)))
 
 
 @fieldwise_init
@@ -994,49 +989,47 @@ def zstd_decompress(src: List[UInt8], size: Int) raises -> List[UInt8]:
 
 
 # ── zstd compression ──────────────────────────────────────────────────────────────────────────────────
-# A greedy-plus-one-step-lazy matcher over a hash chain, literals Huffman coded, sequences coded with FSE tables
+# A greedy-plus-one-step-lazy matcher over a hash table of four-byte keys, literals Huffman coded, sequences coded with FSE tables
 # (predefined, one repeated symbol, or built for the block, whichever costs fewer bits).
 
 struct _BitOut:
-    """Bits written from the low end of each byte upward."""
-    var bytes: List[UInt8]
+    """Bits written from the low end of each byte upward, collected a 32-bit word at a time."""
+    var words: List[UInt32]
     var acc: UInt64
-    var n: Int
+    var n: Int                      # bits in `acc` (< 32 between calls)
 
     def __init__(out self):
-        self.bytes = List[UInt8]()
+        self.words = List[UInt32]()
         self.acc = 0
         self.n = 0
 
     @always_inline
     def add(mut self, v: Int, k: Int):
-        if k == 0:
-            return
         self.acc |= (UInt64(v) & ((UInt64(1) << UInt64(k)) - 1)) << UInt64(self.n)
         self.n += k
-        while self.n >= 8:
-            self.bytes.append(UInt8(self.acc & 0xFF))
-            self.acc >>= 8
-            self.n -= 8
+        if self.n >= 32:
+            self.words.append(UInt32(self.acc & 0xFFFFFFFF))
+            self.acc >>= 32
+            self.n -= 32
 
     def close_stream(mut self):
-        """Ends a backwards-read stream: a 1 bit, then zeros to a whole byte."""
+        """Ends a backwards-read stream: a 1 bit (the decoder finds where the data ends by it), zeros to a whole byte."""
         self.add(1, 1)
-        if self.n > 0:
-            self.bytes.append(UInt8(self.acc & 0xFF))
-            self.acc = 0
-            self.n = 0
 
     def take(mut self) -> List[UInt8]:
-        var r = List[UInt8]()
-        swap(r, self.bytes)
-        return r^
-
-    def close_plain(mut self):
-        if self.n > 0:
-            self.bytes.append(UInt8(self.acc & 0xFF))
-            self.acc = 0
-            self.n = 0
+        """The bytes written, the last one padded with zero bits."""
+        var rest = (self.n + 7) // 8
+        var out = List[UInt8](unsafe_uninit_length=4 * len(self.words) + rest)
+        for w in range(len(self.words)):
+            var x = self.words[w]
+            for k in range(4):
+                out[4 * w + k] = UInt8((x >> UInt32(8 * k)) & 0xFF)
+        for k in range(rest):
+            out[4 * len(self.words) + k] = UInt8((self.acc >> UInt64(8 * k)) & 0xFF)
+        self.words.clear()
+        self.acc = 0
+        self.n = 0
+        return out^
 
 
 struct _FseEnc(Copyable, Movable):
@@ -1187,7 +1180,6 @@ def _write_ncount(norm: List[Int], log: Int) -> List[UInt8]:
         while remaining < threshold:
             nbits -= 1
             threshold >>= 1
-    w.close_plain()
     return w.take()
 
 
@@ -1402,7 +1394,8 @@ def _huf_compress(p: Ptr, n: Int, mut tree_and_streams: List[UInt8]) raises -> B
 
 comptime ZSTD_WINDOW_LOG = 20
 comptime ZSTD_WINDOW = 1 << ZSTD_WINDOW_LOG
-comptime CHAIN_DEPTH = 3                # candidates looked at per position
+comptime WAYS = 4                       # candidates looked at per position
+comptime HASH_BITS_MAX = 16             # buckets: 64 K, 2 MB
 comptime LAZY_MAX = 16                  # a match this long is taken at once; a shorter one gives way to a better one a byte on
 comptime MIN_MATCH = 4
 comptime FAR_SHORT = 1 << 12           # a match of MIN_MATCH bytes this far back is not worth its offset
@@ -1423,64 +1416,63 @@ def _match_len(p: Ptr, a: Int, b: Int, limit: Int) -> Int:
 
 
 struct _Matcher:
+    """Where each four-byte key was last seen: a hash of the key picks a bucket of WAYS entries, newest first, each
+    holding the position and the key itself, so a candidate that cannot match is turned down without reading the input
+    at its position (a read the cache rarely has)."""
     var a: Int                      # address of the input
-    var head: List[Int32]           # hash of 4 bytes -> the latest position + 1 (0: none)
-    var chain: List[Int32]          # position & cmask -> the position + 1 before it with the same hash
+    var table: List[UInt64]         # per bucket WAYS entries: (position + 1) | key << 32, 0 for none
     var hshift: Int
-    var cmask: Int
 
     def __init__(out self, a: Int, n: Int):
         self.a = a
         var hbits = 8
-        while hbits < 17 and (1 << hbits) < n:
+        while hbits < HASH_BITS_MAX and (1 << hbits) < n:
             hbits += 1
         self.hshift = 32 - hbits
-        self.head = List[Int32](length=1 << hbits, fill=0)
-        var csize = 1 << 12
-        while csize < n and csize < ZSTD_WINDOW:
-            csize <<= 1
-        self.chain = List[Int32](length=csize, fill=0)
-        self.cmask = csize - 1
+        self.table = List[UInt64](length=WAYS << hbits, fill=0)
 
     @always_inline
-    def _hash(self, cur: UInt32) -> Int:
-        return Int((cur * UInt32(2654435761)) >> UInt32(self.hshift))
+    def _bucket(self, cur: UInt32) -> Int:
+        return Int((cur * UInt32(2654435761)) >> UInt32(self.hshift)) * WAYS
+
+    @always_inline
+    def _push(mut self, b: Int, i: Int, cur: UInt32):
+        var t = self.table.unsafe_ptr()
+        comptime for w in range(WAYS - 1, 0, -1):
+            t[b + w] = t[b + w - 1]
+        t[b] = UInt64(i + 1) | (UInt64(cur) << 32)
 
     @always_inline
     def insert(mut self, i: Int):
-        var h = self._hash(_load32(_ptr(self.a), i))
-        self.chain[i & self.cmask] = self.head[h]
-        self.head[h] = Int32(i + 1)
+        var cur = _load32(_ptr(self.a), i)
+        self._push(self._bucket(cur), i, cur)
 
     def find(mut self, i: Int, limit: Int, rep1: Int) -> Int:
         """The best match for position i (its bytes up to `limit`), packed as length << 21 | offset; 0 for none. Also
         indexes i."""
         var p = _ptr(self.a)
         var cur = _load32(p, i)
-        var h = self._hash(cur)
+        var b = self._bucket(cur)
         var best_len = 0
         var best_off = 0
         if rep1 <= i and _load32(p, i - rep1) == cur:
             best_len = _match_len(p, i - rep1, i, limit)
             best_off = rep1
-        var cand = Int(self.head[h]) - 1
-        var depth = 0
-        while cand >= 0 and depth < CHAIN_DEPTH and best_len < limit - i:
-            var d = i - cand
+        var t = self.table.unsafe_ptr()
+        for w in range(WAYS):
+            var e = t[b + w]
+            if e == 0:
+                break
+            if UInt32(e >> 32) != cur:
+                continue
+            var d = i - (Int(e & 0xFFFFFFFF) - 1)
             if d > ZSTD_WINDOW:
-                break
-            if _load32(p, cand) == cur:
-                var l = _match_len(p, cand, i, limit)
-                if l > best_len:
-                    best_len = l
-                    best_off = d
-            var nxt = Int(self.chain[cand & self.cmask]) - 1
-            if nxt >= cand:
-                break
-            cand = nxt
-            depth += 1
-        self.chain[i & self.cmask] = self.head[h]
-        self.head[h] = Int32(i + 1)
+                break                                      # the rest are older still
+            var l = _match_len(p, i - d, i, limit)
+            if l > best_len:
+                best_len = l
+                best_off = d
+        self._push(b, i, cur)
         if best_len < MIN_MATCH or (best_len == MIN_MATCH and best_off >= FAR_SHORT):
             return 0
         return (best_len << 21) | best_off
