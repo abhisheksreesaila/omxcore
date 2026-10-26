@@ -8,16 +8,38 @@ green. Anything newer on `main` may still be in review: don't vendor it.
 
 ## Current stable
 
-**`3d2455d`** (2026-10-25): omxcore on Apple GPUs (Metal), and the first stable after the omxcore rename.
+**`2585dc9`** (2026-10-26): spread aggregates, quantile bins and ISO weeks; streamed CSV; undo that covers formulas;
+compressed Parquet on every platform. Includes everything in 3d2455d (Apple GPU).
 
 ```sh
 # build the package from a clean copy of the stable commit (never from a working checkout), on Linux as before
-git -C <omxcore> archive 3d2455d | tar -x -C <scratch>
-cd <scratch> && pixi run bash scripts/build_mojo_pkg.sh      # -> build/omxcore.mojoc (and build/mxframe.mojoc, the old name, one last time)
-cp build/omxcore.mojoc <app>/vendor/ && echo 3d2455d > <app>/vendor/OMXCORE_COMMIT
+git -C <omxcore> archive 2585dc9 | tar -x -C <scratch>
+cd <scratch> && pixi run bash scripts/build_mojo_pkg.sh      # -> build/omxcore.mojoc (and build/mxframe.mojoc)
+cp build/omxcore.mojoc <app>/vendor/ && echo 2585dc9 > <app>/vendor/OMXCORE_COMMIT
 ```
 
-**Building the Mac app with the GPU (new).** The same `omxcore.mojoc` (built on Linux) gives the Apple GPU path when
+The Mac build commands are unchanged from 3d2455d (below): native build on a Mac for the GPU, no `-D` flag; the Linux
+cross-build links as before. **No new libSystem symbols** (`scripts/check_mac_link.sh` OK). Compression needs no flag
+and no library on macOS / iOS.
+
+## What changed since the previous stable (3d2455d), for apps
+
+| Area | What you get | Ticket |
+|---|---|---|
+| Spread | `stddev` / `stddev_pop` / `variance` / `var_pop` (builder; SQL also `stddev_samp` / `var_samp`), per group and whole column, on a Table, Frame or scan. Float64 result, NULLs skipped, the sample forms NULL below two values; exact on data where DuckDB loses digits (1e15 + small numbers), equal to DuckDB elsewhere; NaN / inf among two or more values raises `out of range`, as DuckDB | F-177 |
+| ISO weeks | `EXTRACT(week FROM d)`, `EXTRACT(isoyear FROM d)`, `week()`, `weekofyear()`, `isoyear()`: expressions and group keys, equal to DuckDB for every day 1900-2100 | F-177 |
+| Quantile bins | SQL `quantile_bin(x, n)` as a GROUP BY key (bins 1..n, n at most 32; edge k is the value at sorted place ceil(k N / n) of the non-NULL values the WHERE keeps; ties share a bin; equals `ntile(n)` when n divides N). Builder: `q.quantile_bins(e, n)` then `.key(e)` / `.bins()` in `group_by` (bins 0..n-1). Elsewhere in a query it raises by name | F-177 |
+| GPU and these | AUTO answers spread aggregates and quantile bins on the CPU (`fallback_reason` says so); `compute(GPU)` raises with the same words | F-177 |
+| Streamed CSV | `scan_csv(path, CsvOptions(...))` (or `scan_csv_job`, with progress and cancel) opens a CSV of any size: queries, SQL (`Catalog.add_scan`), `Frame(scan)` edits and `save` (writes Parquet) work as on a Parquet scan. A 1.4 GB file peaks at ~60 MB (read_csv: 2 GB); opening ~165 MB/s on one thread. `scan.csv_report()` (per column failed / empty counts, ragged rows) and `failures()` (row, column, text, why): a failed cell is a NULL, so check the report. Kinds come from a sample cut at `block_bytes`: with very long rows they can differ from `read_csv` | F-178 |
+| Undo for formulas | adding, replacing and removing a formula are steps of the Frame's one undo log; new `Frame.redo()` (every step kind; a new edit clears redo) and `Frame.remove_formula(m)` (refused while another formula reads it); `edits` advances on each step, undo and redo. Drop the app's second undo log | F-179 |
+| Compressed Parquet everywhere | builds without C codecs (macOS, iOS) now write and read ZSTD and SNAPPY with codecs written in Mojo (no library to ship, no licence to carry); the same file size as libzstd level 3, zstd save ~2x slower than Linux's C library, open about the same; checksums verified. Linux is unchanged (libzstd / libsnappy). Write `.omx` files with ZSTD on every platform | F-180 |
+
+**Not yet:** formula columns in `range_aggregate` / `read_block` still raise; saving a CSV scan as CSV; parallel zstd
+compression; spread aggregates on the GPU.
+
+## What changed in 3d2455d (since 23edc59), for apps
+
+**Building the Mac app with the GPU.** The same `omxcore.mojoc` (built on Linux) gives the Apple GPU path when
 the *app* is compiled for macOS with an Apple GPU as the accelerator; the switches resolve at the app's build, not the
 package's. Metal kernels are compiled with Apple's Metal toolchain, so that build runs **on a Mac** (or a macOS runner):
 
@@ -30,8 +52,6 @@ mojo build -I vendor -D MXFRAME_NO_GPU ...                   # opt out: CPU only
 
 A Linux cross-build of the Mac app (`--target-triple arm64-apple-macosx...` without a Metal accelerator) still has no
 GPU and needs no flag: it links exactly as before (`scripts/check_mac_link.sh`).
-
-## What changed since the previous stable (23edc59), for apps
 
 | Area | What you get | Ticket |
 |---|---|---|
@@ -78,6 +98,7 @@ and a repro for a bug. Needs that are generic go into the engine; app-specific o
 ## History
 | Stable | Date | Highlights |
 |---|---|---|
+| `2585dc9` | 2026-10-26 | stddev / variance, quantile bins, ISO week; streamed CSV; undo for formulas; compressed Parquet on the Mac |
 | `3d2455d` | 2026-10-25 | Apple GPU (Metal): Int64 word, atomic-free modes, 32 KB; `gpu_device()`; the omxcore name |
 | `23edc59` | 2026-10-20 | background jobs (cancel, progress), range aggregates and block reads |
 | `321870f` | 2026-10-19 | SQL, joins, planner, expressions, FLOAT64, `mx` |

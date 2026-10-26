@@ -1714,18 +1714,21 @@ NaN / -0.0 as the engine's other aggregates. Errors are plain sentences. Rules, 
 - Not done, on purpose: formula columns raise (`column `m` is a formula`; the work is per-row evaluation and belongs with F-179); the SQL path gives no row numbers, so an app that orders with `ORDER BY` passes the row ids of its own id column; a long range over a Frame with 300,000 edited cells pays ~120 ms to apply them.
 - Review: PASS (314 adversarial runs equal DuckDB and the per-cell loop over table / scan / edited frame / edited scan frame; exact int64 boundary; FLOAT min / max / NaN as DuckDB; bits equal threaded vs serial; too-small buffers, bad ranges, rows and columns refused with writes inside the block; 8 concurrent callers). Ready for later: formula columns (serial per-row evaluation now, batched in F-179), cache the frame patch arrays by edit counter (a long range over 300k edited cells costs 80-120 ms per call), pin the reviewer's safety cases in test_blocks, a plain C record for RangeAgg
 
-## F-177 More aggregates and keys: stddev / variance, quantile bins, ISO week [doing] (mxframe #10, #11)
-- [ ] `stddev` / `stddev_pop` / `variance` / `var_pop` per group and whole column, as DuckDB (numerically stable, float result); quantile bins (`ntile`-style edges from exact quantiles) as group keys; ISO week and ISO year
+## F-177 More aggregates and keys: stddev / variance, quantile bins, ISO week [done] (mxframe #10, #11)
+- Built: `stddev` / `stddev_pop` / `variance` / `var_pop` (builder; SQL also `stddev_samp` / `var_samp`) on table, frame and scan, exact on cancellation-heavy data (DuckDB is not), bits equal for 1 and 8 threads; `EXTRACT(week / isoyear)`, `week()`, `isoyear()` equal DuckDB 1900-2100; `quantile_bin(x, n)` (SQL, bins 1..n, at most 32, GROUP BY keys only, edges at sorted place ceil(k N / n): equals `ntile` only when n divides N) and `Query.quantile_bins` (builder, bins 0..n-1). GPU declines with a reason. Review: round 1 NEEDS WORK (internal error outside GROUP BY), round 2 NEEDS WORK (two bin keys refused), round 3 PASS.
+- [x] `stddev` / `stddev_pop` / `variance` / `var_pop` per group and whole column, as DuckDB (numerically stable, float result); quantile bins (`ntile`-style edges from exact quantiles) as group keys; ISO week and ISO year
 
-## F-178 Streamed CSV [doing] (mxframe #13)
-- [ ] a CSV bigger than memory queried a block at a time (the scan model of F-140 / F-149), types inferred from a sample with a failed-row report; edits and save over it as F-147
+## F-178 Streamed CSV [done] (mxframe #13)
+- Built: `scan_csv(path, CsvOptions)` / `scan_csv_job` return a scan (`csvscan.mojo`): queries, SQL, Frame edits and save (to Parquet) over it; `csv_report()` / `failures()` list failed cells (a failed cell is a null). 1.42 GB file peaks ~60 MB (read_csv 2 GB). Side fix: scans build TEXT dictionaries only for columns a query reads. Review: PASS (300 fuzzed files x 28 block shapes equal read_csv). Not done: save as CSV, parallel open, `mx` streaming CSV.
+- [x] a CSV bigger than memory queried a block at a time (the scan model of F-140 / F-149), types inferred from a sample with a failed-row report; edits and save over it as F-147
 
 ## F-179 Undo that covers formula columns [done] (mxframe #15)
 - [x] adding, changing or removing a formula is an undo step in the Frame's edit log (one log for cells, merges and formulas)
 - Built: `frame.mojo` formula steps (add / replace / remove) in the one log, `Frame.redo()` for every step kind (a new edit clears redo, and frees its formula lists), `Frame.remove_formula(m)` (refused while another formula reads it); `edits` advances on every step, undo and redo; snapshots copy the redo state. Tests `mojo/tests/test_frame_formula_undo.mojo` (replay oracle after every undo / redo on table, edited frame and Parquet scan frame; 150 random walks per source; merges; save after undo). Review: PASS (should-fix items done: snapshot redo state, freed swaps, wider fingerprint). Not done: formula columns in `range_aggregate` / `read_block` still raise (batched evaluation in blocks.mojo, a later ticket).
 
-## F-180 Compressed Parquet writes on every platform [doing] (mxframe #16)
-- [ ] zstd (and snappy) built into the package for macOS and other no-codec targets (vendored static C sources or a Mojo port), so `.omx` files are compressed everywhere; the Mac link check stays green
+## F-180 Compressed Parquet writes on every platform [done] (mxframe #16)
+- Built: `codec.mojo`, zstd and snappy written in Mojo (no vendored C), used by every build without C codecs (macOS, iOS; `-D MXFRAME_NO_CODECS` on Linux); Linux keeps libzstd / libsnappy. Same ratio as libzstd level 3 (4.64x), zstd save ~2x slower (0.60 s vs 0.28 s, 2M rows); checksum verified; corrupt sizes refused before allocating. Review: PASS (430k mutated inputs, no crash). Later: parallel column compression (owner decision).
+- [x] zstd (and snappy) built into the package for macOS and other no-codec targets (vendored static C sources or a Mojo port), so `.omx` files are compressed everywhere; the Mac link check stays green
 
 Mapped to existing tickets: #7 result cache → F-160; #12 count distinct / median on the GPU and streamed in parallel, approximate or spilling → F-167 (+ F-163 for spill); #14 sort that spills (multi-key sort exists since F-152) → F-167 / F-163; #17 window functions → F-168; #18 versions and the time machine → M9 (parked, Delta-Lake style).
 
