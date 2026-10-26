@@ -28,7 +28,7 @@ Semantics, as the app's stand-in (mojoui frame_gpu.group_sum), plus nulls:
 from std.time import perf_counter_ns
 from std.atomic import Atomic
 from std.memory import Pointer
-from .table import SharedTable, Table, TEXT, FLOAT, INT, DECIMAL
+from .table import SharedTable, Table, TEXT, FLOAT, INT, DECIMAL, DATE, BOOL
 from .parquet import ParquetScan, _GroupPlan, _GroupReader, _open_plan, _copy_bits, _count_bits
 from .frame import Frame, Overlay, _eval_row, _eval_row_t
 from .expr import (Expr, Node, N_COL, N_LIT, N_LITF, N_DIV, N_I2F, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG, N_LEAST, N_GREATEST,
@@ -38,7 +38,8 @@ from .kernels.pipeline_cpu import pipeline_keyed, pipeline_plain, E_OVERFLOW, IP
 from .kernels.pipeline_gpu import run_pipeline_gpu, _choose_mode, scratch_rows, int_word_program_ok, APPLE_GPU, HDR as GPU_HDR
 from max.gpu.host import DeviceContext, DeviceBuffer
 from .gpu import DeviceTable, HAS_GPU, NO_GPU_MESSAGE, gpu_available, _ScanContext, _scan_context, _stage_load, _stage_data, _stage_valid, _pinned_prepare
-from .holistic import HolStates, HolSpec, HolResult, window_blocks, heap_offer, float_key, A_DISTINCT, A_PCT, A_TOPK, A_MEDIAN
+from .holistic import (HolStates, HolSpec, HolResult, window_blocks, heap_offer, float_key, A_DISTINCT, A_PCT, A_TOPK, A_MEDIAN,
+                       A_VAR_POP, A_VAR_SAMP, A_STDDEV_POP, A_STDDEV_SAMP, is_spread, spread_needs)
 from .joincore import JoinKeys, JoinSide, normalize_keys, join_pairs, select_rows, gather_join, JOIN_BUDGET_BYTES
 from .kernels.hashjoin_cpu import hj_build, PM_SEMI, PM_ANTI
 from .frame import text_ranks
@@ -166,6 +167,28 @@ def median(e: Expr) -> Agg:
     25. A TEXT column has no mean: its median is the lower middle word (a code), unscaled. The value `percentile(e, 0.5)`
     returns is the lower middle, unscaled."""
     return Agg(A_MEDIAN, e.copy())
+
+
+def stddev(e: Expr) -> Agg:
+    """The sample standard deviation of the group's non-null values (DuckDB's `stddev` = `stddev_samp`): a float64 (`r.floats(i)`), no value
+    (`r.present(i, g)` false) for a group with fewer than two. INT, DECIMAL and FLOAT values are read as float64 as DuckDB casts them
+    (`float(v) / 10^scale`); the sum of squared deviations is stable against cancellation (F-177)."""
+    return Agg(A_STDDEV_SAMP, e.copy())
+
+
+def stddev_pop(e: Expr) -> Agg:
+    """The population standard deviation (`stddev_pop`): a value for a group of one (0.0), none for an empty one."""
+    return Agg(A_STDDEV_POP, e.copy())
+
+
+def variance(e: Expr) -> Agg:
+    """The sample variance (DuckDB's `variance` = `var_samp`); see `stddev`."""
+    return Agg(A_VAR_SAMP, e.copy())
+
+
+def var_pop(e: Expr) -> Agg:
+    """The population variance (`var_pop`); see `stddev_pop`."""
+    return Agg(A_VAR_POP, e.copy())
 
 
 def top_k(e: Expr, k: Int) -> Agg:
@@ -400,7 +423,7 @@ struct Query(Movable):
             comptime if not HAS_GPU:
                 raise Error("device GPU: " + NO_GPU_MESSAGE)
             if holistic:
-                raise Error("device GPU: count_distinct, percentile and top_k run on the CPU")
+                raise Error("device GPU: count_distinct, percentile, top_k, stddev and variance run on the CPU")
             if not self.device:
                 raise Error("device GPU: no DeviceTable is attached (Query.on_device(DeviceTable(table)))")
             if not self.device.value().is_live():
@@ -408,7 +431,7 @@ struct Query(Movable):
             use_gpu = True
         elif device == AUTO and self.device and self.device.value().is_live() and self.table.rows() >= AUTO_GPU_MIN_ROWS:
             if holistic:
-                fallback = "count_distinct, percentile and top_k run on the CPU"
+                fallback = "count_distinct, percentile, top_k, stddev and variance run on the CPU"
             else:
                 use_gpu = True
         var t0 = perf_counter_ns()
@@ -430,7 +453,7 @@ struct Query(Movable):
             fallback = "a FLOAT column or float arithmetic runs on the CPU (a float64 sum has one defined order there)"
         var hs = HolStates(1, List[HolSpec](), List[List[Int64]]())
         if prog.mat:
-            hs = _build_states(self.nodes, nodes, self.table, self.overlay.words, None, -1 if self.framed else self.table.rows(), prog.src_float.copy())
+            hs = _build_states(self.nodes, nodes, self.table, self.overlay.words, None, -1 if self.framed else self.table.rows(), prog.src_float.copy(), prog.src_scale.copy())
         var r = QueryResult()
         var done = False
         if use_gpu:
@@ -518,7 +541,7 @@ struct QueryResult(Movable):
     def is_float(self, i: Int) -> Bool:
         """Aggregate i's value is a float64 (`floats(i)`): a float sum, mean, min, max, median or quantile (not count_distinct)."""
         if self.hol_of[i] >= 0:
-            return self.hfloat[self.hol_of[i]] and self.kinds[i] != A_DISTINCT
+            return is_spread(self.kinds[i]) or (self.hfloat[self.hol_of[i]] and self.kinds[i] != A_DISTINCT)
         return len(self.agg_float) > i and self.agg_float[i]
 
     def floats(self, i: Int) -> List[Float64]:
@@ -584,7 +607,7 @@ struct QueryResult(Movable):
         """Aggregate i has a value in group g: a row whose value is not null (a min / max / mean over only nulls
         has none, and its number is meaningless). count_distinct, percentile, top_k: the group has a non-null value."""
         if self.hol_of[i] >= 0:
-            return self.hcount[self.hol_of[i]][g] > 0
+            return self.hcount[self.hol_of[i]][g] >= (spread_needs(self.kinds[i]) if is_spread(self.kinds[i]) else 1)
         if self.count_slot_of[i] >= 0:
             return self.slots[self.count_slot_of[i]][g] > 0
         return self.counts[g] > 0
@@ -624,6 +647,7 @@ struct Program(Movable):
     var agg_float: List[Bool]        # per aggregate: its value is a float64 (sum, mean, min, max of a float expression)
     var nan_slot_of: List[Int]       # per float min / max: the slot counting the NaNs it left out (NaN is above every number), else -1
     var src_float: List[Bool]        # per holistic source: it reads float64 values (the hook turns them into order-preserving keys)
+    var src_scale: List[Int]         # per holistic source: the decimal places of its integer values (stddev / variance read float(v) / 10^scale)
     var conv: List[String]           # F-156: the casts that can fail (OP_FLAG): what the error says when one does
     var text_tabs: Int               # F-156: the per-word tables the program carries (a text function answered once per dictionary word)
     var text_words: Int              # ... and how many words they were evaluated on
@@ -663,6 +687,7 @@ struct Program(Movable):
         self.agg_float = List[Bool]()
         self.nan_slot_of = List[Int]()
         self.src_float = List[Bool]()
+        self.src_scale = List[Int]()
         self.conv = List[String]()
         self.text_tabs = 0
         self.text_words = 0
@@ -1005,6 +1030,7 @@ def _lower(t: SharedTable, nodes: List[PlanNode], force_counts: Bool, masked: Bo
     p.src_vreg = List[Int](length=p.n_src, fill=-1)
     p.src_valid = List[Int](length=p.n_src, fill=-1)
     p.src_float = List[Bool](length=p.n_src, fill=False)
+    p.src_scale = List[Int](length=p.n_src, fill=0)
     if p.mat:                                            # register 1: the address of the control block the hook reads
         p.section = 1
         p.ctl_const = len(p.consts)
@@ -1090,6 +1116,7 @@ def _lower(t: SharedTable, nodes: List[PlanNode], force_counts: Bool, masked: Bo
                 var vs = _compile_typed(p, a.arg, t)
                 p.src_vreg[src] = p.keep(vs.reg, False)
                 p.src_float[src] = vs.fl
+                p.src_scale[src] = vs.scale if vs.scale > 0 else 0
                 p.reset_temps()
             continue
         p.section = 1
@@ -1582,7 +1609,7 @@ def _run_mat(t: SharedTable, p: Program, mask_addr: Int, mut hs: HolStates, wind
 
 
 def _build_states(orig: List[PlanNode], nodes: List[PlanNode], base: SharedTable, extra: List[List[String]],
-                  scan: Optional[ParquetScan] = None, max_rows: Int = -1, var floats: List[Bool] = List[Bool]()) raises -> HolStates:
+                  scan: Optional[ParquetScan] = None, max_rows: Int = -1, var floats: List[Bool] = List[Bool](), var scales: List[Int] = List[Int]()) raises -> HolStates:
     """The states for the plan's holistic aggregates (none: an empty set). `nodes` are the plan with a frame's formulas
     and merges expanded (they decide which aggregates share a value source), `orig` the plan as built (to see which
     values are a plain TEXT column, whose percentile / top_k order is the words' alphabetical order, not the codes').
@@ -1607,6 +1634,12 @@ def _build_states(orig: List[PlanNode], nodes: List[PlanNode], base: SharedTable
             continue
         ref a = nodes[at].aggs[i]
         specs.append(HolSpec(i, a.kind, a.p, a.k, src_of[i]))
+        if is_spread(a.kind):                              # numbers only: a word, a date or a flag has no spread
+            for name in orig[at].aggs[i].arg.columns():
+                var c = base.index(name)
+                if c >= 0 and (base.kind(c) == TEXT or base.kind(c) == DATE or base.kind(c) == BOOL):
+                    raise Error("stddev / variance need numbers: column `" + name + "` is not one")
+            continue
         if a.kind == A_DISTINCT or len(ranks[src_of[i]]) > 0:
             continue
         ref oa = orig[at].aggs[i].arg
@@ -1626,7 +1659,7 @@ def _build_states(orig: List[PlanNode], nodes: List[PlanNode], base: SharedTable
                     for w in extra[c]:
                         words.append(w)
                 ranks[src_of[i]] = text_ranks(words)
-    return HolStates(nodes[at].groups, specs^, ranks^, max_rows, floats^)
+    return HolStates(nodes[at].groups, specs^, ranks^, max_rows, floats^, scales^)
 
 
 def _finish_holistic(mut r: QueryResult, mut hs: HolStates) raises:
@@ -2364,7 +2397,7 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int, orig: L
     job.check()
     for c in used:                           # every dictionary the plan needs is built before groups decode beside the kernel
         scan.ensure_words(c)
-    var hs = _build_states(orig, nodes, scan.schema, o.words, Optional[ParquetScan](scan.copy()), -1 if framed else scan.rows(), shape.src_float.copy())    # (text order needs the words)
+    var hs = _build_states(orig, nodes, scan.schema, o.words, Optional[ParquetScan](scan.copy()), -1 if framed else scan.rows(), shape.src_float.copy(), shape.src_scale.copy())    # (text order needs the words)
     var sm = _ScanMask()                                                      # F-147
     if len(o.mask) > 0:
         sm.addr = Int(o.mask.unsafe_ptr())
