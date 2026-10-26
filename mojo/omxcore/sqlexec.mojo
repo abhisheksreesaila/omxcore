@@ -1728,7 +1728,8 @@ def _resolve_bins[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: P, o
         var n = Int(node.value)
         var x = q.rexprs[node.a].copy()
         var aux = copy_query(q)
-        aux.rexprs[i].b = -2                                          # (being resolved: the aux query does not resolve it again)
+        for j in todo:
+            aux.rexprs[j].b = -2                                      # (the query's bins are being resolved: the aux query neither resolves nor checks them again)
         aux.keys = List[KeySpec]()
         aux.aggs = List[AggSpec]()
         aux.pexprs = List[BExpr]()

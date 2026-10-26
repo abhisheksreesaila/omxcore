@@ -92,6 +92,32 @@ def test_two_keys_and_a_having(probe, sets):
     assert_equal(got_rows(res), con.execute(oracle).fetchall(), False, sql)
 
 
+@pytest.mark.parametrize("group_by", ["qb, qc", "1, 2", "quantile_bin(x, 4), quantile_bin(d, 3)"])
+def test_two_bin_keys_in_one_group_by(probe, sets, group_by):
+    ds = sets["g8"]
+    con = ds.table
+    ex, ed = edges_by_the_rule(con, "x", "TRUE", 4), edges_by_the_rule(con, "d", "TRUE", 3)
+    sql = f"SELECT quantile_bin(x, 4) qb, quantile_bin(d, 3) qc, count(*), sum(e) FROM t GROUP BY {group_by}"
+    res = run_probe(probe, sql, {"t": ds.path})
+    oracle = f"SELECT {bin_case('x', ex)}, {bin_case('d', ed)}, count(*), sum(e) FROM t GROUP BY 1, 2"
+    assert_equal(got_rows(res), con.execute(oracle).fetchall(), False, sql)
+
+
+def test_three_bin_keys_and_one_column_binned_twice(probe, sets):
+    ds = sets["g8"]
+    con = ds.table
+    e4, e7 = edges_by_the_rule(con, "x", "TRUE", 4), edges_by_the_rule(con, "x", "TRUE", 7)
+    ed, ee = edges_by_the_rule(con, "d", "TRUE", 3), edges_by_the_rule(con, "e", "TRUE", 2)
+    sql = "SELECT quantile_bin(x, 4), quantile_bin(x, 7), quantile_bin(d, 3), count(*) FROM t GROUP BY 1, 2, 3"
+    res = run_probe(probe, sql, {"t": ds.path})
+    oracle = f"SELECT {bin_case('x', e4)}, {bin_case('x', e7)}, {bin_case('d', ed)}, count(*) FROM t GROUP BY 1, 2, 3"
+    assert_equal(got_rows(res), con.execute(oracle).fetchall(), False, sql)
+    sql = "SELECT quantile_bin(x, 4), quantile_bin(d, 3), quantile_bin(e, 2), count(*) FROM t GROUP BY 1, 2, 3"
+    res = run_probe(probe, sql, {"t": ds.path})
+    oracle = f"SELECT {bin_case('x', e4)}, {bin_case('d', ed)}, {bin_case('e', ee)}, count(*) FROM t GROUP BY 1, 2, 3"
+    assert_equal(got_rows(res), con.execute(oracle).fetchall(), False, sql)
+
+
 def test_distinct_values_and_an_n_that_divides_the_rows_are_ntile(probe, tmp_path):
     path = tmp_path / "distinct.parquet"
     values = [(i * 7919) % 1000 for i in range(1000)]               # a permutation of 0 .. 999
@@ -155,8 +181,8 @@ def test_it_is_refused_where_it_means_nothing(probe, sets):
                       ("SELECT quantile_bin(quantile_bin(x, 3), 2), count(*) FROM t GROUP BY 1", "supported only in GROUP BY"),
                       ("SELECT k, sum(quantile_bin(x, 4)) FROM t GROUP BY k", "supported only in GROUP BY"),
                       ("SELECT k, count(*) FROM t GROUP BY k HAVING sum(CASE WHEN quantile_bin(x, 2) = 1 THEN 1 ELSE 0 END) > 1", "supported only in GROUP BY"),
-                      ("SELECT k, CASE WHEN quantile_bin(x, 2) = 1 THEN 1 ELSE 0 END FROM t GROUP BY k", "quantile_bin"),
-                      ("SELECT k, count(*) FROM t GROUP BY k ORDER BY quantile_bin(x, 2)", "quantile_bin"),
-                      ("SELECT count(*) FROM t a JOIN t b ON a.id = b.id GROUP BY quantile_bin(a.x, 2)", "quantile_bin")):
+                      ("SELECT k, CASE WHEN quantile_bin(x, 2) = 1 THEN 1 ELSE 0 END FROM t GROUP BY k", "column 21: quantile_bin() bins the rows of a table: it cannot take an aggregate"),
+                      ("SELECT k, count(*) FROM t GROUP BY k ORDER BY quantile_bin(x, 2)", "column 47: quantile_bin() bins the rows of a table: it cannot take an aggregate"),
+                      ("SELECT count(*) FROM t a JOIN t b ON a.id = b.id GROUP BY quantile_bin(a.x, 2)", "not in a join or a row query yet")):
         res = run_probe(probe, sql, {"t": ds.path}, expect_error=True)
         assert text in res["error"], (sql, res)
