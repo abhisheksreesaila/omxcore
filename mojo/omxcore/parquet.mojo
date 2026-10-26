@@ -22,10 +22,9 @@ or not, the stored instant is floored to a day since 1970 in UTC, never shifted 
 The file is untrusted input: every length, count, run and bit width is checked against what the page or footer can
 hold before anything is allocated or read, and a bad file raises "(corrupt file)", never crashes.
 
-F-138b, the no-codec build: zstd and snappy are C libraries. An Apple app links neither, so there (any target but
-Linux, or `-D MXFRAME_NO_CODECS` on Linux to test it) `write_parquet` saves UNCOMPRESSED whatever `compression` says,
-and `read_parquet` refuses a zstd or snappy column chunk with an error naming the column. No codec symbol is
-referenced, so nothing links. On Linux both codecs work as before.
+F-138b / F-180, the codecs: on Linux zstd and snappy are the C libraries (libzstd, libsnappy). An Apple app links
+neither, so every other target (and `-D MXFRAME_NO_CODECS` on Linux, to test it) uses `codec.mojo`: zstd and snappy
+written in Mojo, with no symbol from outside the package. Files are the same either way: each reads the other's.
 """
 from std.atomic import Atomic
 from std.time import perf_counter_ns
@@ -33,6 +32,7 @@ from std.memory.alloc import unsafe_alloc
 from std.ffi import external_call
 from std.sys import is_defined, CompilationTarget
 from std.bit import pop_count, byte_swap
+from .codec import zstd_compress, zstd_decompress, snappy_compress, snappy_decompress
 from .job import JobCtl, STAGE_READ, STAGE_WRITE, THREADS      # F-175
 from .kernels._fpenv import par_n, core_count
 from std.collections import Dict
@@ -80,7 +80,7 @@ comptime SNAPPY = 1
 comptime GZIP = 2
 comptime ZSTD = 6
 
-comptime NO_CODECS = is_defined["MXFRAME_NO_CODECS"]() or not CompilationTarget.is_linux()
+comptime NO_CODECS = is_defined["MXFRAME_NO_CODECS"]() or not CompilationTarget.is_linux()    # no C codec libraries: codec.mojo
 
 comptime DEFAULT_ROW_GROUP = 1 << 20
 comptime INT32_MAX = 2147483647
@@ -118,7 +118,11 @@ def _compress(codec: Int, src: List[UInt8]) raises -> List[UInt8]:
     if codec == UNCOMPRESSED:
         return src.copy()
     comptime if NO_CODECS:
-        raise Error("this build has no zstd or snappy: pages are saved UNCOMPRESSED")
+        if codec == ZSTD:
+            return zstd_compress(src)
+        if codec == SNAPPY:
+            return snappy_compress(src)
+        raise Error("compression codec " + String(codec) + " is not supported (UNCOMPRESSED, SNAPPY, ZSTD)")
     else:
         if codec == ZSTD:
             var cap = external_call["ZSTD_compressBound", Int](len(src))
@@ -154,9 +158,17 @@ def _decompress(codec: Int, src: Int, n: Int, size: Int) raises -> List[UInt8]:
         out.resize(size, 0)
         return out^
     comptime if NO_CODECS:
-        if codec == ZSTD or codec == SNAPPY:
-            raise Error("this build has no zstd or snappy, so it cannot read this page")
-        raise Error("compression codec " + String(codec) + " is not supported (this build reads UNCOMPRESSED only)")
+        if codec == ZSTD:
+            try:
+                return zstd_decompress(src, n, size)
+            except:
+                raise Error("a zstd page did not decompress to its stated size (corrupt file)")
+        if codec == SNAPPY:
+            try:
+                return snappy_decompress(src, n, size)
+            except:
+                raise Error("a snappy page did not decompress to its stated size (corrupt file)")
+        raise Error("compression codec " + String(codec) + " is not supported yet (UNCOMPRESSED, SNAPPY, ZSTD)")
     else:
         if codec == ZSTD:
             var stated = external_call["ZSTD_getFrameContentSize", UInt64](src, n)
@@ -382,8 +394,6 @@ struct ParquetWriter(Movable):
 
     def __init__(out self, path: String, shape: Table, optional: List[Bool], compression: Int) raises:
         self.codec = compression
-        comptime if NO_CODECS:
-            self.codec = UNCOMPRESSED                  # no zstd / snappy linked: whatever was asked for
         self.path = path
         # The temp name carries the process id, so two processes saving the same path never share a temp file.
         # (F-175) and the address of a fresh allocation and the clock: two saves to one path in one process (a cancelled save that is
@@ -1946,10 +1956,6 @@ def _walk_chunk(base: Int, n: Int, meta: _ChunkMeta, leaf: _Leaf, mut ctx: _Ctx,
     page is decoded now; each data page is appended to `pages`."""
     var pos = meta.dict_off if meta.dict_off > 0 and meta.dict_off < meta.data_off else meta.data_off
     var done = 0
-    comptime if NO_CODECS:
-        if meta.codec == ZSTD or meta.codec == SNAPPY:
-            raise Error("column `" + leaf.name + "` is " + ("zstd" if meta.codec == ZSTD else "snappy") +
-                        "-compressed, and this build has no zstd or snappy (save the file UNCOMPRESSED, or open it on a build with codecs)")
     if meta.values < 0:
         raise Error("column `" + leaf.name + "`: a column chunk has a negative value count (corrupt file)")
     while done < meta.values:

@@ -1,7 +1,8 @@
 # F-138b: the package built for an app with no GPU, no thread pool and no codecs. scripts/mojo_test.sh builds this one
 # file with `-D MXFRAME_NO_GPU -D MXFRAME_SERIAL -D MXFRAME_NO_CODECS` (the switches a Mac build has by default) and
 # runs it with two Parquet files the normal build wrote: argv[1] zstd, argv[2] snappy (from tools/pq_write_sample).
-# Everything an app does must still give the right answer; the three things that are gone must say so readably.
+# Everything an app does must still give the right answer; the GPU and the thread pool are gone and say so readably, and
+# the codecs are the Mojo ones (F-180): files are saved compressed and the C libraries' files are read.
 from std.sys import argv
 from std.os import getenv
 from omxcore import (Table, SharedTable, Frame, Query, QueryResult, INT, DECIMAL, col, sum, count, CPU, GPU, AUTO, DeviceTable,
@@ -16,14 +17,6 @@ from omxcore.kernels._fpenv import core_count
 def expect(cond: Bool, what: String) raises:
     if not cond:
         raise Error("FAILED: " + what)
-
-
-def refusal(path: String) -> String:
-    try:
-        _ = read_parquet(path)
-    except e:
-        return String(e)
-    return String("")
 
 
 def main() raises:
@@ -167,15 +160,23 @@ def main() raises:
         expect(many.table.get(0, i) == one.table.get(0, i) and many.table.get(2, i) == one.table.get(2, i) and
                many.table.text_of(1, Int(many.table.get(1, i))) == one.table.text_of(1, Int(one.table.get(1, i))), "chunked read equals one chunk at row " + String(i))
 
-    # no codecs: saves UNCOMPRESSED, whatever is asked for, and the file reads back
+    # no C codecs: the Mojo zstd and snappy save compressed files (1,000 values of ten kinds: 8,000 bytes plain), and they read back
     var path = String("mxframe-switches.parquet")
+    var tens = Table.empty()
+    var ten = tens.add_column("ten", INT)
+    for i in range(1000):
+        tens.append(ten, Int64(i % 10))
+    for codec in [ZSTD, SNAPPY]:
+        write_parquet(path + ".tens", tens, "", codec)
+        var tsize = len(open(path + ".tens", "r").read_bytes())
+        expect(tsize < 700, "1,000 repeating values are stored compressed (" + String(tsize) + " bytes)")
+        var tback = read_parquet(path + ".tens")
+        expect(tback.table.rows() == 1000 and tback.table.get(0, 997) == 7 and tback.table.get(0, 3) == 3, "and read back exactly")
     var big = Table.empty()
     var x = big.add_column("x", INT)
     for i in range(1000):
         big.append(x, Int64(i) * 0x9E3779B97F4A7C15)
     write_parquet(path, big, "", ZSTD)
-    var size = len(open(path, "r").read_bytes())
-    expect(size >= 8000, "the 1,000 values are stored uncompressed (" + String(size) + " bytes)")
     var back = read_parquet(path)
     expect(back.table.rows() == 1000 and back.table.get(0, 999) == Int64(999) * 0x9E3779B97F4A7C15, "and read back exactly")
 
@@ -249,17 +250,13 @@ def main() raises:
         slow.cancel()
         expect(slow.wait() == JOB_CANCELLED or slow.poll() == JOB_DONE, "a job thread on a serial build can be cancelled")
 
-    # ... and refuses a compressed file, naming the column
+    # ... and reads the files the C libraries wrote
     expect(len(args) >= 3, "run with a zstd file and a snappy file")
-    var z = refusal(String(args[1]))
-    expect("`qty`" in z and "zstd" in z and "no zstd or snappy" in z, "a zstd file is refused: `" + z + "`")
-    var s = refusal(String(args[2]))
-    expect("`qty`" in s and "snappy" in s and "no zstd or snappy" in s, "a snappy file is refused: `" + s + "`")
-    var scanned = String("")
-    try:
-        var zs = scan_parquet(String(args[1]))        # opens (the footer); its text is read lazily
-        _ = zs.word_count(zs.index("region"))
-    except e:
-        scanned = String(e)
-    expect("zstd" in scanned and "no zstd or snappy" in scanned, "a zstd file's text cannot be scanned: `" + scanned + "`")
+    for k in range(1, 3):
+        var theirs = read_parquet(String(args[k]))
+        expect(theirs.table.rows() == 500, "a file from the C codecs has its 500 rows")
+        for i in range(500):
+            expect(theirs.table.get(0, i) == Int64(i * 7 - 3000), "qty of row " + String(i) + " in file " + String(k))
+        var words = scan_parquet(String(args[k]))
+        expect(words.word_count(words.index("region")) == 5, "and its text column scans: " + String(words.word_count(words.index("region"))) + " words")
     print("ok")

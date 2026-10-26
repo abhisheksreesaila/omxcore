@@ -4,7 +4,7 @@
 # and open). `mojo_entry` is the entry point the app's Mac build links with (`-e _mojo_entry`).
 from std.ffi import c_int
 from omxcore import (Table, SharedTable, Frame, INT, DECIMAL, TEXT, Query, col, sum, count, CPU, GPU, AUTO,
-                     DeviceTable, gpu_available, read_csv, write_parquet, read_parquet, scan_parquet, UNCOMPRESSED, ZSTD,
+                     DeviceTable, gpu_available, read_csv, write_parquet, read_parquet, scan_parquet, UNCOMPRESSED, ZSTD, SNAPPY,
                      count_distinct, median, percentile, top_k, Catalog, PlannerOptions, GROUP_HASHED, sql, range_aggregate, read_block,
                      compute_job, sql_job, read_csv_job, read_parquet_job, save_job, write_parquet_job, permutation_job, JOB_DONE)
 
@@ -30,10 +30,9 @@ def run() raises:
     except e:
         print(e)
     write_parquet("probe.parquet", shared, "{}", UNCOMPRESSED)
-    try:
-        write_parquet("probe-z.parquet", shared, "{}", ZSTD)     # saved UNCOMPRESSED on a no-codec build
-    except e:
-        print(e)
+    write_parquet("probe-z.parquet", shared, "{}", ZSTD)         # F-180: the Mojo zstd and snappy, no C library
+    write_parquet("probe-s.parquet", shared, "{}", SNAPPY)
+    print(read_parquet("probe-z.parquet").table.rows(), read_parquet("probe-s.parquet").table.rows())
     var back = read_parquet("probe.parquet")
     print(back.table.rows())
     print(Query(scan_parquet("probe.parquet")).group_by(col("k"), 3).agg(sum(col("v")), count()).compute(AUTO).counts[0])
