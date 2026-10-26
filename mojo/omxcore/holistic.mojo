@@ -35,7 +35,7 @@ from std.memory import Pointer
 from std.sys import prefetch, PrefetchOptions
 from std.atomic import Atomic
 from std.bit import count_leading_zeros
-from std.math import ceil, log, sqrt
+from std.math import ceil, log, sqrt, isfinite
 from .kernels._fpenv import core_count, par_n
 
 comptime LP = Pointer[Int64, MutUntrackedOrigin]
@@ -548,11 +548,18 @@ def spread_needs(kind: Int) -> Int:
     return 2 if kind == A_VAR_SAMP or kind == A_STDDEV_SAMP else 1
 
 
-def spread_value(kind: Int, n: Int, m2: Float64) -> Float64:
-    """The aggregate from a group's count and sum of squared deviations (the caller checks `spread_needs`)."""
+def spread_name(kind: Int) -> String:
+    return "var_pop" if kind == A_VAR_POP else "var_samp" if kind == A_VAR_SAMP else "stddev_pop" if kind == A_STDDEV_POP else "stddev_samp"
+
+
+def spread_value(kind: Int, n: Int, m2: Float64) raises -> Float64:
+    """The aggregate from a group's count and sum of squared deviations (the caller checks `spread_needs`). As DuckDB, a result that is not a
+    finite number (a NaN or an infinity among two or more values, or an overflow) is an error, not a value."""
     var v = m2 / Float64(n) if kind == A_VAR_POP or kind == A_STDDEV_POP else m2 / Float64(n - 1)
     if kind == A_STDDEV_POP or kind == A_STDDEV_SAMP:
-        return sqrt(v)
+        v = sqrt(v)
+    if not isfinite(v):
+        raise Error(spread_name(kind) + " is out of range: the values give a result that is not a finite number (a NaN or an infinity among them, or an overflow), as in DuckDB")
     return v
 
 
@@ -580,6 +587,8 @@ def _piece_moments(p: LP, m: Int, is_float: Bool, div: Float64) -> Tuple[Float64
     var mean = 0.0
     for i in range(m):
         mean += (_dbl(p[i], is_float, div) - mean) / Float64(i + 1)
+    if m == 1:                                     # (DuckDB: one value is a spread of 0, even when the value is NaN or infinite)
+        return (mean, 0.0, 0.0)
     var s1 = 0.0
     var c1 = 0.0
     var s2 = 0.0

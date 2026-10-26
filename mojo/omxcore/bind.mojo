@@ -211,6 +211,10 @@ comptime F_AVG = 5
 comptime F_COUNT_DISTINCT = 6
 comptime F_MEDIAN = 7
 comptime F_QUANTILE = 8
+comptime F_STDDEV_SAMP = 9       # F-177: stddev / stddev_samp, stddev_pop, variance / var_samp, var_pop: a FLOAT from the group's count, mean and squared deviations
+comptime F_STDDEV_POP = 10
+comptime F_VAR_SAMP = 11
+comptime F_VAR_POP = 12
 
 
 struct AggSpec(Copyable, Movable):
@@ -2128,6 +2132,14 @@ struct _Binder(Movable):
                 func = F_AVG
             elif name == "MEDIAN":
                 func = F_MEDIAN
+            elif name == "STDDEV" or name == "STDDEV_SAMP":
+                func = F_STDDEV_SAMP
+            elif name == "STDDEV_POP":
+                func = F_STDDEV_POP
+            elif name == "VARIANCE" or name == "VAR_SAMP":
+                func = F_VAR_SAMP
+            elif name == "VAR_POP":
+                func = F_VAR_POP
             else:
                 func = F_QUANTILE
             var want = 2 if func == F_QUANTILE else 1
@@ -2174,6 +2186,10 @@ struct _Binder(Movable):
                 if not _is_num(a.kind):
                     raise self.err(x.items[0], "avg() needs numbers, found " + kind_name(a.kind, a.scale))
                 rkind = FLOAT.value
+            elif func >= F_STDDEV_SAMP and func <= F_VAR_POP:                  # a float64 whatever the number's kind, as DuckDB
+                if not _is_num(a.kind):
+                    raise self.err(x.items[0], name.lower() + "() needs numbers, found " + kind_name(a.kind, a.scale))
+                rkind = FLOAT.value
             elif func == F_MIN or func == F_MAX or func == F_QUANTILE:
                 rkind = a.kind
                 rscale = a.scale
@@ -2203,7 +2219,7 @@ struct _Binder(Movable):
             if func == F_COUNT and (a.op == B_LIT or a.op == B_STR):
                 func = F_COUNT_STAR
                 arg = -1
-        var hol = func == F_COUNT_DISTINCT or func == F_MEDIAN or func == F_QUANTILE
+        var hol = func == F_COUNT_DISTINCT or func == F_MEDIAN or func == F_QUANTILE or (func >= F_STDDEV_SAMP and func <= F_VAR_POP)
         if (func == F_MIN or func == F_MAX) and rkind == TEXT.value:        # TEXT has no running min: the lowest / highest of its ranked values
             hol = True
             p = 0.0 if func == F_MIN else 1.0
@@ -2232,7 +2248,7 @@ struct _Binder(Movable):
 
 
 def _aggregate_names() -> List[String]:
-    return ["sum", "count", "min", "max", "avg", "median", "quantile_disc"]
+    return ["sum", "count", "min", "max", "avg", "median", "quantile_disc", "stddev", "stddev_samp", "stddev_pop", "variance", "var_samp", "var_pop"]
 
 
 def _scalar_names() -> List[String]:
@@ -2251,7 +2267,8 @@ def _is_scalar_name(up: String) -> Bool:
 
 
 def _is_aggregate_name(up: String) -> Bool:
-    return up == "SUM" or up == "COUNT" or up == "MIN" or up == "MAX" or up == "AVG" or up == "MEAN" or up == "MEDIAN" or up == "QUANTILE_DISC"
+    return up == "SUM" or up == "COUNT" or up == "MIN" or up == "MAX" or up == "AVG" or up == "MEAN" or up == "MEDIAN" or up == "QUANTILE_DISC" or
+           up == "STDDEV" or up == "STDDEV_SAMP" or up == "STDDEV_POP" or up == "VARIANCE" or up == "VAR_SAMP" or up == "VAR_POP"
 
 
 def _has_aggregate(st: SqlStatement, e: Int) -> Bool:

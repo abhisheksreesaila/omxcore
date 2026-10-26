@@ -22,10 +22,11 @@ from .query import (Program, QueryResult, _run_cpu, _run_cpu_job, _run_mat, _key
 from .kernels._fpenv import core_count, par_n
 from .kernels.pipeline_cpu import IP, LP, FP, BP, VEC, E_OVERFLOW, _no_front, _no_keys, pipeline_keyed
 from .kernels.hashagg_cpu import hash_aggregate
-from .holistic import HolStates, HolSpec, HolResult, A_DISTINCT, A_PCT, A_MEDIAN, window_blocks, float_key
+from .holistic import (HolStates, HolSpec, HolResult, A_DISTINCT, A_PCT, A_MEDIAN, A_VAR_POP, A_VAR_SAMP, A_STDDEV_POP, A_STDDEV_SAMP, window_blocks,
+                           float_key)
 from .sql import sql_error, EXPLAIN_NONE, EXPLAIN_ANALYZE
 from .bind import (copy_query, Catalog, SqlSource, BoundQuery, SortKey, bind_sql, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, F_COUNT_STAR,
-                   F_COUNT, F_SUM, F_MIN, F_MAX, F_AVG, F_COUNT_DISTINCT, F_MEDIAN, pow10_checked)
+                   F_COUNT, F_SUM, F_MIN, F_MAX, F_AVG, F_COUNT_DISTINCT, F_MEDIAN, F_STDDEV_SAMP, F_STDDEV_POP, F_VAR_SAMP, F_VAR_POP, pow10_checked)
 from .plan import LogicalPlan, build_plan, executable
 from .post import run_post
 from .join import (needed_columns, side_query, joined_query, virtual_schema, all_needed, needed_after, table_of_column, filter_query, final_query, count_query,
@@ -325,7 +326,7 @@ def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hre
             var f = sp_a.func
             var arg_float = sp_a.arg >= 0 and q.rexprs[sp_a.arg].kind == FLOAT.value
             if sp_a.hol:                                          # the holistic states: count(DISTINCT), median, quantile_disc, min / max of TEXT
-                var present = hres.counts[h][g] > 0
+                var present = hres.counts[h][g] >= (2 if f == F_STDDEV_SAMP or f == F_VAR_SAMP else 1)       # (the sample variants need two values)
                 if f == F_COUNT_DISTINCT:
                     vc.v[i] = Int64(hres.vals[h][g])
                 elif not present:
@@ -375,6 +376,7 @@ def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hre
 def _holistic_states(q: BoundQuery, groups: Int, sp: SqlProgram, dicts: DictAccess, rows: Int) raises -> HolStates:
     var specs = List[HolSpec]()
     var ranks = List[List[Int64]]()
+    var scales = List[Int](length=sp.n_src, fill=0)                # the decimal places of a stddev / variance source
     for _ in range(sp.n_src):
         ranks.append(List[Int64]())
     for a in range(len(q.aggs)):
@@ -382,14 +384,24 @@ def _holistic_states(q: BoundQuery, groups: Int, sp: SqlProgram, dicts: DictAcce
             continue
         ref sa = q.aggs[a]
         var kind = A_DISTINCT if sa.func == F_COUNT_DISTINCT else A_MEDIAN if sa.func == F_MEDIAN else A_PCT
+        if sa.func == F_STDDEV_SAMP:
+            kind = A_STDDEV_SAMP
+        elif sa.func == F_STDDEV_POP:
+            kind = A_STDDEV_POP
+        elif sa.func == F_VAR_SAMP:
+            kind = A_VAR_SAMP
+        elif sa.func == F_VAR_POP:
+            kind = A_VAR_POP
         specs.append(HolSpec(a, kind, sa.p, 0, sp.agg_src[a]))
+        if kind >= A_VAR_POP and q.rexprs[sa.arg].kind == DECIMAL.value:
+            scales[sp.agg_src[a]] = q.rexprs[sa.arg].scale
         if sa.func != F_COUNT_DISTINCT and q.rexprs[sa.arg].kind == TEXT.value and len(ranks[sp.agg_src[a]]) == 0:
             var c = q.rexprs[sa.arg].src                       # (a derived TEXT value: its own dictionary)
             var words = List[String]()
             for k in range(dicts.count(c)):
                 words.append(dicts.word(c, k))
             ranks[sp.agg_src[a]] = text_ranks(words)
-    return HolStates(groups, specs^, ranks^, rows, sp.p.src_float.copy())
+    return HolStates(groups, specs^, ranks^, rows, sp.p.src_float.copy(), scales^)
 
 
 def _run_dense_fused(t: SharedTable, sp: SqlProgram, mask_addr: Int, threads: Int, fj: ArcPointer[FusedJoin], start: Int = 0, stop: Int = -1) raises -> QueryResult:
