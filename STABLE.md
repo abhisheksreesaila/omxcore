@@ -8,21 +8,29 @@ green. Anything newer on `main` may still be in review: don't vendor it.
 
 ## Current stable
 
-**`2585dc9`** (2026-10-26): spread aggregates, quantile bins and ISO weeks; streamed CSV; undo that covers formulas;
-compressed Parquet on every platform. Includes everything in 3d2455d (Apple GPU).
+**`8017543`** (2026-10-26): faster compressed saves (zstd in parallel, a faster Mojo encoder). Includes everything in
+2585dc9 and 3d2455d.
 
 ```sh
 # build the package from a clean copy of the stable commit (never from a working checkout), on Linux as before
-git -C <omxcore> archive 2585dc9 | tar -x -C <scratch>
+git -C <omxcore> archive 8017543 | tar -x -C <scratch>
 cd <scratch> && pixi run bash scripts/build_mojo_pkg.sh      # -> build/omxcore.mojoc (and build/mxframe.mojoc)
-cp build/omxcore.mojoc <app>/vendor/ && echo 2585dc9 > <app>/vendor/OMXCORE_COMMIT
+cp build/omxcore.mojoc <app>/vendor/ && echo 8017543 > <app>/vendor/OMXCORE_COMMIT
 ```
 
-The Mac build commands are unchanged from 3d2455d (below): native build on a Mac for the GPU, no `-D` flag; the Linux
-cross-build links as before. **No new libSystem symbols** (`scripts/check_mac_link.sh` OK). Compression needs no flag
-and no library on macOS / iOS.
+The Mac build commands are unchanged from 3d2455d (below). **No new libSystem symbols** (`scripts/check_mac_link.sh`
+OK). For parallel saves on the Mac, build the app with `-D MXFRAME_JOB_THREADS` (the pthread symbols listed under
+23edc59, nothing more); without it, saves run on one thread.
 
-## What changed since the previous stable (3d2455d), for apps
+## What changed since the previous stable (2585dc9), for apps
+
+| Area | What you get | Ticket |
+|---|---|---|
+| Parallel saves | `write_parquet(..., threads=n)` (0 = every thread the build has) compresses a row group's pages on several threads: Linux always; macOS / iOS with `-D MXFRAME_JOB_THREADS`; otherwise serial. The file is byte-identical for any thread count. 2M rows, zstd with the Mojo codec: 0.60 s before, 0.36 s on one thread, 0.06-0.07 s on 12 threads (libzstd: 0.22 s / 0.035 s). Saves of a streamed Frame use at most 4 threads (memory bound) | F-187 |
+| Pages | big columns are written as ~1 MB data pages (every build, Linux included): pyarrow and DuckDB read them, and files open faster (0.040 s to 0.022 s) because pages decode in parallel | F-187 |
+| Size | zstd files within 0.2% of libzstd level 3 | F-187 |
+
+## What changed in 2585dc9 (since 3d2455d), for apps
 
 | Area | What you get | Ticket |
 |---|---|---|
@@ -98,6 +106,7 @@ and a repro for a bug. Needs that are generic go into the engine; app-specific o
 ## History
 | Stable | Date | Highlights |
 |---|---|---|
+| `8017543` | 2026-10-26 | parallel zstd saves, faster Mojo encoder, ~1 MB pages |
 | `2585dc9` | 2026-10-26 | stddev / variance, quantile bins, ISO week; streamed CSV; undo for formulas; compressed Parquet on the Mac |
 | `3d2455d` | 2026-10-25 | Apple GPU (Metal): Int64 word, atomic-free modes, 32 KB; `gpu_device()`; the omxcore name |
 | `23edc59` | 2026-10-20 | background jobs (cancel, progress), range aggregates and block reads |
