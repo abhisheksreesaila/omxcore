@@ -37,7 +37,7 @@ Needs: none · Agreed 2026-10-15 · Report: `docs/bench/gpu-correctness-sf1.md`
 - [x] a GPU path that can't be made correct is listed in `auto_mode.KNOWN_BROKEN_GPU`: none needed, it stays empty
 - [ ] open: statuses cover out-of-memory only (a real OOM sort and an oversized request are tested). A real fault such as `CUDA_ERROR_ILLEGAL_ADDRESS` kills the process (core dump) and no status comes back; the Mojo `ctx.synchronize()` of the other kernels is assumed to raise on OOM like the sort's does (not probed)
 
-## F-056 Data bigger than GPU memory never fails [doing]
+## F-056 Data bigger than GPU memory never fails [doing] (owner 2026-10-27: next after F-188, on the owner's go)
 Needs: F-055 · Spec: `docs/spec-auto-mode.md` Phase 4 · Agreed 2026-10-15 ("96 GB on a 48 GB machine must not just say out of memory; trust is lost")
 - [x] research first, written to `docs/research/gpu-out-of-core.md` and `docs/research/heavydb.md` (HeavyDB is the closest open-source GPU-native competitor; mine it for algorithms): how RAPIDS (cuDF spilling, dask-cudf, the cuDF-Polars streaming executor), BlazingSQL and HeavyDB handle a working set larger than the GPU, and which of their algorithms fit our morsel design
 - [x] `device="gpu"` and `"auto"` on a working set larger than free GPU memory finish with results equal to `cpu` (test with an artificially small GPU memory budget, so no 96 GB data is needed): step 1 for a piece, step 2 for a Parquet source bigger than GPU memory and RAM
@@ -1736,7 +1736,7 @@ NaN / -0.0 as the engine's other aggregates. Errors are plain sentences. Rules, 
 - [x] the Mac link check stays green (no new symbol outside the job-threads list)
 - Built: `fan.mojo` (dispatcher), columns cut into ~1 MB data pages in every build (files change on Linux too; read back by pyarrow / DuckDB, opens faster: 0.040 s to 0.022 s); all threads 0.06-0.07 s vs libzstd 0.035 s. Streamed saves capped at `STREAM_WRITE_THREADS = 4` (memory bound). Review: safety clean (477 adversarial encoder inputs, no heap error; decoder unchanged; pthread fan joins and frees), must-fix was the missed 1.5x target, accepted here.
 
-## F-188 Parallel Parquet save bounded by the memory budget [todo]
+## F-188 Parallel Parquet save bounded by the memory budget [doing]
 - [ ] the pages a parallel save holds in flight are bounded by the budget (row-group bytes), not by a fixed thread cap (`STREAM_WRITE_THREADS = 4` is the workaround from F-187; the streamed-save test peaks at 105-108 MB of a 111 MB bound)
 
 Mapped to existing tickets: #7 result cache → F-160; #12 count distinct / median on the GPU and streamed in parallel, approximate or spilling → F-167 (+ F-163 for spill); #14 sort that spills (multi-key sort exists since F-152) → F-167 / F-163; #17 window functions → F-168; #18 versions and the time machine → M9 (parked, Delta-Lake style).
