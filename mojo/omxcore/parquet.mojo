@@ -710,8 +710,7 @@ struct ParquetWriter(Movable):
         for k in range(n):                                   # (the first bad page in file order raises, whatever the threads or the budget)
             if outs[k].error.byte_length() > 0:
                 raise Error(outs[k].error)
-        _ = cost[n]
-        _ = jobs[0]
+        _ = len(cost) + len(jobs) + len(chunks)              # (the lists the task read by address live to here; an empty one is fine)
         self.groups.append(chunks^)
         self.rows.append(hi - lo)
         self.total += hi - lo

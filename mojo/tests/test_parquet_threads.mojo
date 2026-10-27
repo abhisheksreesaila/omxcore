@@ -3,7 +3,7 @@
 # bytes, and read_parquet must give back the table that was saved. A column that cannot be written raises the same error for
 # every count and leaves no file behind.
 from std.pathlib import Path
-from omxcore import (Table, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, write_parquet, read_parquet, UNCOMPRESSED, SNAPPY, ZSTD)
+from omxcore import (Table, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, write_parquet, read_parquet, ParquetWriter, UNCOMPRESSED, SNAPPY, ZSTD)
 
 
 def expect(cond: Bool, what: String) raises:
@@ -133,4 +133,14 @@ def main() raises:
         expect(not Path("bad.parquet").exists(), "no file is left behind (threads " + String(c) + ")")
         msgs.append(msg)
     expect(msgs[0] == msgs[1] and msgs[1] == msgs[2], "the error does not depend on the thread count")
+    # F-188: a row group with no pages at all (a writer with no columns) and one with no rows, on several threads
+    var none = Table.empty()
+    var w0 = ParquetWriter("none.parquet", none, List[Bool](), ZSTD)
+    w0.threads = 4
+    w0.write_group(none)
+    w0.abort()
+    var empty = table(0)
+    for c in [1, 4]:
+        write_parquet("empty.parquet", empty, "{}", ZSTD, threads=c)
+        expect(read_parquet("empty.parquet").table.rows() == 0, "a table with no rows reads back empty (threads " + String(c) + ")")
     print("ok")

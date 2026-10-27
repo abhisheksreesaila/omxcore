@@ -1530,6 +1530,17 @@ def budget_probe(request, tmp_path_factory):
     return out
 
 
+@pytest.fixture
+def scratch():
+    """Big files go under ~/.cache (not the shared /tmp quota) and are removed at the end of the case."""
+    import shutil, tempfile
+    root = Path(os.environ.get("MXFRAME_TEST_TMPDIR", Path.home() / ".cache" / "mxframe-test-tmp"))
+    root.mkdir(parents=True, exist_ok=True)
+    d = Path(tempfile.mkdtemp(prefix="f188-", dir=root))
+    yield d
+    shutil.rmtree(d, ignore_errors=True)
+
+
 def run_budget_probe(probe, tmp_path, rows, threads, budget, data):
     path = tmp_path / f"b{threads}_{budget}_{data}.parquet"
     p = subprocess.run([str(probe), str(rows), str(path), str(threads), str(budget), data], capture_output=True, text=True)
@@ -1540,7 +1551,8 @@ def run_budget_probe(probe, tmp_path, rows, threads, budget, data):
 
 
 @pytest.mark.parametrize("data", ["random", "compressible"])
-def test_a_save_with_many_threads_holds_pages_within_its_budget(budget_probe, tmp_path, data):
+def test_a_save_with_many_threads_holds_pages_within_its_budget(budget_probe, scratch, data):
+    tmp_path = scratch
     """A 125 MB table in one row group saved on 24 threads: the memory the save adds stays within the budget it was given (plus 2 MB), for
     incompressible and for compressible values alike (the coder's match tables and buffers are counted in a page's cost), with libzstd and with
     the Mojo coder; the bytes written do not depend on the budget."""
@@ -1557,7 +1569,8 @@ def test_a_save_with_many_threads_holds_pages_within_its_budget(budget_probe, tm
     assert len(set(files.values())) == 1 and files[1 * MB] == (tmp_path / f"b1_{4 * MB}_{data}.parquet").read_bytes()
 
 
-def test_without_a_bound_a_save_holds_the_pages_of_its_row_group(budget_probe, tmp_path):
+def test_without_a_bound_a_save_holds_the_pages_of_its_row_group(budget_probe, scratch):
+    tmp_path = scratch
     """The measure sees what the budget bounds: with a 1 GB budget the same save adds over 100 MB."""
     big = run_budget_probe(budget_probe, tmp_path, 2_000_000, 24, 1024 * 2**20, "random")
     assert big["growth_kb"] * 1024 > 100 * 2**20, big
