@@ -81,6 +81,29 @@ def main() raises:
         expect(back.table.cols[0].values[24_999] == 1_024_999, "id of the last row: " + String(back.table.cols[0].values[24_999]))
         expect(back.table.cols[3].values[7] == 19_000, "day of row 7: " + String(back.table.cols[3].values[7]))
 
+    # one row group with columns of several pages (a page holds about 1 MB: 131,072 INT rows, 262,144 DATE rows): the pages of a column are
+    # made side by side and laid out in order; every value reads back
+    var m = 300_000
+    var wide = table(m)
+    write_parquet("one.parquet", wide, "{}", ZSTD, threads=1)
+    var want_pages = bytes_of("one.parquet")
+    for c in counts:
+        write_parquet("many.parquet", wide, "{}", ZSTD, threads=c)
+        var got = bytes_of("many.parquet")
+        var same = len(got) == len(want_pages)
+        if same:
+            for i in range(len(got)):
+                if got[i] != want_pages[i]:
+                    same = False
+                    break
+        expect(same, "multi-page: threads " + String(c) + " writes the single-thread file's bytes")
+    var pages = read_parquet("many.parquet")
+    expect(pages.table.rows() == m, "multi-page rows: " + String(pages.table.rows()))
+    for r in [0, 1, 131_071, 131_072, 262_143, 262_144, 299_999]:
+        for col in range(wide.columns()):
+            expect(pages.table.get(col, r) == wide.get(col, r), "multi-page: column " + String(col) + " row " + String(r) + " reads back")
+    expect(pages.table.text_of(4, Int(pages.table.get(4, 299_999))) == wide.text_of(4, Int(wide.get(4, 299_999))), "multi-page: text of the last row")
+
     # a column that cannot be written: one error, the same for every count, and no file (nor temporary file) is left
     var bad = table(16_000, with_bad_decimal=True)
     var msgs = List[String]()

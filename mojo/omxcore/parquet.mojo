@@ -11,7 +11,7 @@ How omxcore's kinds are stored (any Parquet reader understands them):
   TEXT     BYTE_ARRAY (STRING): a dictionary page with the column's words, data pages of dictionary indices
 A column with nulls is OPTIONAL: its definition levels are the validity bitmap's bits (Parquet packs them the same
 way, least significant first), written as bit-packed runs. Pages are compressed with zstd (default), snappy or not
-at all; one data page per column per row group. `write_parquet` writes to `path + ".tmp"` and renames it into place,
+at all; a column of a row group is cut into data pages of about 1 MB (PAGE_RAW_BYTES). `write_parquet` writes to `path + ".tmp"` and renames it into place,
 so a crash or a refused table never destroys an existing file.
 
 Reading takes what other writers produce: signed and unsigned integers of 8 to 64 bits (a UINT_64 past the int64 range
@@ -251,25 +251,41 @@ def _check_page(col: Column, uncompressed: Int, compressed: Int) raises:
                     " (use a smaller row_group_rows)")
 
 
-def _column_pages(mut file: List[UInt8], col: Column, lo: Int, hi: Int, optional: Bool, codec: Int) raises -> _Chunk:
-    """Appends one column chunk (rows lo..hi) to `file`."""
-    if hi - lo > INT32_MAX:
-        raise Error("column `" + col.name + "`: " + String(hi - lo) + " rows in one row group do not fit a Parquet page (use a smaller row_group_rows)")
-    var chunk = _Chunk(len(file), 0, -1, 0, 0, hi - lo)
-    var start = len(file)
-    if col.kind == TEXT:                                # the dictionary page: every word, PLAIN
-        var d = List[UInt8]()
-        for word in col.dict[].words:
-            var bytes = word.as_bytes()
-            _put32(d, len(bytes))
-            for c in bytes:
-                d.append(c)
-        var cd = _compress(codec, d)
-        _check_page(col, len(d), len(cd))
-        chunk.dict_offset = len(file)
-        _page_header(file, PAGE_DICTIONARY, len(d), len(cd), len(col.dict[].words), ENC_PLAIN)
-        chunk.uncompressed += len(file) - chunk.dict_offset + len(d)       # header + page, uncompressed
-        file.extend(cd^)
+comptime PAGE_RAW_BYTES = 1 << 20        # a data page holds about this much before compression (F-187): a big column is cut into pages,
+                                          # which threads compress side by side. Readers take any number of pages (every other writer makes them).
+
+
+def _page_rows(col: Column) -> Int:
+    """Rows in a full data page of `col`: PAGE_RAW_BYTES of its values, a multiple of 8 (the bit-packed runs count groups of 8)."""
+    var bits = 64
+    if col.kind == TEXT:
+        bits = max(_bit_width(len(col.dict[].words) - 1), 1)
+    elif col.kind == BOOL:
+        bits = 1
+    elif col.kind == DATE:
+        bits = 32
+    return max(8, ((PAGE_RAW_BYTES * 8) // bits) & ~7)
+
+
+def _dict_page(mut file: List[UInt8], col: Column, codec: Int) raises -> Int:
+    """Appends the dictionary page of a TEXT column (every word, PLAIN); returns its header plus uncompressed bytes."""
+    var d = List[UInt8]()
+    for word in col.dict[].words:
+        var bytes = word.as_bytes()
+        _put32(d, len(bytes))
+        for c in bytes:
+            d.append(c)
+    var cd = _compress(codec, d)
+    _check_page(col, len(d), len(cd))
+    var at = len(file)
+    _page_header(file, PAGE_DICTIONARY, len(d), len(cd), len(col.dict[].words), ENC_PLAIN)
+    var uncompressed = len(file) - at + len(d)
+    file.extend(cd^)
+    return uncompressed
+
+
+def _data_page(mut file: List[UInt8], col: Column, lo: Int, hi: Int, optional: Bool, codec: Int) raises -> Int:
+    """Appends one data page (rows lo..hi of `col`); returns its header plus uncompressed bytes."""
     var body = List[UInt8]()
     if optional:                                        # definition levels: the validity bits, bit-packed runs
         var levels = List[UInt8]()
@@ -338,12 +354,11 @@ def _column_pages(mut file: List[UInt8], col: Column, lo: Int, hi: Int, optional
                 _put64(body, v)
     var cb = _compress(codec, body)
     _check_page(col, len(body), len(cb))
-    chunk.data_offset = len(file)
+    var at = len(file)
     _page_header(file, PAGE_DATA, len(body), len(cb), hi - lo, ENC_RLE_DICTIONARY if col.kind == TEXT else ENC_PLAIN)
-    chunk.uncompressed += len(file) - chunk.data_offset + len(body)
+    var uncompressed = len(file) - at + len(body)
     file.extend(cb^)
-    chunk.compressed = len(file) - start
-    return chunk^
+    return uncompressed
 
 
 def _write(path: String, t: Table, metadata: String, requested: Int, row_group_rows: Int, job: JobCtl = JobCtl(), threads: Int = 0) raises:
@@ -377,37 +392,48 @@ def _write(path: String, t: Table, metadata: String, requested: Int, row_group_r
         raise e^
 
 
-struct _ColOut(Movable):
-    """One column chunk of a row group, as a thread made it."""
-    var bytes: List[UInt8]           # its pages, headers included; offsets in `chunk` count from the first byte
-    var chunk: _Chunk
-    var error: String                # set when the column cannot be written (checked in column order, so the error never depends on timing)
+@fieldwise_init
+struct _PageJob(Copyable, Movable):
+    """One page to make: rows lo..hi of column `col`, or the column's dictionary."""
+    var col: Int
+    var lo: Int
+    var hi: Int
+    var dict: Bool
 
-    def __init__(out self, var bytes: List[UInt8], var chunk: _Chunk, var error: String):
-        self.bytes = bytes^
-        self.chunk = chunk^
-        self.error = error^
+
+struct _PageOut(Movable):
+    """A page as a thread made it: header and compressed bytes."""
+    var bytes: List[UInt8]
+    var uncompressed: Int            # header plus the page before compression
+    var error: String                # set when the page cannot be written (checked in page order, so the error never depends on timing)
+
+    def __init__(out self):
+        self.bytes = List[UInt8]()
+        self.uncompressed = 0
+        self.error = String()
 
 
 @fieldwise_init
-struct _ColumnTask(ParTask):
-    """Column `i` of rows lo..hi into slot `i` of an array of `_ColOut`; nothing is shared but the table, which is only read."""
+struct _PageTask(ParTask):
+    """Page `i` of the jobs into slot `i` of the outputs; nothing is shared but the table, which is only read."""
     var table: Int                   # address of the Table
     var optional: Int                # address of the Bool per column
-    var outs: Int                    # address of the first _ColOut
-    var lo: Int
-    var hi: Int
+    var jobs: Int                    # address of the first _PageJob
+    var outs: Int                    # address of the first _PageOut
     var codec: Int
 
     def run(self, i: Int):
         var t = UnsafePointer[Table, MutAnyOrigin](unsafe_from_address=self.table)
         var opt = UnsafePointer[Bool, MutAnyOrigin](unsafe_from_address=self.optional)
-        var slot = UnsafePointer[_ColOut, MutAnyOrigin](unsafe_from_address=self.outs) + i
+        var job = UnsafePointer[_PageJob, MutAnyOrigin](unsafe_from_address=self.jobs) + i
+        var slot = UnsafePointer[_PageOut, MutAnyOrigin](unsafe_from_address=self.outs) + i
         try:
             var buf = List[UInt8]()
-            var ch = _column_pages(buf, t[].cols[i], self.lo, self.hi, opt[i], self.codec)
+            if job[].dict:
+                slot[].uncompressed = _dict_page(buf, t[].cols[job[].col], self.codec)
+            else:
+                slot[].uncompressed = _data_page(buf, t[].cols[job[].col], job[].lo, job[].hi, opt[job[].col], self.codec)
             slot[].bytes = buf^
-            slot[].chunk = ch^
         except e:
             slot[].error = String(e)
 
@@ -473,24 +499,42 @@ struct ParquetWriter(Movable):
         if t.columns() != self.schema.columns():
             raise Error("a row group has " + String(t.columns()) + " columns, the file " + String(self.schema.columns()))
         var cols = t.columns()
-        var outs = List[_ColOut]()
-        for _ in range(cols):
-            outs.append(_ColOut(List[UInt8](), _Chunk(0, 0, -1, 0, 0, 0), String()))
-        # every column's pages are built and compressed on their own (F-187), then laid out in column order: the same bytes for any thread count
-        run_tasks(_ColumnTask(Int(UnsafePointer(to=t)), Int(self.optional.unsafe_ptr()), Int(outs.unsafe_ptr()), lo, hi, self.codec), cols, self.threads)
-        for c in range(cols):                                # (a group with a bad column writes nothing)
-            if outs[c].error.byte_length() > 0:
-                raise Error(outs[c].error)
-        var chunks = List[_Chunk]()
+        var jobs = List[_PageJob]()                          # per column: its dictionary page, then its data pages, in file order
         for c in range(cols):
-            var ch = outs[c].chunk.copy()
-            ch.offset += self.offset                         # the column's bytes start where the file stands
-            ch.data_offset += self.offset
-            if ch.dict_offset >= 0:
-                ch.dict_offset += self.offset
-            self.file.write_bytes(Span(outs[c].bytes))
-            self.offset += len(outs[c].bytes)
-            chunks.append(ch^)
+            if t.cols[c].kind == TEXT:
+                jobs.append(_PageJob(c, 0, 0, True))
+            var step = _page_rows(t.cols[c])
+            var r = lo
+            while True:                                      # (a group with no rows still has one page)
+                var e = min(r + step, hi)
+                jobs.append(_PageJob(c, r, e, False))
+                r = e
+                if r >= hi:
+                    break
+        var outs = List[_PageOut]()
+        for _ in range(len(jobs)):
+            outs.append(_PageOut())
+        # every page is built and compressed on its own (F-187), then laid out in order: the same bytes for any thread count
+        run_tasks(_PageTask(Int(UnsafePointer(to=t)), Int(self.optional.unsafe_ptr()), Int(jobs.unsafe_ptr()), Int(outs.unsafe_ptr()), self.codec),
+                  len(jobs), self.threads)
+        for j in range(len(jobs)):                           # (a group with a bad page writes nothing)
+            if outs[j].error.byte_length() > 0:
+                raise Error(outs[j].error)
+        var chunks = List[_Chunk]()
+        for _ in range(cols):
+            chunks.append(_Chunk(-1, 0, -1, 0, 0, hi - lo))
+        for j in range(len(jobs)):
+            var c = jobs[j].col
+            if chunks[c].offset < 0:
+                chunks[c].offset = self.offset
+            if jobs[j].dict:
+                chunks[c].dict_offset = self.offset
+            elif chunks[c].data_offset == 0:
+                chunks[c].data_offset = self.offset
+            chunks[c].uncompressed += outs[j].uncompressed
+            chunks[c].compressed += len(outs[j].bytes)
+            self.file.write_bytes(Span(outs[j].bytes))
+            self.offset += len(outs[j].bytes)
         self.groups.append(chunks^)
         self.rows.append(hi - lo)
         self.total += hi - lo

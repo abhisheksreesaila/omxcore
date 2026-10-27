@@ -76,10 +76,20 @@ def run_tasks[T: ParTask](task: T, n: Int, threads: Int = 0):
                 task.run(i)
             return
 
-        def work(i: Int) {imm}:
-            task.run(i)
+        var counter = unsafe_alloc[Int64](1)             # the workers take the next task as they finish one: the pages differ a lot in cost
+        counter[0] = 0
+        var cp = Int(counter)
 
-        par_n(work, n, workers)
+        def work(w: Int) {imm}:
+            var next = _P(unsafe_from_address=cp)
+            while True:
+                var i = Int(_A.fetch_add(next, 1))
+                if i >= n:
+                    return
+                task.run(i)
+
+        par_n(work, workers, workers)
+        counter.free()
     elif not THREADS:
         for i in range(n):
             task.run(i)
