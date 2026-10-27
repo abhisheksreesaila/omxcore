@@ -28,7 +28,7 @@ from .expr import (Expr, Node, col, least, greatest, N_COL, N_LIT, N_LITF, N_DIV
                    N_LEAST, N_GREATEST, N_LT, N_LE, N_GT, N_GE, N_EQ, N_NE, N_AND, N_OR, N_NOT, N_BOOL2INT, N_SCALE_TO)
 from .csv import _parse_int, _parse_decimal, _parse_date, _parse_bool, _parse_float, F_OK, F_RANGE, F_NAN_BITS
 from .holistic import float_key
-from .parquet import ParquetScan, ParquetWriter, write_parquet, ZSTD, DEFAULT_ROW_GROUP
+from .parquet import ParquetScan, ParquetWriter, write_parquet, ZSTD, DEFAULT_ROW_GROUP, STREAM_WRITE_THREADS
 
 comptime SET = 0
 comptime APPEND = 1
@@ -1000,6 +1000,7 @@ struct Frame(Movable):
         for c in range(stored):
             all.append(c)
         var w = ParquetWriter(path, out, optional, compression)
+        w.threads = STREAM_WRITE_THREADS
         try:
             var changed = self.changed_rows()                # ascending; the rows whose values are not the file's
             var ci = 0

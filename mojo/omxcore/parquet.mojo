@@ -87,6 +87,9 @@ comptime ZSTD = 6
 comptime NO_CODECS = is_defined["MXFRAME_NO_CODECS"]() or not CompilationTarget.is_linux()    # no C codec libraries: codec.mojo
 
 comptime DEFAULT_ROW_GROUP = 1 << 20
+comptime STREAM_WRITE_THREADS = 4       # most threads that compress a streamed save (Frame over a scan): its memory is one row group whatever the
+                                        # file's size, and workers add to it (the test's 332 MB file, 250k-row groups, measured: 1 thread 101 MB at the peak,
+                                        # 2 to 4 threads 105 to 108 MB, 12 threads 116 MB; tests/test_mojo_parquet.py bounds that peak at a third of the file)
 comptime INT32_MAX = 2147483647
 comptime MAX_DECIMAL = 1_000_000_000_000_000_000      # DECIMAL(18, s): the stored integer has at most 18 digits
 
