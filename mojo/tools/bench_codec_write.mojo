@@ -1,5 +1,5 @@
-# bench_codec_write <rows> <path>: saves a realistic orders table with each codec and reads it back, printing bytes and best-of-three
-# seconds (F-180). Build it normally for libzstd / libsnappy, or with -D MXFRAME_NO_CODECS for the Mojo codecs, and compare.
+# bench_codec_write <rows> <path> [threads]: saves a realistic orders table with each codec and reads it back, printing bytes and best-of-five
+# seconds (F-180); threads (F-187): the most threads that compress, 0 or none given: all the build has, 1: one. Build it normally for libzstd / libsnappy, or with -D MXFRAME_NO_CODECS for the Mojo codecs, and compare.
 from std.sys import argv
 from std.time import perf_counter_ns
 from omxcore import Table, INT, DECIMAL, TEXT, DATE, BOOL, write_parquet, read_parquet, UNCOMPRESSED, SNAPPY, ZSTD
@@ -43,6 +43,7 @@ def main() raises:
     var args = argv()
     var n = Int(String(args[1]))
     var path = String(args[2])
+    var threads = Int(String(args[3])) if len(args) > 3 else 0
     var t = orders(n)
     var plain = 0
     for which in range(3):
@@ -50,9 +51,9 @@ def main() raises:
         var name = "none" if which == 0 else ("snappy" if which == 1 else "zstd")
         var best_w = 1 << 62
         var best_r = 1 << 62
-        for _ in range(3):
+        for _ in range(5):
             var a = perf_counter_ns()
-            write_parquet(path, t, "", codec)
+            write_parquet(path, t, "", codec, threads=threads)
             var b = perf_counter_ns()
             var back = read_parquet(path)
             var c = perf_counter_ns()

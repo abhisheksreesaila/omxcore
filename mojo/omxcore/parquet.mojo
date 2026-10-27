@@ -284,74 +284,119 @@ def _dict_page(mut file: List[UInt8], col: Column, codec: Int) raises -> Int:
     return uncompressed
 
 
-def _data_page(mut file: List[UInt8], col: Column, lo: Int, hi: Int, optional: Bool, codec: Int) raises -> Int:
-    """Appends one data page (rows lo..hi of `col`); returns its header plus uncompressed bytes."""
+comptime _BytePtr = UnsafePointer[UInt8, MutAnyOrigin]
+comptime _WordPtr = UnsafePointer[Int64, MutAnyOrigin]
+
+
+def _page_body(col: Column, lo: Int, hi: Int, optional: Bool) raises -> List[UInt8]:
+    """The bytes of a data page before compression: definition levels (an OPTIONAL column), then the values of the rows that are not null."""
+    var n = hi - lo
+    var has = len(col.validity) > 0
+    var vp = _BytePtr(unsafe_from_address=Int(col.validity.unsafe_ptr()))
+    var vals = _WordPtr(unsafe_from_address=Int(col.values.unsafe_ptr()))
+    var present = n
+    if has:
+        present = 0
+        for row in range(lo, hi):
+            present += Int((vp[row >> 3] >> UInt8(row & 7)) & 1)
     var body = List[UInt8]()
     if optional:                                        # definition levels: the validity bits, bit-packed runs
         var levels = List[UInt8]()
-        var n = hi - lo
         var groups = (n + 7) // 8
         _put_varint(levels, (groups << 1) | 1)
+        var at = len(levels)
+        levels.resize(at + groups, 0)
+        var lp = _BytePtr(unsafe_from_address=Int(levels.unsafe_ptr())) + at
         for g in range(groups):
             var byte = UInt8(0)
-            for k in range(8):
-                var row = lo + 8 * g + k
-                if row < hi and not col.is_null(row):
-                    byte |= UInt8(1) << UInt8(k)
-            levels.append(byte)
+            if lo % 8 == 0 and has:                     # the validity bitmap is the levels' layout: copy the byte, mask what is past `hi`
+                byte = vp[(lo >> 3) + g]
+                if g == groups - 1 and n % 8 != 0:
+                    byte &= UInt8((1 << (n % 8)) - 1)
+            else:
+                for k in range(8):
+                    var row = lo + 8 * g + k
+                    if row < hi and ((not has) or ((vp[row >> 3] >> UInt8(row & 7)) & 1) != 0):
+                        byte |= UInt8(1) << UInt8(k)
+            lp[g] = byte
         _put32(body, len(levels))
         body.extend(levels^)
     if col.kind == TEXT:                                # dictionary indices: bit width, then bit-packed runs
         var w = max(_bit_width(len(col.dict[].words) - 1), 1)
         body.append(UInt8(w))
-        var idx = List[Int64]()
-        for row in range(lo, hi):
-            if not col.is_null(row):
-                idx.append(col.values[row])
-        var groups = (len(idx) + 7) // 8
+        var groups = (present + 7) // 8
         _put_varint(body, (groups << 1) | 1)
+        var at = len(body)
+        body.resize(at + groups * w, 0)                 # 8 values of w bits are w bytes
+        var bp = _BytePtr(unsafe_from_address=Int(body.unsafe_ptr())) + at
         var acc: UInt64 = 0
         var nbits = 0
-        for i in range(groups * 8):
-            var v = UInt64(idx[i]) if i < len(idx) else 0
-            acc |= v << UInt64(nbits)
+        var o = 0
+        var left = groups * 8 - present                 # the last group is padded with zeros
+        for row in range(lo, hi):
+            if has and ((vp[row >> 3] >> UInt8(row & 7)) & 1) == 0:
+                continue
+            acc |= UInt64(vals[row]) << UInt64(nbits)
             nbits += w
             while nbits >= 8:
-                body.append(UInt8(acc & 0xFF))
+                bp[o] = UInt8(acc & 0xFF)
+                o += 1
+                acc >>= 8
+                nbits -= 8
+        for _ in range(left):
+            nbits += w
+            while nbits >= 8:
+                bp[o] = UInt8(acc & 0xFF)
+                o += 1
                 acc >>= 8
                 nbits -= 8
         if nbits > 0:
-            body.append(UInt8(acc & 0xFF))
+            bp[o] = UInt8(acc & 0xFF)
     elif col.kind == BOOL:                              # PLAIN booleans: one bit each, least significant first
-        var acc = 0
+        var at = len(body)
+        body.resize(at + (present + 7) // 8, 0)
+        var bp = _BytePtr(unsafe_from_address=Int(body.unsafe_ptr())) + at
         var k = 0
         for row in range(lo, hi):
-            if col.is_null(row):
+            if has and ((vp[row >> 3] >> UInt8(row & 7)) & 1) == 0:
                 continue
-            if col.values[row] != 0:
-                acc |= 1 << k
+            if vals[row] != 0:
+                bp[k >> 3] |= UInt8(1) << UInt8(k & 7)
             k += 1
-            if k == 8:
-                body.append(UInt8(acc))
-                acc = 0
-                k = 0
-        if k > 0:
-            body.append(UInt8(acc))
     elif col.kind == DATE:
+        var at = len(body)
+        body.resize(at + present * 4, 0)
+        var bp = _BytePtr(unsafe_from_address=Int(body.unsafe_ptr())) + at
+        var o = 0
         for row in range(lo, hi):
-            if not col.is_null(row):
-                var v = col.values[row]
-                if v < Int64(Int32.MIN) or v > Int64(Int32.MAX):
-                    raise Error("column `" + col.name + "`: day " + String(v) + " does not fit a Parquet DATE")
-                _put32(body, Int(v))
+            if has and ((vp[row >> 3] >> UInt8(row & 7)) & 1) == 0:
+                continue
+            var v = vals[row]
+            if v < Int64(Int32.MIN) or v > Int64(Int32.MAX):
+                raise Error("column `" + col.name + "`: day " + String(v) + " does not fit a Parquet DATE")
+            (bp + o).bitcast[Int32]().store[alignment=1](Int32(v))
+            o += 4
     else:                                               # INT, DECIMAL, FLOAT: PLAIN int64 (a FLOAT's bits are the DOUBLE's)
+        var at = len(body)
+        body.resize(at + present * 8, 0)
+        var bp = _BytePtr(unsafe_from_address=Int(body.unsafe_ptr())) + at
+        var o = 0
+        var decimal = col.kind == DECIMAL
         for row in range(lo, hi):
-            if not col.is_null(row):
-                var v = col.values[row]
-                if col.kind == DECIMAL and (v >= Int64(MAX_DECIMAL) or v <= -Int64(MAX_DECIMAL)):
-                    raise Error("column `" + col.name + "`: " + String(v) + " does not fit DECIMAL(18, " +
-                                String(col.scale) + ") (more than 18 digits)")
-                _put64(body, v)
+            if has and ((vp[row >> 3] >> UInt8(row & 7)) & 1) == 0:
+                continue
+            var v = vals[row]
+            if decimal and (v >= Int64(MAX_DECIMAL) or v <= -Int64(MAX_DECIMAL)):
+                raise Error("column `" + col.name + "`: " + String(v) + " does not fit DECIMAL(18, " +
+                            String(col.scale) + ") (more than 18 digits)")
+            (bp + o).bitcast[Int64]().store[alignment=1](v)
+            o += 8
+    return body^
+
+
+def _data_page(mut file: List[UInt8], col: Column, lo: Int, hi: Int, optional: Bool, codec: Int) raises -> Int:
+    """Appends one data page (rows lo..hi of `col`); returns its header plus uncompressed bytes."""
+    var body = _page_body(col, lo, hi, optional)
     var cb = _compress(codec, body)
     _check_page(col, len(body), len(cb))
     var at = len(file)

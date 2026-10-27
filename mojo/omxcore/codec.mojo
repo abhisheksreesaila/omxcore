@@ -29,6 +29,17 @@ def _ptr(addr: Int) -> Ptr:
     return Ptr(unsafe_from_address=addr)
 
 
+comptime MIPtr = UnsafePointer[Int, MutAnyOrigin]
+
+
+def _ip(ref l: List[Int]) -> MIPtr:
+    return MIPtr(unsafe_from_address=Int(l.unsafe_ptr()))
+
+
+def _bp(ref l: List[UInt8]) -> Ptr:
+    return _ptr(Int(l.unsafe_ptr()))
+
+
 @always_inline
 def _load32(p: Ptr, i: Int) -> UInt32:
     return (p + i).bitcast[UInt32]().load[alignment=1]()
@@ -1105,6 +1116,38 @@ struct _BitOut:
         return out^
 
 
+struct _BitW:
+    """Bits written from the low end of each byte upward into a buffer the caller sized, 32 at a time."""
+    var base: Int                   # the buffer's address
+    var pos: Int
+    var acc: UInt64
+    var n: Int                      # bits in `acc` (< 32 between calls)
+
+    def __init__(out self, base: Int):
+        self.base = base
+        self.pos = 0
+        self.acc = 0
+        self.n = 0
+
+    @always_inline
+    def add(mut self, v: Int, k: Int):
+        self.acc |= (UInt64(v) & ((UInt64(1) << UInt64(k)) - 1)) << UInt64(self.n)
+        self.n += k
+        if self.n >= 32:
+            (_ptr(self.base) + self.pos).bitcast[UInt32]().store[alignment=1](UInt32(self.acc & 0xFFFFFFFF))
+            self.pos += 4
+            self.acc >>= 32
+            self.n -= 32
+
+    def finish(mut self) -> Int:
+        """Ends a backwards-read stream (a 1 bit, zeros to a whole byte); the bytes written."""
+        self.add(1, 1)
+        var rest = (self.n + 7) // 8
+        for k in range(rest):
+            _ptr(self.base)[self.pos + k] = UInt8((self.acc >> UInt64(8 * k)) & 0xFF)
+        return self.pos + rest
+
+
 struct _FseEnc(Copyable, Movable):
     """What encoding with an FSE table needs: for each symbol where its states are and how many bits it costs."""
     var log: Int
@@ -1387,20 +1430,25 @@ def _fse_compress_weights(w: List[Int], nw: Int) raises -> List[UInt8]:
 
 
 def _huf_stream(lens: List[Int], codes: List[Int], p: Ptr, start: Int, count: Int) -> List[UInt8]:
-    var bw = _BitOut()
+    var out = List[UInt8](unsafe_uninit_length=count * 2 + 16)           # at most HUF_MAX_BITS (11) bits a symbol
+    var bw = _BitW(Int(out.unsafe_ptr()))
+    var lp = _ip(lens)
+    var cp = _ip(codes)
     for i in range(start + count - 1, start - 1, -1):
         var s = Int(p[i])
-        bw.add(codes[s], lens[s])
-    bw.close_stream()
-    return bw.take()
+        bw.add(cp[s], lp[s])
+    var size = bw.finish()
+    out.resize(size, 0)
+    return out^
 
 
 def _huf_compress(p: Ptr, n: Int, mut tree_and_streams: List[UInt8]) raises -> Bool:
     """Huffman codes the `n` literals at `p`: the tree description, then one stream (n < 256) or the jump table and
     four. False when the literals do not allow it (fewer than two symbols, or the result is too big a header)."""
     var freq = List[Int](length=256, fill=0)
+    var fp = _ip(freq)
     for i in range(n):
-        freq[Int(p[i])] += 1
+        fp[Int(p[i])] += 1
     var distinct = 0
     var last = 0
     for s in range(256):
@@ -1525,6 +1573,7 @@ struct _Matcher:
         var cur = _load32(_ptr(self.a), i)
         self._push(self._bucket(cur), i, cur)
 
+    @always_inline
     def find(mut self, i: Int, limit: Int, rep1: Int) -> Int:
         """The best match for position i (its bytes up to `limit`), packed as length << 21 | offset; 0 for none. Also
         indexes i."""
@@ -1649,6 +1698,18 @@ def _gain(len: Int, off: Int, rep1: Int) -> Int:
 
 
 def _find_sequences(mut z: _ZEnc, mut m: _Matcher, p: Ptr, start: Int, end: Int, mut sq: _Seqs):
+    """Cuts [start, end) into sequences (literals, then a match) and the literals after the last one."""
+    var cap = (end - start) // MIN_MATCH + 2                  # a match takes at least MIN_MATCH bytes
+    sq.ll = List[Int](unsafe_uninit_length=cap)
+    sq.ml = List[Int](unsafe_uninit_length=cap)
+    sq.ov = List[Int](unsafe_uninit_length=cap)
+    sq.lits = List[UInt8](unsafe_uninit_length=end - start)
+    var llp = _ip(sq.ll)
+    var mlp = _ip(sq.ml)
+    var ovp = _ip(sq.ov)
+    var litp = _bp(sq.lits)
+    var ns = 0
+    var nl = 0
     var i = start
     var anchor = start
     var skip_step = 0
@@ -1666,7 +1727,7 @@ def _find_sequences(mut z: _ZEnc, mut m: _Matcher, p: Ptr, start: Int, end: Int,
         else:
             var found = m.find(i, end, z.rep1)
             if found == 0:
-                skip_step = min((i - anchor) >> 8, 3)       # nothing found for a long while: look at fewer positions (but still
+                skip_step = min((i - anchor) >> 8, 15)      # nothing found for a long while: look at fewer positions (but still
                                                             # index enough of them for a later copy of this data to be found)
                 i += 1 + skip_step
                 continue
@@ -1684,15 +1745,17 @@ def _find_sequences(mut z: _ZEnc, mut m: _Matcher, p: Ptr, start: Int, end: Int,
                 else:
                     q = i + 2                               # i + 1 is indexed already
         var ll = i - anchor
-        for k in range(anchor, i):
-            sq.lits.append(p[k])
-        sq.ll.append(ll)
-        sq.ml.append(len)
-        sq.ov.append(z.offset_value(off, ll))
+        for k in range(ll):
+            litp[nl + k] = p[anchor + k]
+        nl += ll
+        llp[ns] = ll
+        mlp[ns] = len
+        ovp[ns] = z.offset_value(off, ll)
+        ns += 1
         var stop = i + len
         var qlim = min(stop, end - MIN_MATCH + 1)
-        if qlim - q > 32:
-            for _ in range(8):
+        if qlim - q > 32:                                   # a long match indexes its first and last 8 positions: the middle of a long
+            for _ in range(8):                              # run is the same data again and again
                 m.insert(q)
                 q += 1
             q = qlim - 8
@@ -1701,8 +1764,13 @@ def _find_sequences(mut z: _ZEnc, mut m: _Matcher, p: Ptr, start: Int, end: Int,
             q += 1
         i = stop
         anchor = i
-    for k in range(anchor, end):
-        sq.lits.append(p[k])
+    for k in range(end - anchor):
+        litp[nl + k] = p[anchor + k]
+    nl += end - anchor
+    sq.ll.resize(ns, 0)
+    sq.ml.resize(ns, 0)
+    sq.ov.resize(ns, 0)
+    sq.lits.resize(nl, 0)
 
 
 # ── blocks ────────────────────────────────────────────────────────────────────────────────────────────
@@ -1790,43 +1858,9 @@ def _pick_table(counts: List[Int], n: Int, max_symbol: Int, default_norm: List[I
     return _fse_enc_build(default_norm, default_log)
 
 
-struct _BitW:
-    """Bits written from the low end of each byte upward into a buffer the caller sized, 32 at a time."""
-    var base: Int                   # the buffer's address
-    var pos: Int
-    var acc: UInt64
-    var n: Int                      # bits in `acc` (< 32 between calls)
-
-    def __init__(out self, base: Int):
-        self.base = base
-        self.pos = 0
-        self.acc = 0
-        self.n = 0
-
-    @always_inline
-    def add(mut self, v: Int, k: Int):
-        self.acc |= (UInt64(v) & ((UInt64(1) << UInt64(k)) - 1)) << UInt64(self.n)
-        self.n += k
-        if self.n >= 32:
-            (_ptr(self.base) + self.pos).bitcast[UInt32]().store[alignment=1](UInt32(self.acc & 0xFFFFFFFF))
-            self.pos += 4
-            self.acc >>= 32
-            self.n -= 32
-
-    def finish(mut self) -> Int:
-        """Ends a backwards-read stream (a 1 bit, zeros to a whole byte); the bytes written."""
-        self.add(1, 1)
-        var rest = (self.n + 7) // 8
-        for k in range(rest):
-            _ptr(self.base)[self.pos + k] = UInt8((self.acc >> UInt64(8 * k)) & 0xFF)
-        return self.pos + rest
-
-
 comptime IPtr = UnsafePointer[Int, ImmutAnyOrigin]
 
 
-def _ip(ref l: List[Int]) -> IPtr:
-    return IPtr(unsafe_from_address=Int(l.unsafe_ptr()))
 
 
 @always_inline
@@ -1916,16 +1950,30 @@ def _sequences_section(z: _ZEnc, sq: _Seqs) raises -> List[UInt8]:
     var ll_n = List[Int](length=36, fill=0)
     var ml_n = List[Int](length=53, fill=0)
     var of_n = List[Int](length=32, fill=0)
+    var llp = _ip(sq.ll)
+    var mlp = _ip(sq.ml)
+    var ovp = _ip(sq.ov)
+    var llut = _ip(z.ll_lut)
+    var mlut = _ip(z.ml_lut)
+    var lcp = _bp(llc)
+    var mcp = _bp(mlc)
+    var ocp = _bp(ofc)
+    var lnp = _ip(ll_n)
+    var mnp = _ip(ml_n)
+    var onp = _ip(of_n)
     for k in range(nseq):
-        var a = z.ll_code(sq.ll[k])
-        var b = z.ml_code(sq.ml[k])
-        var c = _highbit(sq.ov[k])
-        llc[k] = UInt8(a)
-        mlc[k] = UInt8(b)
-        ofc[k] = UInt8(c)
-        ll_n[a] += 1
-        ml_n[b] += 1
-        of_n[c] += 1
+        var lv = llp[k]
+        var mv = mlp[k] - 3
+        var ov = ovp[k]
+        var a = llut[lv] if lv < 64 else _highbit(lv) + 19
+        var b = mlut[mv] if mv < 128 else _highbit(mv) + 36
+        var c = _highbit(ov)
+        lcp[k] = UInt8(a)
+        mcp[k] = UInt8(b)
+        ocp[k] = UInt8(c)
+        lnp[a] += 1
+        mnp[b] += 1
+        onp[c] += 1
     var mode_ll = 0
     var mode_of = 0
     var mode_ml = 0
