@@ -1140,6 +1140,11 @@ struct _FseEnc(Copyable, Movable):
             return
         out.add(state, self.log)
 
+    def flush_to(self, mut out: _BitW, state: Int):
+        if self.rle:
+            return
+        out.add(state, self.log)
+
 
 def _fse_enc_build(norm: List[Int], log: Int) raises -> _FseEnc:
     var size = 1 << log
@@ -1685,7 +1690,13 @@ def _find_sequences(mut z: _ZEnc, mut m: _Matcher, p: Ptr, start: Int, end: Int,
         sq.ml.append(len)
         sq.ov.append(z.offset_value(off, ll))
         var stop = i + len
-        while q < stop and q + MIN_MATCH <= end:
+        var qlim = min(stop, end - MIN_MATCH + 1)
+        if qlim - q > 32:
+            for _ in range(8):
+                m.insert(q)
+                q += 1
+            q = qlim - 8
+        while q < qlim:
             m.insert(q)
             q += 1
         i = stop
@@ -1740,14 +1751,10 @@ def _literals_section(p: Ptr, n: Int) raises -> List[UInt8]:
     return out^
 
 
-def _pick_table(codes: List[Int], max_symbol: Int, default_norm: List[Int], default_log: Int, max_log: Int,
+def _pick_table(counts: List[Int], n: Int, max_symbol: Int, default_norm: List[Int], default_log: Int, max_log: Int,
                 mut mode: Int, mut desc: List[UInt8]) raises -> _FseEnc:
-    """The table for one of the three code streams: predefined (mode 0), a repeated symbol (1) or one made for these
-    codes (2), by the bits each would cost."""
-    var counts = List[Int](length=max_symbol + 1, fill=0)
-    for c in codes:
-        counts[c] += 1
-    var n = len(codes)
+    """The table for one of the three code streams (`n` codes, `counts` of each symbol): predefined (mode 0), a repeated
+    symbol (1) or one made for these codes (2), by the bits each would cost."""
     var distinct = 0
     var top = 0
     for s in range(max_symbol + 1):
@@ -1783,6 +1790,110 @@ def _pick_table(codes: List[Int], max_symbol: Int, default_norm: List[Int], defa
     return _fse_enc_build(default_norm, default_log)
 
 
+struct _BitW:
+    """Bits written from the low end of each byte upward into a buffer the caller sized, 32 at a time."""
+    var base: Int                   # the buffer's address
+    var pos: Int
+    var acc: UInt64
+    var n: Int                      # bits in `acc` (< 32 between calls)
+
+    def __init__(out self, base: Int):
+        self.base = base
+        self.pos = 0
+        self.acc = 0
+        self.n = 0
+
+    @always_inline
+    def add(mut self, v: Int, k: Int):
+        self.acc |= (UInt64(v) & ((UInt64(1) << UInt64(k)) - 1)) << UInt64(self.n)
+        self.n += k
+        if self.n >= 32:
+            (_ptr(self.base) + self.pos).bitcast[UInt32]().store[alignment=1](UInt32(self.acc & 0xFFFFFFFF))
+            self.pos += 4
+            self.acc >>= 32
+            self.n -= 32
+
+    def finish(mut self) -> Int:
+        """Ends a backwards-read stream (a 1 bit, zeros to a whole byte); the bytes written."""
+        self.add(1, 1)
+        var rest = (self.n + 7) // 8
+        for k in range(rest):
+            _ptr(self.base)[self.pos + k] = UInt8((self.acc >> UInt64(8 * k)) & 0xFF)
+        return self.pos + rest
+
+
+comptime IPtr = UnsafePointer[Int, ImmutAnyOrigin]
+
+
+def _ip(ref l: List[Int]) -> IPtr:
+    return IPtr(unsafe_from_address=Int(l.unsafe_ptr()))
+
+
+@always_inline
+def _fse_step(rle: Bool, mut bw: _BitW, mut state: Int, sym: Int, dnb: IPtr,
+              dfind: IPtr, states: IPtr):
+    if not rle:
+        var nb = (state + dnb[sym]) >> 16
+        bw.add(state, nb)
+        state = states[(state >> nb) + dfind[sym]]
+
+
+def _sequence_stream(z: _ZEnc, sq: _Seqs, llc: List[UInt8], mlc: List[UInt8], ofc: List[UInt8],
+                     ll_enc: _FseEnc, of_enc: _FseEnc, ml_enc: _FseEnc) -> List[UInt8]:
+    """The bit stream of the sequences: written last sequence first, the decoder reads it backwards."""
+    var nseq = len(sq.ll)
+    var out = List[UInt8](unsafe_uninit_length=16 * nseq + 32)             # at most 120 bits a sequence
+    var bw = _BitW(Int(out.unsafe_ptr()))
+    var lcp = llc.unsafe_ptr()
+    var mcp = mlc.unsafe_ptr()
+    var ocp = ofc.unsafe_ptr()
+    var llp = sq.ll.unsafe_ptr()
+    var mlp = sq.ml.unsafe_ptr()
+    var ovp = sq.ov.unsafe_ptr()
+    var llb = z.ll_base.unsafe_ptr()
+    var llx = z.ll_bits.unsafe_ptr()
+    var mlb = z.ml_base.unsafe_ptr()
+    var mlx = z.ml_bits.unsafe_ptr()
+    var l_dnb = _ip(ll_enc.delta_nb)
+    var l_dfd = _ip(ll_enc.delta_find)
+    var l_st = _ip(ll_enc.states)
+    var m_dnb = _ip(ml_enc.delta_nb)
+    var m_dfd = _ip(ml_enc.delta_find)
+    var m_st = _ip(ml_enc.states)
+    var o_dnb = _ip(of_enc.delta_nb)
+    var o_dfd = _ip(of_enc.delta_find)
+    var o_st = _ip(of_enc.states)
+    var l_rle = ll_enc.rle
+    var m_rle = ml_enc.rle
+    var o_rle = of_enc.rle
+    var last = nseq - 1
+    var st_ml = ml_enc.init_state(Int(mcp[last]))
+    var st_of = of_enc.init_state(Int(ocp[last]))
+    var st_ll = ll_enc.init_state(Int(lcp[last]))
+    bw.add(llp[last] - llb[Int(lcp[last])], llx[Int(lcp[last])])
+    bw.add(mlp[last] - mlb[Int(mcp[last])], mlx[Int(mcp[last])])
+    bw.add(ovp[last] - (1 << Int(ocp[last])), Int(ocp[last]))
+    for k in range(last - 1, -1, -1):
+        var lc = Int(lcp[k])
+        var mc = Int(mcp[k])
+        var oc = Int(ocp[k])
+        _fse_step(o_rle, bw, st_of, oc, o_dnb, o_dfd, o_st)
+        _fse_step(m_rle, bw, st_ml, mc, m_dnb, m_dfd, m_st)
+        _fse_step(l_rle, bw, st_ll, lc, l_dnb, l_dfd, l_st)
+        bw.add(llp[k] - llb[lc], llx[lc])
+        bw.add(mlp[k] - mlb[mc], mlx[mc])
+        bw.add(ovp[k] - (1 << oc), oc)
+    ml_enc.flush_to(bw, st_ml)
+    of_enc.flush_to(bw, st_of)
+    ll_enc.flush_to(bw, st_ll)
+    var size = bw.finish()
+    out.resize(size, 0)
+    _ = llc
+    _ = mlc
+    _ = ofc
+    return out^
+
+
 def _sequences_section(z: _ZEnc, sq: _Seqs) raises -> List[UInt8]:
     var nseq = len(sq.ll)
     var out = List[UInt8]()
@@ -1798,47 +1909,37 @@ def _sequences_section(z: _ZEnc, sq: _Seqs) raises -> List[UInt8]:
         out.append(255)
         out.append(UInt8((nseq - 0x7F00) & 0xFF))
         out.append(UInt8((nseq - 0x7F00) >> 8))
-    var llc = List[Int](length=nseq, fill=0)
-    var mlc = List[Int](length=nseq, fill=0)
-    var ofc = List[Int](length=nseq, fill=0)
+    # the codes of every sequence (one byte each) and how often each occurs
+    var llc = List[UInt8](unsafe_uninit_length=nseq)
+    var mlc = List[UInt8](unsafe_uninit_length=nseq)
+    var ofc = List[UInt8](unsafe_uninit_length=nseq)
+    var ll_n = List[Int](length=36, fill=0)
+    var ml_n = List[Int](length=53, fill=0)
+    var of_n = List[Int](length=32, fill=0)
     for k in range(nseq):
-        llc[k] = z.ll_code(sq.ll[k])
-        mlc[k] = z.ml_code(sq.ml[k])
-        ofc[k] = _highbit(sq.ov[k])
+        var a = z.ll_code(sq.ll[k])
+        var b = z.ml_code(sq.ml[k])
+        var c = _highbit(sq.ov[k])
+        llc[k] = UInt8(a)
+        mlc[k] = UInt8(b)
+        ofc[k] = UInt8(c)
+        ll_n[a] += 1
+        ml_n[b] += 1
+        of_n[c] += 1
     var mode_ll = 0
     var mode_of = 0
     var mode_ml = 0
     var desc_ll = List[UInt8]()
     var desc_of = List[UInt8]()
     var desc_ml = List[UInt8]()
-    var ll_enc = _pick_table(llc, 35, _ll_default(), LL_DEFAULT_LOG, LL_MAX_LOG, mode_ll, desc_ll)
-    var of_enc = _pick_table(ofc, 31, _of_default(), OF_DEFAULT_LOG, OF_MAX_LOG, mode_of, desc_of)
-    var ml_enc = _pick_table(mlc, 52, _ml_default(), ML_DEFAULT_LOG, ML_MAX_LOG, mode_ml, desc_ml)
+    var ll_enc = _pick_table(ll_n, nseq, 35, _ll_default(), LL_DEFAULT_LOG, LL_MAX_LOG, mode_ll, desc_ll)
+    var of_enc = _pick_table(of_n, nseq, 31, _of_default(), OF_DEFAULT_LOG, OF_MAX_LOG, mode_of, desc_of)
+    var ml_enc = _pick_table(ml_n, nseq, 52, _ml_default(), ML_DEFAULT_LOG, ML_MAX_LOG, mode_ml, desc_ml)
     out.append(UInt8((mode_ll << 6) | (mode_of << 4) | (mode_ml << 2)))
     out.extend(desc_ll^)
     out.extend(desc_of^)
     out.extend(desc_ml^)
-    # the stream is written last sequence first; the decoder reads it backwards
-    var bw = _BitOut()
-    var last = nseq - 1
-    var st_ml = ml_enc.init_state(mlc[last])
-    var st_of = of_enc.init_state(ofc[last])
-    var st_ll = ll_enc.init_state(llc[last])
-    bw.add(sq.ll[last] - z.ll_base[llc[last]], z.ll_bits[llc[last]])
-    bw.add(sq.ml[last] - z.ml_base[mlc[last]], z.ml_bits[mlc[last]])
-    bw.add(sq.ov[last] - (1 << ofc[last]), ofc[last])
-    for k in range(last - 1, -1, -1):
-        of_enc.encode(bw, st_of, ofc[k])
-        ml_enc.encode(bw, st_ml, mlc[k])
-        ll_enc.encode(bw, st_ll, llc[k])
-        bw.add(sq.ll[k] - z.ll_base[llc[k]], z.ll_bits[llc[k]])
-        bw.add(sq.ml[k] - z.ml_base[mlc[k]], z.ml_bits[mlc[k]])
-        bw.add(sq.ov[k] - (1 << ofc[k]), ofc[k])
-    ml_enc.flush(bw, st_ml)
-    of_enc.flush(bw, st_of)
-    ll_enc.flush(bw, st_ll)
-    bw.close_stream()
-    out.extend(bw.take())
+    out.extend(_sequence_stream(z, sq, llc, mlc, ofc, ll_enc, of_enc, ml_enc))
     return out^
 
 

@@ -34,6 +34,7 @@ from std.sys import is_defined, CompilationTarget
 from std.bit import pop_count, byte_swap
 from .codec import zstd_compress, zstd_decompress, snappy_compress, snappy_decompress
 from .job import JobCtl, STAGE_READ, STAGE_WRITE, THREADS      # F-175
+from .fan import ParTask, run_tasks                              # F-187
 from .kernels._fpenv import par_n, core_count
 from std.collections import Dict
 from std.memory import ArcPointer
@@ -209,15 +210,17 @@ struct _Chunk(Copyable, Movable):
 
 
 def write_parquet(path: String, t: SharedTable, metadata: String = "", compression: Int = ZSTD,
-                  row_group_rows: Int = DEFAULT_ROW_GROUP, job: JobCtl = JobCtl()) raises:
+                  row_group_rows: Int = DEFAULT_ROW_GROUP, job: JobCtl = JobCtl(), threads: Int = 0) raises:
     """Writes the table to `path`; `metadata` (a JSON string) is stored under the key "omx". `job` (F-175): the background job it
-    runs for; a cancel is seen between row groups, and a cancelled write leaves `path` as it was."""
-    _write(path, t._table[], metadata, compression, row_group_rows, job)
+    runs for; a cancel is seen between row groups, and a cancelled write leaves `path` as it was. `threads` (F-187): at most
+    this many threads compress the columns of a row group (0: every thread the build has; 1: the calling thread); the file is
+    the same bytes for any number."""
+    _write(path, t._table[], metadata, compression, row_group_rows, job, threads)
 
 
 def write_parquet(path: String, t: Table, metadata: String = "", compression: Int = ZSTD,
-                  row_group_rows: Int = DEFAULT_ROW_GROUP, job: JobCtl = JobCtl()) raises:
-    _write(path, t, metadata, compression, row_group_rows, job)
+                  row_group_rows: Int = DEFAULT_ROW_GROUP, job: JobCtl = JobCtl(), threads: Int = 0) raises:
+    _write(path, t, metadata, compression, row_group_rows, job, threads)
 
 
 def _page_header(mut b: List[UInt8], kind: Int, uncompressed: Int, compressed: Int, values: Int, encoding: Int):
@@ -343,7 +346,7 @@ def _column_pages(mut file: List[UInt8], col: Column, lo: Int, hi: Int, optional
     return chunk^
 
 
-def _write(path: String, t: Table, metadata: String, requested: Int, row_group_rows: Int, job: JobCtl = JobCtl()) raises:
+def _write(path: String, t: Table, metadata: String, requested: Int, row_group_rows: Int, job: JobCtl = JobCtl(), threads: Int = 0) raises:
     t.check()
     if t.columns() == 0:
         raise Error("a table with no columns cannot be written as Parquet")
@@ -353,6 +356,7 @@ def _write(path: String, t: Table, metadata: String, requested: Int, row_group_r
     for c in range(t.columns()):
         optional.append(t.cols[c].nulls > 0)
     var w = ParquetWriter(path, t, optional, requested)
+    w.threads = threads
     try:
         var n = t.rows()
         var lo = 0
@@ -371,6 +375,41 @@ def _write(path: String, t: Table, metadata: String, requested: Int, row_group_r
     except e:
         w.abort()
         raise e^
+
+
+struct _ColOut(Movable):
+    """One column chunk of a row group, as a thread made it."""
+    var bytes: List[UInt8]           # its pages, headers included; offsets in `chunk` count from the first byte
+    var chunk: _Chunk
+    var error: String                # set when the column cannot be written (checked in column order, so the error never depends on timing)
+
+    def __init__(out self, var bytes: List[UInt8], var chunk: _Chunk, var error: String):
+        self.bytes = bytes^
+        self.chunk = chunk^
+        self.error = error^
+
+
+@fieldwise_init
+struct _ColumnTask(ParTask):
+    """Column `i` of rows lo..hi into slot `i` of an array of `_ColOut`; nothing is shared but the table, which is only read."""
+    var table: Int                   # address of the Table
+    var optional: Int                # address of the Bool per column
+    var outs: Int                    # address of the first _ColOut
+    var lo: Int
+    var hi: Int
+    var codec: Int
+
+    def run(self, i: Int):
+        var t = UnsafePointer[Table, MutAnyOrigin](unsafe_from_address=self.table)
+        var opt = UnsafePointer[Bool, MutAnyOrigin](unsafe_from_address=self.optional)
+        var slot = UnsafePointer[_ColOut, MutAnyOrigin](unsafe_from_address=self.outs) + i
+        try:
+            var buf = List[UInt8]()
+            var ch = _column_pages(buf, t[].cols[i], self.lo, self.hi, opt[i], self.codec)
+            slot[].bytes = buf^
+            slot[].chunk = ch^
+        except e:
+            slot[].error = String(e)
 
 
 struct ParquetWriter(Movable):
@@ -394,9 +433,11 @@ struct ParquetWriter(Movable):
     var groups: List[List[_Chunk]]
     var rows: List[Int]
     var total: Int
+    var threads: Int                     # F-187: most threads that compress the columns of a group (0: all the build has)
 
     def __init__(out self, path: String, shape: Table, optional: List[Bool], compression: Int) raises:
         self.codec = compression
+        self.threads = 0
         self.path = path
         # The temp name carries the process id, so two processes saving the same path never share a temp file.
         # (F-175) and the address of a fresh allocation and the clock: two saves to one path in one process (a cancelled save that is
@@ -431,17 +472,25 @@ struct ParquetWriter(Movable):
         """Appends rows lo..hi of `t` as one row group."""
         if t.columns() != self.schema.columns():
             raise Error("a row group has " + String(t.columns()) + " columns, the file " + String(self.schema.columns()))
-        var buf = List[UInt8]()
+        var cols = t.columns()
+        var outs = List[_ColOut]()
+        for _ in range(cols):
+            outs.append(_ColOut(List[UInt8](), _Chunk(0, 0, -1, 0, 0, 0), String()))
+        # every column's pages are built and compressed on their own (F-187), then laid out in column order: the same bytes for any thread count
+        run_tasks(_ColumnTask(Int(UnsafePointer(to=t)), Int(self.optional.unsafe_ptr()), Int(outs.unsafe_ptr()), lo, hi, self.codec), cols, self.threads)
+        for c in range(cols):                                # (a group with a bad column writes nothing)
+            if outs[c].error.byte_length() > 0:
+                raise Error(outs[c].error)
         var chunks = List[_Chunk]()
-        for c in range(t.columns()):
-            var ch = _column_pages(buf, t.cols[c], lo, hi, self.optional[c], self.codec)
-            ch.offset += self.offset                       # `buf` starts where the file stands
+        for c in range(cols):
+            var ch = outs[c].chunk.copy()
+            ch.offset += self.offset                         # the column's bytes start where the file stands
             ch.data_offset += self.offset
             if ch.dict_offset >= 0:
                 ch.dict_offset += self.offset
+            self.file.write_bytes(Span(outs[c].bytes))
+            self.offset += len(outs[c].bytes)
             chunks.append(ch^)
-        self.file.write_bytes(Span(buf))
-        self.offset += len(buf)
         self.groups.append(chunks^)
         self.rows.append(hi - lo)
         self.total += hi - lo
