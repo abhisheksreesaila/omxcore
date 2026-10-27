@@ -1,6 +1,7 @@
 """F-135 (M4): Parquet written by the Python-free Mojo package reads back in pyarrow and DuckDB with every value,
 type, null and the "omx" metadata, for each codec and several row-group sizes."""
 import json
+import os
 import struct
 import subprocess
 from pathlib import Path
@@ -1514,3 +1515,62 @@ def test_gpu_scans_that_raise_give_their_device_context_back(tmp_path):
     if held[1] == 0:
         pytest.skip("nvidia-smi cannot see this process's GPU memory (container, MIG or driver permissions)")
     assert held[1000] - held[1] < 60, f"GPU MiB held after 1 failed scan {held[1]}, after 1000: {held[1000]}"
+
+
+# ── F-188: the pages a save makes at once follow a byte budget, not the thread count ─────────────────────
+
+@pytest.fixture(scope="module", params=["libzstd", "mojo-codec"])
+def budget_probe(request, tmp_path_factory):
+    out = tmp_path_factory.mktemp("mojo") / "pq_write_budget_probe"
+    env = dict(os.environ)
+    if request.param == "mojo-codec":
+        env["MXFRAME_BUILD_FLAGS"] = "-D MXFRAME_NO_CODECS"
+    subprocess.run(["bash", str(ROOT / "scripts/mojo_build.sh"), str(ROOT / "mojo/tools/pq_write_budget_probe.mojo"), str(out)],
+                   check=True, capture_output=True, text=True, env=env)
+    return out
+
+
+@pytest.fixture
+def scratch():
+    """Big files go under ~/.cache (not the shared /tmp quota) and are removed at the end of the case."""
+    import shutil, tempfile
+    root = Path(os.environ.get("MXFRAME_TEST_TMPDIR", Path.home() / ".cache" / "mxframe-test-tmp"))
+    root.mkdir(parents=True, exist_ok=True)
+    d = Path(tempfile.mkdtemp(prefix="f188-", dir=root))
+    yield d
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def run_budget_probe(probe, tmp_path, rows, threads, budget, data):
+    path = tmp_path / f"b{threads}_{budget}_{data}.parquet"
+    p = subprocess.run([str(probe), str(rows), str(path), str(threads), str(budget), data], capture_output=True, text=True)
+    assert p.returncode == 0, p.stdout + p.stderr
+    res = json.loads(p.stdout.strip().split("\n")[-1])
+    res["growth_kb"] = res["peak_kb"] - res["before_kb"]
+    return res
+
+
+@pytest.mark.parametrize("data", ["random", "compressible"])
+def test_a_save_with_many_threads_holds_pages_within_its_budget(budget_probe, scratch, data):
+    tmp_path = scratch
+    """A 125 MB table in one row group saved on 24 threads: the memory the save adds stays within the budget it was given (plus 2 MB), for
+    incompressible and for compressible values alike (the coder's match tables and buffers are counted in a page's cost), with libzstd and with
+    the Mojo coder; the bytes written do not depend on the budget."""
+    rows = 2_000_000
+    MB = 2**20
+    files = {}
+    for budget in (1 * MB, 4 * MB, 16 * MB, 64 * MB):
+        res = run_budget_probe(budget_probe, tmp_path, rows, 24, budget, data)
+        assert res["table_kb"] == 125000
+        assert res["growth_kb"] * 1024 <= budget + 2 * MB, (budget, res)
+        files[budget] = (tmp_path / f"b24_{budget}_{data}.parquet").read_bytes()
+    one = run_budget_probe(budget_probe, tmp_path, rows, 1, 4 * MB, data)
+    assert one["growth_kb"] * 1024 <= 4 * MB + 2 * MB, one
+    assert len(set(files.values())) == 1 and files[1 * MB] == (tmp_path / f"b1_{4 * MB}_{data}.parquet").read_bytes()
+
+
+def test_without_a_bound_a_save_holds_the_pages_of_its_row_group(budget_probe, scratch):
+    tmp_path = scratch
+    """The measure sees what the budget bounds: with a 1 GB budget the same save adds over 100 MB."""
+    big = run_budget_probe(budget_probe, tmp_path, 2_000_000, 24, 1024 * 2**20, "random")
+    assert big["growth_kb"] * 1024 > 100 * 2**20, big

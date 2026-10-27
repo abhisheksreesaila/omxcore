@@ -140,8 +140,7 @@ has, 1 the calling thread; tested for 1, 2, 3, 5, 8 and all, both codecs, with p
 The threads are the build's own: Linux with the pool uses `par_n` (workers take the next page as they finish one, because
 pages differ 50-fold in cost), a **plain Mac build stays serial** (no async runtime, as before), and a serial build
 with `-D MXFRAME_JOB_THREADS` fans out over pthreads with the calls its jobs already need (`pthread_create`, `pthread_join`,
-`pthread_attr_*`) and `sysconf`: `scripts/check_mac_link.sh` reports no new symbol. A save that streams a file (a Frame over a
-scan) uses at most 4 threads, because its memory is bounded by one row group and each worker adds a few MB. Reading is
+`pthread_attr_*`) and `sysconf`: `scripts/check_mac_link.sh` reports no new symbol. The pages a save holds in flight follow a byte budget (`budget=`, F-188), not a thread cap: a page waits until what the pages in flight hold, with the coder's scratch, fits (`WRITE_BUDGET` 256 MB for a table; `STREAM_WRITE_BUDGET` 57 MB, four pages, for a save that streams a file). The bytes written are the same for any budget. A small budget means fewer pages at once and a slower save (a 1-4 MB budget on a 125 MB table: about 0.35 s against 0.06 s). Reading is
 faster too: a file saved this way has several pages per column, which `read_parquet` decodes in parallel (0.040 s to
 0.022 s on the table above).
 

@@ -3,7 +3,7 @@
 # bytes, and read_parquet must give back the table that was saved. A column that cannot be written raises the same error for
 # every count and leaves no file behind.
 from std.pathlib import Path
-from omxcore import (Table, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, write_parquet, read_parquet, UNCOMPRESSED, SNAPPY, ZSTD)
+from omxcore import (Table, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, write_parquet, read_parquet, ParquetWriter, UNCOMPRESSED, SNAPPY, ZSTD)
 
 
 def expect(cond: Bool, what: String) raises:
@@ -104,13 +104,28 @@ def main() raises:
             expect(pages.table.get(col, r) == wide.get(col, r), "multi-page: column " + String(col) + " row " + String(r) + " reads back")
     expect(pages.table.text_of(4, Int(pages.table.get(4, 299_999))) == wide.text_of(4, Int(wide.get(4, 299_999))), "multi-page: text of the last row")
 
+    # F-188: the pages made at once are bounded by a byte budget; a page is never split, so the least is one page. Every thread count under every
+    # budget (1 byte: one page at a time; 3 MB: a window of a page or two; 1 GB: the whole row group) writes the single-thread file's bytes
+    var budgets: List[Int] = [1, 3 << 20, 1 << 30]
+    for b in budgets:
+        for c in counts:
+            write_parquet("many.parquet", wide, "{}", ZSTD, threads=c, budget=b)
+            var got = bytes_of("many.parquet")
+            var same = len(got) == len(want_pages)
+            if same:
+                for i in range(len(got)):
+                    if got[i] != want_pages[i]:
+                        same = False
+                        break
+            expect(same, "budget " + String(b) + " threads " + String(c) + " writes the single-thread file's bytes")
+
     # a column that cannot be written: one error, the same for every count, and no file (nor temporary file) is left
     var bad = table(16_000, with_bad_decimal=True)
     var msgs = List[String]()
     for c in [1, 3, 0]:
         var msg = String("")
         try:
-            write_parquet("bad.parquet", bad, "{}", ZSTD, 8000, threads=c)
+            write_parquet("bad.parquet", bad, "{}", ZSTD, 8000, threads=c, budget=1 if c == 3 else 0)
         except e:
             msg = String(e)
         expect(msg.byte_length() > 0, "an out-of-range DECIMAL raises (threads " + String(c) + ")")
@@ -118,4 +133,14 @@ def main() raises:
         expect(not Path("bad.parquet").exists(), "no file is left behind (threads " + String(c) + ")")
         msgs.append(msg)
     expect(msgs[0] == msgs[1] and msgs[1] == msgs[2], "the error does not depend on the thread count")
+    # F-188: a row group with no pages at all (a writer with no columns) and one with no rows, on several threads
+    var none = Table.empty()
+    var w0 = ParquetWriter("none.parquet", none, List[Bool](), ZSTD)
+    w0.threads = 4
+    w0.write_group(none)
+    w0.abort()
+    var empty = table(0)
+    for c in [1, 4]:
+        write_parquet("empty.parquet", empty, "{}", ZSTD, threads=c)
+        expect(read_parquet("empty.parquet").table.rows() == 0, "a table with no rows reads back empty (threads " + String(c) + ")")
     print("ok")

@@ -28,7 +28,7 @@ from .expr import (Expr, Node, col, least, greatest, N_COL, N_LIT, N_LITF, N_DIV
                    N_LEAST, N_GREATEST, N_LT, N_LE, N_GT, N_GE, N_EQ, N_NE, N_AND, N_OR, N_NOT, N_BOOL2INT, N_SCALE_TO)
 from .csv import _parse_int, _parse_decimal, _parse_date, _parse_bool, _parse_float, F_OK, F_RANGE, F_NAN_BITS
 from .holistic import float_key
-from .parquet import ParquetScan, ParquetWriter, write_parquet, ZSTD, DEFAULT_ROW_GROUP, STREAM_WRITE_THREADS
+from .parquet import ParquetScan, ParquetWriter, write_parquet, ZSTD, DEFAULT_ROW_GROUP, STREAM_WRITE_BUDGET
 
 comptime SET = 0
 comptime APPEND = 1
@@ -949,7 +949,7 @@ struct Frame(Movable):
                     t.append(c, self.alias(c, cell[0]))
         return t^
 
-    def save(self, path: String, metadata: String = "", compression: Int = ZSTD, allow_narrowing: Bool = False, job: JobCtl = JobCtl()) raises:
+    def save(self, path: String, metadata: String = "", compression: Int = ZSTD, allow_narrowing: Bool = False, job: JobCtl = JobCtl(), budget: Int = 0) raises:
         """Writes the edited rows to a new Parquet file (`metadata` under the key "omx"; the file replaces `path` by
         rename, so `path` may be the file this frame reads). A frame over a scan streams: one row group of the file at
         a time (all its columns decoded, edits applied, encoded and written; appended rows follow in groups of
@@ -962,9 +962,12 @@ struct Frame(Movable):
         naming the column, unless `allow_narrowing`.
 
         `job` (F-175, job.mojo `save_job`): the background job this saves for. A cancel is seen between row groups and the old file
-        stays (the temporary file is removed); progress counts the rows written."""
+        stays (the temporary file is removed); progress counts the rows written.
+
+        `budget` (F-188): bytes of pages being compressed at once (bodies and compressed bytes); 0: STREAM_WRITE_BUDGET for a frame over a scan,
+        WRITE_BUDGET for a table. The threads (as many as the build has) work inside it; the file is the same bytes for any budget."""
         if not self.scan:
-            write_parquet(path, self.bake(), metadata, compression, DEFAULT_ROW_GROUP, job)
+            write_parquet(path, self.bake(), metadata, compression, DEFAULT_ROW_GROUP, job, budget=budget)
             return
         ref scan = self.scan.value()
         var stored = self.stored()
@@ -1000,7 +1003,7 @@ struct Frame(Movable):
         for c in range(stored):
             all.append(c)
         var w = ParquetWriter(path, out, optional, compression)
-        w.threads = STREAM_WRITE_THREADS
+        w.budget = budget if budget > 0 else STREAM_WRITE_BUDGET
         try:
             var changed = self.changed_rows()                # ascending; the rows whose values are not the file's
             var ci = 0
