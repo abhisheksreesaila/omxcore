@@ -87,9 +87,11 @@ comptime ZSTD = 6
 comptime NO_CODECS = is_defined["MXFRAME_NO_CODECS"]() or not CompilationTarget.is_linux()    # no C codec libraries: codec.mojo
 
 comptime DEFAULT_ROW_GROUP = 1 << 20
-comptime STREAM_WRITE_THREADS = 4       # most threads that compress a streamed save (Frame over a scan): its memory is one row group whatever the
-                                        # file's size, and workers add to it (the test's 332 MB file, 250k-row groups, measured: 1 thread 101 MB at the peak,
-                                        # 2 to 4 threads 105 to 108 MB, 12 threads 116 MB; tests/test_mojo_parquet.py bounds that peak at a third of the file)
+comptime WRITE_BUDGET = 256 << 20        # F-188: bytes of pages (each counted as its body plus its compressed bytes) a save makes at once, when the caller
+                                        # gives no budget: the threads take pages from a window of this size, which is written in order and freed
+comptime STREAM_WRITE_BUDGET = 4 << 20  # the same for a streamed save (Frame over a scan), whose memory is one row group whatever the file's size: two 1 MB pages
+                                        # in flight (the test's 332 MB file, 250k-row groups: peak 104-106 MB at 4 MB, 109-114 MB at 12 threads with no bound;
+                                        # tests/test_mojo_parquet.py bounds that peak at a third of the file)
 comptime INT32_MAX = 2147483647
 comptime MAX_DECIMAL = 1_000_000_000_000_000_000      # DECIMAL(18, s): the stored integer has at most 18 digits
 
@@ -213,17 +215,18 @@ struct _Chunk(Copyable, Movable):
 
 
 def write_parquet(path: String, t: SharedTable, metadata: String = "", compression: Int = ZSTD,
-                  row_group_rows: Int = DEFAULT_ROW_GROUP, job: JobCtl = JobCtl(), threads: Int = 0) raises:
+                  row_group_rows: Int = DEFAULT_ROW_GROUP, job: JobCtl = JobCtl(), threads: Int = 0, budget: Int = 0) raises:
     """Writes the table to `path`; `metadata` (a JSON string) is stored under the key "omx". `job` (F-175): the background job it
     runs for; a cancel is seen between row groups, and a cancelled write leaves `path` as it was. `threads` (F-187): at most
     this many threads compress the columns of a row group (0: every thread the build has; 1: the calling thread); the file is
-    the same bytes for any number."""
-    _write(path, t._table[], metadata, compression, row_group_rows, job, threads)
+    the same bytes for any number. `budget` (F-188): at most this many bytes of page bodies and compressed pages are
+    in flight at once (0: WRITE_BUDGET; a page is never split, so one page is the least); the file is the same bytes for any budget."""
+    _write(path, t._table[], metadata, compression, row_group_rows, job, threads, budget)
 
 
 def write_parquet(path: String, t: Table, metadata: String = "", compression: Int = ZSTD,
-                  row_group_rows: Int = DEFAULT_ROW_GROUP, job: JobCtl = JobCtl(), threads: Int = 0) raises:
-    _write(path, t, metadata, compression, row_group_rows, job, threads)
+                  row_group_rows: Int = DEFAULT_ROW_GROUP, job: JobCtl = JobCtl(), threads: Int = 0, budget: Int = 0) raises:
+    _write(path, t, metadata, compression, row_group_rows, job, threads, budget)
 
 
 def _page_header(mut b: List[UInt8], kind: Int, uncompressed: Int, compressed: Int, values: Int, encoding: Int):
@@ -268,6 +271,24 @@ def _page_rows(col: Column) -> Int:
     elif col.kind == DATE:
         bits = 32
     return max(8, ((PAGE_RAW_BYTES * 8) // bits) & ~7)
+
+
+def _page_bytes(col: Column, job: _PageJob, optional: Bool) -> Int:
+    """What making a page holds at once (F-188): its body and its compressed bytes, each about the page's size before compression."""
+    if job.dict:
+        var n = 0
+        for w in col.dict[].words:
+            n += w.byte_length() + 4
+        return 2 * n + 64
+    var rows = job.hi - job.lo
+    var bits = 64
+    if col.kind == TEXT:
+        bits = max(_bit_width(len(col.dict[].words) - 1), 1)
+    elif col.kind == BOOL:
+        bits = 1
+    elif col.kind == DATE:
+        bits = 32
+    return 2 * ((rows * bits + 7) // 8 + (rows // 8 if optional else 0)) + 64
 
 
 def _dict_page(mut file: List[UInt8], col: Column, codec: Int) raises -> Int:
@@ -409,7 +430,7 @@ def _data_page(mut file: List[UInt8], col: Column, lo: Int, hi: Int, optional: B
     return uncompressed
 
 
-def _write(path: String, t: Table, metadata: String, requested: Int, row_group_rows: Int, job: JobCtl = JobCtl(), threads: Int = 0) raises:
+def _write(path: String, t: Table, metadata: String, requested: Int, row_group_rows: Int, job: JobCtl = JobCtl(), threads: Int = 0, budget: Int = 0) raises:
     t.check()
     if t.columns() == 0:
         raise Error("a table with no columns cannot be written as Parquet")
@@ -420,6 +441,7 @@ def _write(path: String, t: Table, metadata: String, requested: Int, row_group_r
         optional.append(t.cols[c].nulls > 0)
     var w = ParquetWriter(path, t, optional, requested)
     w.threads = threads
+    w.budget = budget
     try:
         var n = t.rows()
         var lo = 0
@@ -463,17 +485,18 @@ struct _PageOut(Movable):
 
 @fieldwise_init
 struct _PageTask(ParTask):
-    """Page `i` of the jobs into slot `i` of the outputs; nothing is shared but the table, which is only read."""
+    """Job `first + i` into slot `i` of the outputs; nothing is shared but the table, which is only read."""
     var table: Int                   # address of the Table
     var optional: Int                # address of the Bool per column
     var jobs: Int                    # address of the first _PageJob
     var outs: Int                    # address of the first _PageOut
+    var first: Int                   # the job of slot 0 (F-188: a window of the jobs is made at a time)
     var codec: Int
 
     def run(self, i: Int):
         var t = UnsafePointer[Table, MutAnyOrigin](unsafe_from_address=self.table)
         var opt = UnsafePointer[Bool, MutAnyOrigin](unsafe_from_address=self.optional)
-        var job = UnsafePointer[_PageJob, MutAnyOrigin](unsafe_from_address=self.jobs) + i
+        var job = UnsafePointer[_PageJob, MutAnyOrigin](unsafe_from_address=self.jobs) + self.first + i
         var slot = UnsafePointer[_PageOut, MutAnyOrigin](unsafe_from_address=self.outs) + i
         try:
             var buf = List[UInt8]()
@@ -508,10 +531,12 @@ struct ParquetWriter(Movable):
     var rows: List[Int]
     var total: Int
     var threads: Int                     # F-187: most threads that compress the columns of a group (0: all the build has)
+    var budget: Int                      # F-188: bytes of pages (bodies and compressed bytes) made at once (0: WRITE_BUDGET)
 
     def __init__(out self, path: String, shape: Table, optional: List[Bool], compression: Int) raises:
         self.codec = compression
         self.threads = 0
+        self.budget = 0
         self.path = path
         # The temp name carries the process id, so two processes saving the same path never share a temp file.
         # (F-175) and the address of a fresh allocation and the clock: two saves to one path in one process (a cancelled save that is
@@ -559,30 +584,45 @@ struct ParquetWriter(Movable):
                 r = e
                 if r >= hi:
                     break
-        var outs = List[_PageOut]()
-        for _ in range(len(jobs)):
-            outs.append(_PageOut())
-        # every page is built and compressed on its own (F-187), then laid out in order: the same bytes for any thread count
-        run_tasks(_PageTask(Int(UnsafePointer(to=t)), Int(self.optional.unsafe_ptr()), Int(jobs.unsafe_ptr()), Int(outs.unsafe_ptr()), self.codec),
-                  len(jobs), self.threads)
-        for j in range(len(jobs)):                           # (a group with a bad page writes nothing)
-            if outs[j].error.byte_length() > 0:
-                raise Error(outs[j].error)
         var chunks = List[_Chunk]()
         for _ in range(cols):
             chunks.append(_Chunk(-1, 0, -1, 0, 0, hi - lo))
-        for j in range(len(jobs)):
-            var c = jobs[j].col
-            if chunks[c].offset < 0:
-                chunks[c].offset = self.offset
-            if jobs[j].dict:
-                chunks[c].dict_offset = self.offset
-            elif chunks[c].data_offset == 0:
-                chunks[c].data_offset = self.offset
-            chunks[c].uncompressed += outs[j].uncompressed
-            chunks[c].compressed += len(outs[j].bytes)
-            self.file.write_bytes(Span(outs[j].bytes))
-            self.offset += len(outs[j].bytes)
+        var budget = self.budget if self.budget > 0 else WRITE_BUDGET
+        var start = 0
+        while start < len(jobs):
+            # F-188: a window of pages whose bodies and compressed bytes fit the budget (at least one page) is made at once, written in
+            # order and freed before the next; every page is built and compressed on its own (F-187), so the bytes are the same for any
+            # thread count and any budget
+            var stop = start
+            var used = 0
+            while stop < len(jobs):
+                var need = _page_bytes(t.cols[jobs[stop].col], jobs[stop], self.optional[jobs[stop].col])
+                if stop > start and used + need > budget:
+                    break
+                used += need
+                stop += 1
+            var outs = List[_PageOut]()
+            for _ in range(stop - start):
+                outs.append(_PageOut())
+            run_tasks(_PageTask(Int(UnsafePointer(to=t)), Int(self.optional.unsafe_ptr()), Int(jobs.unsafe_ptr()),
+                                Int(outs.unsafe_ptr()), start, self.codec), stop - start, self.threads)
+            for k in range(stop - start):                    # (the first bad page in file order raises, whatever the threads or the budget)
+                if outs[k].error.byte_length() > 0:
+                    raise Error(outs[k].error)
+            for k in range(stop - start):
+                var j = start + k
+                var c = jobs[j].col
+                if chunks[c].offset < 0:
+                    chunks[c].offset = self.offset
+                if jobs[j].dict:
+                    chunks[c].dict_offset = self.offset
+                elif chunks[c].data_offset == 0:
+                    chunks[c].data_offset = self.offset
+                chunks[c].uncompressed += outs[k].uncompressed
+                chunks[c].compressed += len(outs[k].bytes)
+                self.file.write_bytes(Span(outs[k].bytes))
+                self.offset += len(outs[k].bytes)
+            start = stop
         self.groups.append(chunks^)
         self.rows.append(hi - lo)
         self.total += hi - lo

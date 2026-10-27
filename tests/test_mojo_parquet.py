@@ -1514,3 +1514,40 @@ def test_gpu_scans_that_raise_give_their_device_context_back(tmp_path):
     if held[1] == 0:
         pytest.skip("nvidia-smi cannot see this process's GPU memory (container, MIG or driver permissions)")
     assert held[1000] - held[1] < 60, f"GPU MiB held after 1 failed scan {held[1]}, after 1000: {held[1000]}"
+
+
+# ── F-188: the pages a save makes at once follow a byte budget, not the thread count ─────────────────────
+
+@pytest.fixture(scope="module")
+def budget_probe(tmp_path_factory):
+    out = tmp_path_factory.mktemp("mojo") / "pq_write_budget_probe"
+    subprocess.run(["bash", str(ROOT / "scripts/mojo_build.sh"), str(ROOT / "mojo/tools/pq_write_budget_probe.mojo"), str(out)],
+                   check=True, capture_output=True, text=True)
+    return out
+
+
+def run_budget_probe(probe, tmp_path, rows, threads, budget):
+    p = subprocess.run([str(probe), str(rows), str(tmp_path / f"b{threads}_{budget}.parquet"), str(threads), str(budget)],
+                       capture_output=True, text=True)
+    assert p.returncode == 0, p.stdout + p.stderr
+    res = json.loads(p.stdout.strip().split("\n")[-1])
+    res["growth_kb"] = res["peak_kb"] - res["before_kb"]
+    return res
+
+
+def test_a_save_with_many_threads_holds_pages_within_its_budget(budget_probe, tmp_path):
+    """A 125 MB table of incompressible columns in one row group saved on all threads (24 asked for): the memory the save adds
+    follows the budget it was given (measured: 1 MB adds ~1 MB, 4 MB ~2 MB, 16 MB ~15 MB), and the bytes written do not."""
+    rows = 2_000_000
+    MB = 2**20
+    files = {}
+    for budget in (1 * MB, 4 * MB, 16 * MB):
+        res = run_budget_probe(budget_probe, tmp_path, rows, 24, budget)
+        assert res["table_kb"] == 125000
+        assert res["growth_kb"] * 1024 <= budget + 2 * MB, (budget, res)
+        files[budget] = (tmp_path / f"b24_{budget}.parquet").read_bytes()
+    big = run_budget_probe(budget_probe, tmp_path, rows, 24, 1024 * MB)            # nothing bounds it: the pages of the whole group are held
+    assert big["growth_kb"] * 1024 > 100 * MB, big
+    one = run_budget_probe(budget_probe, tmp_path, rows, 1, 4 * MB)
+    assert one["growth_kb"] * 1024 <= 4 * MB + 2 * MB, one
+    assert files[1 * MB] == files[4 * MB] == files[16 * MB] == (tmp_path / f"b1_{4 * MB}.parquet").read_bytes()
