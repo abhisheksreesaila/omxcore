@@ -1,4 +1,5 @@
-# F-188: how much memory a save adds. Usage: pq_write_budget_probe <rows> <path> <threads> <budget bytes>
+# F-188: how much memory a save adds. Usage: pq_write_budget_probe <rows> <path> <threads> <budget bytes> [compressible]
+# (compressible: values below 1000, which the encoders search for matches in; else random, which they store)
 # Builds a table of eight incompressible INT columns in one row group (rows * 64 bytes), resets the process's peak resident memory
 # (/proc/self/clear_refs 5), saves it with `threads` threads and a `budget`, and prints one JSON line: the table's size and how far the peak
 # rose above what the process held before the save (tests/test_mojo_parquet.py).
@@ -22,6 +23,7 @@ def main() raises:
     var path = String(args[2])
     var threads = Int(String(args[3]))
     var budget = Int(String(args[4]))
+    var small = len(args) > 5 and String(args[5]) == "compressible"
     var t = Table.empty()
     for c in range(8):
         _ = t.add_column("c" + String(c), INT)
@@ -31,7 +33,7 @@ def main() raises:
             s ^= s << 13
             s ^= s >> 7
             s ^= s << 17
-            t.append(c, Int64(s >> 1))
+            t.append(c, Int64((s >> 1) % 1000) if small else Int64(s >> 1))
     with open("/proc/self/clear_refs", "w") as f:
         f.write("5")
     var before = status_kb("VmRSS:")

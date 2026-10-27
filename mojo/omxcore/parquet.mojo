@@ -87,11 +87,13 @@ comptime ZSTD = 6
 comptime NO_CODECS = is_defined["MXFRAME_NO_CODECS"]() or not CompilationTarget.is_linux()    # no C codec libraries: codec.mojo
 
 comptime DEFAULT_ROW_GROUP = 1 << 20
-comptime WRITE_BUDGET = 256 << 20        # F-188: bytes of pages (each counted as its body plus its compressed bytes) a save makes at once, when the caller
-                                        # gives no budget: the threads take pages from a window of this size, which is written in order and freed
-comptime STREAM_WRITE_BUDGET = 4 << 20  # the same for a streamed save (Frame over a scan), whose memory is one row group whatever the file's size: two 1 MB pages
-                                        # in flight (the test's 332 MB file, 250k-row groups: peak 104-106 MB at 4 MB, 109-114 MB at 12 threads with no bound;
-                                        # tests/test_mojo_parquet.py bounds that peak at a third of the file)
+comptime ZSTD_SCRATCH = 12 << 20          # F-188: what compressing one 1 MB page holds besides its body and output (see _scratch)
+comptime WRITE_BUDGET = 256 << 20       # F-188: bytes a save holds in flight when the caller gives no budget: a page being made counts its body, its compressed
+                                        # bytes and its coder's scratch, a finished one waiting for its turn in the file its compressed bytes. A table is resident
+                                        # already, and a 2M-row save with this budget is as fast as with none
+comptime STREAM_WRITE_BUDGET = 57 << 20 # the same for a streamed save (Frame over a scan): four pages being made (4 x 14 MB), as many as F-187's cap of 4 threads
+                                        # allowed. The save's floor is the decoded row group (about 101 MB with one thread in the test), not its pages
+                                        # (tests/test_mojo_parquet.py bounds the peak at a third of the file)
 comptime INT32_MAX = 2147483647
 comptime MAX_DECIMAL = 1_000_000_000_000_000_000      # DECIMAL(18, s): the stored integer has at most 18 digits
 
@@ -273,13 +275,25 @@ def _page_rows(col: Column) -> Int:
     return max(8, ((PAGE_RAW_BYTES * 8) // bits) & ~7)
 
 
-def _page_bytes(col: Column, job: _PageJob, optional: Bool) -> Int:
-    """What making a page holds at once (F-188): its body and its compressed bytes, each about the page's size before compression."""
+def _scratch(codec: Int, raw: Int) -> Int:
+    """What compressing a page of `raw` bytes holds besides its body and its output (F-188): zstd's match table (the Mojo coder's is 2 MB, libzstd's context
+    about 1.5 MB), the Mojo coder's growing output (up to twice its size), block lists, and what the allocator keeps after a free. Calibrated on a 125 MB
+    table, 24 threads, random and compressible values, both builds (tests/test_mojo_parquet.py): the memory a save adds stays under its budget with
+    12 MB a 1 MB page (6-47 MB added at a 64 MB budget); 4 MB and 8 MB did not (+95 MB). Snappy's table is 64 KB."""
+    if codec == ZSTD:
+        return ZSTD_SCRATCH if raw >= (64 << 10) else ZSTD_SCRATCH // 4
+    if codec == SNAPPY:
+        return 256 << 10
+    return 0
+
+
+def _page_bytes(col: Column, job: _PageJob, optional: Bool, codec: Int) -> Int:
+    """What making a page holds at once (F-188): its body and its compressed bytes, each about the page's size before compression, and the coder's scratch."""
     if job.dict:
         var n = 0
         for w in col.dict[].words:
             n += w.byte_length() + 4
-        return 2 * n + 64
+        return 2 * n + _scratch(codec, n) + 64
     var rows = job.hi - job.lo
     var bits = 64
     if col.kind == TEXT:
@@ -288,7 +302,8 @@ def _page_bytes(col: Column, job: _PageJob, optional: Bool) -> Int:
         bits = 1
     elif col.kind == DATE:
         bits = 32
-    return 2 * ((rows * bits + 7) // 8 + (rows // 8 if optional else 0)) + 64
+    var raw = (rows * bits + 7) // 8 + (rows // 8 if optional else 0)
+    return 2 * raw + _scratch(codec, raw) + 64
 
 
 def _dict_page(mut file: List[UInt8], col: Column, codec: Int) raises -> Int:
@@ -483,20 +498,52 @@ struct _PageOut(Movable):
         self.error = String()
 
 
+comptime _AI = Atomic[Scalar[DType.int64]]
+comptime _IP = Pointer[Int64, MutUntrackedOrigin]
+comptime _W_WRITTEN = 0                # pages 0 .. written - 1 are in the file
+comptime _W_LOCK = 1                   # 1 while a thread is laying finished pages out
+comptime _W_STOP = 2                   # 1 once a page failed: nothing more is made or written
+comptime _W_USED = 3                   # bytes the pages hold now: a page being made its whole cost, a finished one not yet in the file its compressed bytes
+comptime _WORDS = 4
+
+
 @fieldwise_init
 struct _PageTask(ParTask):
-    """Job `first + i` into slot `i` of the outputs; nothing is shared but the table, which is only read."""
-    var table: Int                   # address of the Table
+    """Page `i` of a row group (F-187, F-188). A page waits until what the pages hold now (the cost of those being made, the compressed bytes of those
+    made and not yet in the file) plus its own cost fit the budget (the oldest page always goes), is built and compressed on its own, and then
+    whichever thread holds the file lock lays out every finished page from the front, in order, and frees it. So the memory follows the budget
+    however many threads there are, and the bytes do not depend on either."""
+    var table: Int                   # address of the Table (only read)
     var optional: Int                # address of the Bool per column
     var jobs: Int                    # address of the first _PageJob
     var outs: Int                    # address of the first _PageOut
-    var first: Int                   # the job of slot 0 (F-188: a window of the jobs is made at a time)
+    var cost: Int                    # address of n + 1 prefix sums of the pages' costs
+    var done: Int                    # address of n flags, 1 once the page is made
+    var words: Int                   # address of the _W_ words
+    var writer: Int                  # address of the ParquetWriter
+    var chunks: Int                  # address of the first of the row group's _Chunk
+    var n: Int
+    var budget: Int
     var codec: Int
 
     def run(self, i: Int):
+        var w = _IP(unsafe_from_address=self.words)
+        var cost = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=self.cost)
+        var mine = cost[i + 1] - cost[i]
+        while True:
+            if _AI.load(w + _W_STOP) != 0:
+                return
+            var held = _AI.load(w + _W_USED)
+            if i == Int(_AI.load(w + _W_WRITTEN)):
+                _ = _AI.fetch_add(w + _W_USED, Int64(mine))
+                break
+            if Int(held) + mine <= self.budget and _AI.compare_exchange(w + _W_USED, held, held + Int64(mine)):
+                break
+            comptime if THREADS:                         # (a serial build never waits: its one thread makes the pages in order)
+                _ = external_call["sched_yield", Int32]()
         var t = UnsafePointer[Table, MutAnyOrigin](unsafe_from_address=self.table)
         var opt = UnsafePointer[Bool, MutAnyOrigin](unsafe_from_address=self.optional)
-        var job = UnsafePointer[_PageJob, MutAnyOrigin](unsafe_from_address=self.jobs) + self.first + i
+        var job = UnsafePointer[_PageJob, MutAnyOrigin](unsafe_from_address=self.jobs) + i
         var slot = UnsafePointer[_PageOut, MutAnyOrigin](unsafe_from_address=self.outs) + i
         try:
             var buf = List[UInt8]()
@@ -504,9 +551,55 @@ struct _PageTask(ParTask):
                 slot[].uncompressed = _dict_page(buf, t[].cols[job[].col], self.codec)
             else:
                 slot[].uncompressed = _data_page(buf, t[].cols[job[].col], job[].lo, job[].hi, opt[job[].col], self.codec)
-            slot[].bytes = buf^
+            slot[].bytes = buf.copy()        # (a copy holds no more than its bytes; a list grown by appends holds up to twice that, and a finished page waits for its turn in the file)
         except e:
             slot[].error = String(e)
+        _ = _AI.fetch_add(w + _W_USED, Int64(len(slot[].bytes) - mine))      # (the body and the coder's scratch are gone)
+        _ = _AI.fetch_add(_IP(unsafe_from_address=self.done) + i, 1)
+        self._lay_out()
+
+    def _lay_out(self):
+        var w = _IP(unsafe_from_address=self.words)
+        var done = _IP(unsafe_from_address=self.done)
+        var outs = UnsafePointer[_PageOut, MutAnyOrigin](unsafe_from_address=self.outs)
+        var jobs = UnsafePointer[_PageJob, MutAnyOrigin](unsafe_from_address=self.jobs)
+        var wr = UnsafePointer[ParquetWriter, MutAnyOrigin](unsafe_from_address=self.writer)
+        var chunks = UnsafePointer[_Chunk, MutAnyOrigin](unsafe_from_address=self.chunks)
+        while True:
+            var expect = Int64(0)
+            if not _AI.compare_exchange(w + _W_LOCK, expect, 1):
+                return                                       # the thread that holds the lock sees this page: it looks again after it lets go
+            while _AI.load(w + _W_STOP) == 0:
+                var k = Int(_AI.load(w + _W_WRITTEN))
+                if k >= self.n or _AI.load(done + k) == 0:
+                    break
+                if outs[k].error.byte_length() > 0:
+                    _AI.store(w + _W_STOP, 1)
+                    break
+                try:
+                    var c = jobs[k].col
+                    ref ch = chunks[c]
+                    if ch.offset < 0:
+                        ch.offset = wr[].offset
+                    if jobs[k].dict:
+                        ch.dict_offset = wr[].offset
+                    elif ch.data_offset == 0:
+                        ch.data_offset = wr[].offset
+                    ch.uncompressed += outs[k].uncompressed
+                    ch.compressed += len(outs[k].bytes)
+                    wr[].file.write_bytes(Span(outs[k].bytes))
+                    wr[].offset += len(outs[k].bytes)
+                    _ = _AI.fetch_add(w + _W_USED, Int64(-len(outs[k].bytes)))
+                    outs[k].bytes = List[UInt8]()
+                except e:
+                    outs[k].error = String(e)
+                    _AI.store(w + _W_STOP, 1)
+                    break
+                _AI.store(w + _W_WRITTEN, Int64(k + 1))
+            _AI.store(w + _W_LOCK, 0)
+            var k = Int(_AI.load(w + _W_WRITTEN))
+            if _AI.load(w + _W_STOP) != 0 or k >= self.n or _AI.load(done + k) == 0:
+                return
 
 
 struct ParquetWriter(Movable):
@@ -588,41 +681,37 @@ struct ParquetWriter(Movable):
         for _ in range(cols):
             chunks.append(_Chunk(-1, 0, -1, 0, 0, hi - lo))
         var budget = self.budget if self.budget > 0 else WRITE_BUDGET
-        var start = 0
-        while start < len(jobs):
-            # F-188: a window of pages whose bodies and compressed bytes fit the budget (at least one page) is made at once, written in
-            # order and freed before the next; every page is built and compressed on its own (F-187), so the bytes are the same for any
-            # thread count and any budget
-            var stop = start
-            var used = 0
-            while stop < len(jobs):
-                var need = _page_bytes(t.cols[jobs[stop].col], jobs[stop], self.optional[jobs[stop].col])
-                if stop > start and used + need > budget:
-                    break
-                used += need
-                stop += 1
-            var outs = List[_PageOut]()
-            for _ in range(stop - start):
-                outs.append(_PageOut())
-            run_tasks(_PageTask(Int(UnsafePointer(to=t)), Int(self.optional.unsafe_ptr()), Int(jobs.unsafe_ptr()),
-                                Int(outs.unsafe_ptr()), start, self.codec), stop - start, self.threads)
-            for k in range(stop - start):                    # (the first bad page in file order raises, whatever the threads or the budget)
-                if outs[k].error.byte_length() > 0:
-                    raise Error(outs[k].error)
-            for k in range(stop - start):
-                var j = start + k
-                var c = jobs[j].col
-                if chunks[c].offset < 0:
-                    chunks[c].offset = self.offset
-                if jobs[j].dict:
-                    chunks[c].dict_offset = self.offset
-                elif chunks[c].data_offset == 0:
-                    chunks[c].data_offset = self.offset
-                chunks[c].uncompressed += outs[k].uncompressed
-                chunks[c].compressed += len(outs[k].bytes)
-                self.file.write_bytes(Span(outs[k].bytes))
-                self.offset += len(outs[k].bytes)
-            start = stop
+        var n = len(jobs)
+        var cost = List[Int]()                               # F-188: what the pages before page i hold, summed
+        cost.append(0)
+        for j in range(n):
+            cost.append(cost[j] + _page_bytes(t.cols[jobs[j].col], jobs[j], self.optional[jobs[j].col], self.codec))
+        var inflight = 1                                     # the most pages the budget lets run together: no use in more threads than that (waiting ones cost stacks)
+        var lo_page = 0
+        for hi_page in range(1, n + 1):
+            while lo_page < hi_page - 1 and cost[hi_page] - cost[lo_page] > budget:
+                lo_page += 1
+            inflight = max(inflight, hi_page - lo_page)
+        var workers = self.threads
+        if inflight < 16 and inflight < n and (workers <= 0 or inflight < workers):
+            workers = inflight
+        var outs = List[_PageOut]()
+        for _ in range(n):
+            outs.append(_PageOut())
+        var done = unsafe_alloc[Int64](n + _WORDS)           # the page flags, then the words of the task
+        for j in range(n + _WORDS):
+            done[j] = 0
+        # every page is built and compressed on its own (F-187) and laid out in order as the window of pages in flight advances: the same bytes
+        # for any thread count and any budget
+        run_tasks(_PageTask(Int(UnsafePointer(to=t)), Int(self.optional.unsafe_ptr()), Int(jobs.unsafe_ptr()), Int(outs.unsafe_ptr()),
+                            Int(cost.unsafe_ptr()), Int(done), Int(done + n), Int(UnsafePointer(to=self)), Int(chunks.unsafe_ptr()), n, budget, self.codec),
+                  n, workers)
+        done.free()
+        for k in range(n):                                   # (the first bad page in file order raises, whatever the threads or the budget)
+            if outs[k].error.byte_length() > 0:
+                raise Error(outs[k].error)
+        _ = cost[n]
+        _ = jobs[0]
         self.groups.append(chunks^)
         self.rows.append(hi - lo)
         self.total += hi - lo
