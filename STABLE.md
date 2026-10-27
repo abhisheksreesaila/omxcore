@@ -8,25 +8,31 @@ green. Anything newer on `main` may still be in review: don't vendor it.
 
 ## Current stable
 
-**`8017543`** (2026-10-26): faster compressed saves (zstd in parallel, a faster Mojo encoder). Includes everything in
-2585dc9 and 3d2455d.
+**`5053a44`** (2026-10-27): a save's memory follows a byte budget. Includes everything in 8017543, 2585dc9 and
+3d2455d.
 
 ```sh
 # build the package from a clean copy of the stable commit (never from a working checkout), on Linux as before
-git -C <omxcore> archive 8017543 | tar -x -C <scratch>
+git -C <omxcore> archive 5053a44 | tar -x -C <scratch>
 cd <scratch> && pixi run bash scripts/build_mojo_pkg.sh      # -> build/omxcore.mojoc (and build/mxframe.mojoc)
-cp build/omxcore.mojoc <app>/vendor/ && echo 8017543 > <app>/vendor/OMXCORE_COMMIT
+cp build/omxcore.mojoc <app>/vendor/ && echo 5053a44 > <app>/vendor/OMXCORE_COMMIT
 ```
 
 The Mac build commands are unchanged from 3d2455d (below). **No new libSystem symbols** (`scripts/check_mac_link.sh`
 OK). For parallel saves on the Mac, build the app with `-D MXFRAME_JOB_THREADS` (the pthread symbols listed under
 23edc59, nothing more); without it, saves run on one thread.
 
-## What changed since the previous stable (2585dc9), for apps
+## What changed since the previous stable (8017543), for apps
 
 | Area | What you get | Ticket |
 |---|---|---|
-| Parallel saves | `write_parquet(..., threads=n)` (0 = every thread the build has) compresses a row group's pages on several threads: Linux always; macOS / iOS with `-D MXFRAME_JOB_THREADS`; otherwise serial. The file is byte-identical for any thread count. 2M rows, zstd with the Mojo codec: 0.60 s before, 0.36 s on one thread, 0.06-0.07 s on 12 threads (libzstd: 0.22 s / 0.035 s). Saves of a streamed Frame use at most 4 threads (memory bound) | F-187 |
+| Save memory | `write_parquet(..., budget=)` and `Frame.save(..., budget=)` (bytes; 0 = default): a parallel save keeps the pages it holds in flight, the coder's working memory included, within the budget, for any data. Defaults: 256 MB for a table, 57 MB for a streamed Frame. Same file bytes for any thread count and budget. Streamed saves keep 8017543's speed and peak; the fixed 4-thread cap is gone. A tiny budget (1-4 MB) saves one page at a time: a 125 MB table takes ~0.35 s instead of 0.06 s | F-188 |
+
+## What changed in 8017543 (since 2585dc9), for apps
+
+| Area | What you get | Ticket |
+|---|---|---|
+| Parallel saves | `write_parquet(..., threads=n)` (0 = every thread the build has) compresses a row group's pages on several threads: Linux always; macOS / iOS with `-D MXFRAME_JOB_THREADS`; otherwise serial. The file is byte-identical for any thread count. 2M rows, zstd with the Mojo codec: 0.60 s before, 0.36 s on one thread, 0.06-0.07 s on 12 threads (libzstd: 0.22 s / 0.035 s). Saves of a streamed Frame used at most 4 threads (replaced by a byte budget in 5053a44) | F-187 |
 | Pages | big columns are written as ~1 MB data pages (every build, Linux included): pyarrow and DuckDB read them, and files open faster (0.040 s to 0.022 s) because pages decode in parallel | F-187 |
 | Size | zstd files within 0.2% of libzstd level 3 | F-187 |
 
@@ -106,6 +112,7 @@ and a repro for a bug. Needs that are generic go into the engine; app-specific o
 ## History
 | Stable | Date | Highlights |
 |---|---|---|
+| `5053a44` | 2026-10-27 | a save's memory follows a byte budget (`budget=`) |
 | `8017543` | 2026-10-26 | parallel zstd saves, faster Mojo encoder, ~1 MB pages |
 | `2585dc9` | 2026-10-26 | stddev / variance, quantile bins, ISO week; streamed CSV; undo for formulas; compressed Parquet on the Mac |
 | `3d2455d` | 2026-10-25 | Apple GPU (Metal): Int64 word, atomic-free modes, 32 KB; `gpu_device()`; the omxcore name |
