@@ -180,6 +180,28 @@ def main() raises:
     var back = read_parquet(path)
     expect(back.table.rows() == 1000 and back.table.get(0, 999) == Int64(999) * 0x9E3779B97F4A7C15, "and read back exactly")
 
+    # F-187: the columns of a row group are compressed on every thread the build has (a plain serial build: none, one with
+    # -D MXFRAME_JOB_THREADS: pthreads, no async runtime); the file is the same bytes for any count
+    var wide = Table.empty()
+    for c in range(6):
+        _ = wide.add_column("c" + String(c), INT)
+    for i in range(5000):
+        for c in range(6):
+            wide.append(c, Int64(i * (c + 1)) % 977)
+    write_parquet(path + ".t1", wide, "", ZSTD, 2000, threads=1)
+    var want_bytes = open(path + ".t1", "r").read_bytes()
+    for count_of_threads in [0, 2, 4]:
+        write_parquet(path + ".tn", wide, "", ZSTD, 2000, threads=count_of_threads)
+        var got_bytes = open(path + ".tn", "r").read_bytes()
+        var same_bytes = len(got_bytes) == len(want_bytes)
+        if same_bytes:
+            for i in range(len(want_bytes)):
+                if got_bytes[i] != want_bytes[i]:
+                    same_bytes = False
+                    break
+        expect(same_bytes, "threads=" + String(count_of_threads) + " writes the single-thread file's bytes")
+    expect(read_parquet(path + ".tn").table.get(5, 4999) == Int64(4999 * 6) % 977, "and it reads back")
+
     # a streamed query (F-140) over it: the same numbers, on the CPU
     var streamed = Query(scan_parquet(path)).agg(count(), min_of(col("x")), max_of(col("x"))).compute(AUTO)
     var whole = Query(back.take_table().share()).agg(count(), min_of(col("x")), max_of(col("x"))).compute(AUTO)

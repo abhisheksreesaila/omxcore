@@ -11,7 +11,7 @@ How omxcore's kinds are stored (any Parquet reader understands them):
   TEXT     BYTE_ARRAY (STRING): a dictionary page with the column's words, data pages of dictionary indices
 A column with nulls is OPTIONAL: its definition levels are the validity bitmap's bits (Parquet packs them the same
 way, least significant first), written as bit-packed runs. Pages are compressed with zstd (default), snappy or not
-at all; one data page per column per row group. `write_parquet` writes to `path + ".tmp"` and renames it into place,
+at all; a column of a row group is cut into data pages of about 1 MB (PAGE_RAW_BYTES). `write_parquet` writes to `path + ".tmp"` and renames it into place,
 so a crash or a refused table never destroys an existing file.
 
 Reading takes what other writers produce: signed and unsigned integers of 8 to 64 bits (a UINT_64 past the int64 range
@@ -34,6 +34,7 @@ from std.sys import is_defined, CompilationTarget
 from std.bit import pop_count, byte_swap
 from .codec import zstd_compress, zstd_decompress, snappy_compress, snappy_decompress
 from .job import JobCtl, STAGE_READ, STAGE_WRITE, THREADS      # F-175
+from .fan import ParTask, run_tasks                              # F-187
 from .kernels._fpenv import par_n, core_count
 from std.collections import Dict
 from std.memory import ArcPointer
@@ -86,6 +87,9 @@ comptime ZSTD = 6
 comptime NO_CODECS = is_defined["MXFRAME_NO_CODECS"]() or not CompilationTarget.is_linux()    # no C codec libraries: codec.mojo
 
 comptime DEFAULT_ROW_GROUP = 1 << 20
+comptime STREAM_WRITE_THREADS = 4       # most threads that compress a streamed save (Frame over a scan): its memory is one row group whatever the
+                                        # file's size, and workers add to it (the test's 332 MB file, 250k-row groups, measured: 1 thread 101 MB at the peak,
+                                        # 2 to 4 threads 105 to 108 MB, 12 threads 116 MB; tests/test_mojo_parquet.py bounds that peak at a third of the file)
 comptime INT32_MAX = 2147483647
 comptime MAX_DECIMAL = 1_000_000_000_000_000_000      # DECIMAL(18, s): the stored integer has at most 18 digits
 
@@ -209,15 +213,17 @@ struct _Chunk(Copyable, Movable):
 
 
 def write_parquet(path: String, t: SharedTable, metadata: String = "", compression: Int = ZSTD,
-                  row_group_rows: Int = DEFAULT_ROW_GROUP, job: JobCtl = JobCtl()) raises:
+                  row_group_rows: Int = DEFAULT_ROW_GROUP, job: JobCtl = JobCtl(), threads: Int = 0) raises:
     """Writes the table to `path`; `metadata` (a JSON string) is stored under the key "omx". `job` (F-175): the background job it
-    runs for; a cancel is seen between row groups, and a cancelled write leaves `path` as it was."""
-    _write(path, t._table[], metadata, compression, row_group_rows, job)
+    runs for; a cancel is seen between row groups, and a cancelled write leaves `path` as it was. `threads` (F-187): at most
+    this many threads compress the columns of a row group (0: every thread the build has; 1: the calling thread); the file is
+    the same bytes for any number."""
+    _write(path, t._table[], metadata, compression, row_group_rows, job, threads)
 
 
 def write_parquet(path: String, t: Table, metadata: String = "", compression: Int = ZSTD,
-                  row_group_rows: Int = DEFAULT_ROW_GROUP, job: JobCtl = JobCtl()) raises:
-    _write(path, t, metadata, compression, row_group_rows, job)
+                  row_group_rows: Int = DEFAULT_ROW_GROUP, job: JobCtl = JobCtl(), threads: Int = 0) raises:
+    _write(path, t, metadata, compression, row_group_rows, job, threads)
 
 
 def _page_header(mut b: List[UInt8], kind: Int, uncompressed: Int, compressed: Int, values: Int, encoding: Int):
@@ -248,102 +254,162 @@ def _check_page(col: Column, uncompressed: Int, compressed: Int) raises:
                     " (use a smaller row_group_rows)")
 
 
-def _column_pages(mut file: List[UInt8], col: Column, lo: Int, hi: Int, optional: Bool, codec: Int) raises -> _Chunk:
-    """Appends one column chunk (rows lo..hi) to `file`."""
-    if hi - lo > INT32_MAX:
-        raise Error("column `" + col.name + "`: " + String(hi - lo) + " rows in one row group do not fit a Parquet page (use a smaller row_group_rows)")
-    var chunk = _Chunk(len(file), 0, -1, 0, 0, hi - lo)
-    var start = len(file)
-    if col.kind == TEXT:                                # the dictionary page: every word, PLAIN
-        var d = List[UInt8]()
-        for word in col.dict[].words:
-            var bytes = word.as_bytes()
-            _put32(d, len(bytes))
-            for c in bytes:
-                d.append(c)
-        var cd = _compress(codec, d)
-        _check_page(col, len(d), len(cd))
-        chunk.dict_offset = len(file)
-        _page_header(file, PAGE_DICTIONARY, len(d), len(cd), len(col.dict[].words), ENC_PLAIN)
-        chunk.uncompressed += len(file) - chunk.dict_offset + len(d)       # header + page, uncompressed
-        file.extend(cd^)
+comptime PAGE_RAW_BYTES = 1 << 20        # a data page holds about this much before compression (F-187): a big column is cut into pages,
+                                          # which threads compress side by side. Readers take any number of pages (every other writer makes them).
+
+
+def _page_rows(col: Column) -> Int:
+    """Rows in a full data page of `col`: PAGE_RAW_BYTES of its values, a multiple of 8 (the bit-packed runs count groups of 8)."""
+    var bits = 64
+    if col.kind == TEXT:
+        bits = max(_bit_width(len(col.dict[].words) - 1), 1)
+    elif col.kind == BOOL:
+        bits = 1
+    elif col.kind == DATE:
+        bits = 32
+    return max(8, ((PAGE_RAW_BYTES * 8) // bits) & ~7)
+
+
+def _dict_page(mut file: List[UInt8], col: Column, codec: Int) raises -> Int:
+    """Appends the dictionary page of a TEXT column (every word, PLAIN); returns its header plus uncompressed bytes."""
+    var d = List[UInt8]()
+    for word in col.dict[].words:
+        var bytes = word.as_bytes()
+        _put32(d, len(bytes))
+        for c in bytes:
+            d.append(c)
+    var cd = _compress(codec, d)
+    _check_page(col, len(d), len(cd))
+    var at = len(file)
+    _page_header(file, PAGE_DICTIONARY, len(d), len(cd), len(col.dict[].words), ENC_PLAIN)
+    var uncompressed = len(file) - at + len(d)
+    file.extend(cd^)
+    return uncompressed
+
+
+comptime _BytePtr = UnsafePointer[UInt8, MutAnyOrigin]
+comptime _WordPtr = UnsafePointer[Int64, MutAnyOrigin]
+
+
+def _page_body(col: Column, lo: Int, hi: Int, optional: Bool) raises -> List[UInt8]:
+    """The bytes of a data page before compression: definition levels (an OPTIONAL column), then the values of the rows that are not null."""
+    var n = hi - lo
+    var has = len(col.validity) > 0
+    var vp = _BytePtr(unsafe_from_address=Int(col.validity.unsafe_ptr()))
+    var vals = _WordPtr(unsafe_from_address=Int(col.values.unsafe_ptr()))
+    var present = n
+    if has:
+        present = 0
+        for row in range(lo, hi):
+            present += Int((vp[row >> 3] >> UInt8(row & 7)) & 1)
     var body = List[UInt8]()
     if optional:                                        # definition levels: the validity bits, bit-packed runs
         var levels = List[UInt8]()
-        var n = hi - lo
         var groups = (n + 7) // 8
         _put_varint(levels, (groups << 1) | 1)
+        var at = len(levels)
+        levels.resize(at + groups, 0)
+        var lp = _BytePtr(unsafe_from_address=Int(levels.unsafe_ptr())) + at
         for g in range(groups):
             var byte = UInt8(0)
-            for k in range(8):
-                var row = lo + 8 * g + k
-                if row < hi and not col.is_null(row):
-                    byte |= UInt8(1) << UInt8(k)
-            levels.append(byte)
+            if lo % 8 == 0 and has:                     # the validity bitmap is the levels' layout: copy the byte, mask what is past `hi`
+                byte = vp[(lo >> 3) + g]
+                if g == groups - 1 and n % 8 != 0:
+                    byte &= UInt8((1 << (n % 8)) - 1)
+            else:
+                for k in range(8):
+                    var row = lo + 8 * g + k
+                    if row < hi and ((not has) or ((vp[row >> 3] >> UInt8(row & 7)) & 1) != 0):
+                        byte |= UInt8(1) << UInt8(k)
+            lp[g] = byte
         _put32(body, len(levels))
         body.extend(levels^)
     if col.kind == TEXT:                                # dictionary indices: bit width, then bit-packed runs
         var w = max(_bit_width(len(col.dict[].words) - 1), 1)
         body.append(UInt8(w))
-        var idx = List[Int64]()
-        for row in range(lo, hi):
-            if not col.is_null(row):
-                idx.append(col.values[row])
-        var groups = (len(idx) + 7) // 8
+        var groups = (present + 7) // 8
         _put_varint(body, (groups << 1) | 1)
+        var at = len(body)
+        body.resize(at + groups * w, 0)                 # 8 values of w bits are w bytes
+        var bp = _BytePtr(unsafe_from_address=Int(body.unsafe_ptr())) + at
         var acc: UInt64 = 0
         var nbits = 0
-        for i in range(groups * 8):
-            var v = UInt64(idx[i]) if i < len(idx) else 0
-            acc |= v << UInt64(nbits)
+        var o = 0
+        var left = groups * 8 - present                 # the last group is padded with zeros
+        for row in range(lo, hi):
+            if has and ((vp[row >> 3] >> UInt8(row & 7)) & 1) == 0:
+                continue
+            acc |= UInt64(vals[row]) << UInt64(nbits)
             nbits += w
             while nbits >= 8:
-                body.append(UInt8(acc & 0xFF))
+                bp[o] = UInt8(acc & 0xFF)
+                o += 1
+                acc >>= 8
+                nbits -= 8
+        for _ in range(left):
+            nbits += w
+            while nbits >= 8:
+                bp[o] = UInt8(acc & 0xFF)
+                o += 1
                 acc >>= 8
                 nbits -= 8
         if nbits > 0:
-            body.append(UInt8(acc & 0xFF))
+            bp[o] = UInt8(acc & 0xFF)
     elif col.kind == BOOL:                              # PLAIN booleans: one bit each, least significant first
-        var acc = 0
+        var at = len(body)
+        body.resize(at + (present + 7) // 8, 0)
+        var bp = _BytePtr(unsafe_from_address=Int(body.unsafe_ptr())) + at
         var k = 0
         for row in range(lo, hi):
-            if col.is_null(row):
+            if has and ((vp[row >> 3] >> UInt8(row & 7)) & 1) == 0:
                 continue
-            if col.values[row] != 0:
-                acc |= 1 << k
+            if vals[row] != 0:
+                bp[k >> 3] |= UInt8(1) << UInt8(k & 7)
             k += 1
-            if k == 8:
-                body.append(UInt8(acc))
-                acc = 0
-                k = 0
-        if k > 0:
-            body.append(UInt8(acc))
     elif col.kind == DATE:
+        var at = len(body)
+        body.resize(at + present * 4, 0)
+        var bp = _BytePtr(unsafe_from_address=Int(body.unsafe_ptr())) + at
+        var o = 0
         for row in range(lo, hi):
-            if not col.is_null(row):
-                var v = col.values[row]
-                if v < Int64(Int32.MIN) or v > Int64(Int32.MAX):
-                    raise Error("column `" + col.name + "`: day " + String(v) + " does not fit a Parquet DATE")
-                _put32(body, Int(v))
+            if has and ((vp[row >> 3] >> UInt8(row & 7)) & 1) == 0:
+                continue
+            var v = vals[row]
+            if v < Int64(Int32.MIN) or v > Int64(Int32.MAX):
+                raise Error("column `" + col.name + "`: day " + String(v) + " does not fit a Parquet DATE")
+            (bp + o).bitcast[Int32]().store[alignment=1](Int32(v))
+            o += 4
     else:                                               # INT, DECIMAL, FLOAT: PLAIN int64 (a FLOAT's bits are the DOUBLE's)
+        var at = len(body)
+        body.resize(at + present * 8, 0)
+        var bp = _BytePtr(unsafe_from_address=Int(body.unsafe_ptr())) + at
+        var o = 0
+        var decimal = col.kind == DECIMAL
         for row in range(lo, hi):
-            if not col.is_null(row):
-                var v = col.values[row]
-                if col.kind == DECIMAL and (v >= Int64(MAX_DECIMAL) or v <= -Int64(MAX_DECIMAL)):
-                    raise Error("column `" + col.name + "`: " + String(v) + " does not fit DECIMAL(18, " +
-                                String(col.scale) + ") (more than 18 digits)")
-                _put64(body, v)
+            if has and ((vp[row >> 3] >> UInt8(row & 7)) & 1) == 0:
+                continue
+            var v = vals[row]
+            if decimal and (v >= Int64(MAX_DECIMAL) or v <= -Int64(MAX_DECIMAL)):
+                raise Error("column `" + col.name + "`: " + String(v) + " does not fit DECIMAL(18, " +
+                            String(col.scale) + ") (more than 18 digits)")
+            (bp + o).bitcast[Int64]().store[alignment=1](v)
+            o += 8
+    return body^
+
+
+def _data_page(mut file: List[UInt8], col: Column, lo: Int, hi: Int, optional: Bool, codec: Int) raises -> Int:
+    """Appends one data page (rows lo..hi of `col`); returns its header plus uncompressed bytes."""
+    var body = _page_body(col, lo, hi, optional)
     var cb = _compress(codec, body)
     _check_page(col, len(body), len(cb))
-    chunk.data_offset = len(file)
+    var at = len(file)
     _page_header(file, PAGE_DATA, len(body), len(cb), hi - lo, ENC_RLE_DICTIONARY if col.kind == TEXT else ENC_PLAIN)
-    chunk.uncompressed += len(file) - chunk.data_offset + len(body)
+    var uncompressed = len(file) - at + len(body)
     file.extend(cb^)
-    chunk.compressed = len(file) - start
-    return chunk^
+    return uncompressed
 
 
-def _write(path: String, t: Table, metadata: String, requested: Int, row_group_rows: Int, job: JobCtl = JobCtl()) raises:
+def _write(path: String, t: Table, metadata: String, requested: Int, row_group_rows: Int, job: JobCtl = JobCtl(), threads: Int = 0) raises:
     t.check()
     if t.columns() == 0:
         raise Error("a table with no columns cannot be written as Parquet")
@@ -353,6 +419,7 @@ def _write(path: String, t: Table, metadata: String, requested: Int, row_group_r
     for c in range(t.columns()):
         optional.append(t.cols[c].nulls > 0)
     var w = ParquetWriter(path, t, optional, requested)
+    w.threads = threads
     try:
         var n = t.rows()
         var lo = 0
@@ -371,6 +438,52 @@ def _write(path: String, t: Table, metadata: String, requested: Int, row_group_r
     except e:
         w.abort()
         raise e^
+
+
+@fieldwise_init
+struct _PageJob(Copyable, Movable):
+    """One page to make: rows lo..hi of column `col`, or the column's dictionary."""
+    var col: Int
+    var lo: Int
+    var hi: Int
+    var dict: Bool
+
+
+struct _PageOut(Movable):
+    """A page as a thread made it: header and compressed bytes."""
+    var bytes: List[UInt8]
+    var uncompressed: Int            # header plus the page before compression
+    var error: String                # set when the page cannot be written (checked in page order, so the error never depends on timing)
+
+    def __init__(out self):
+        self.bytes = List[UInt8]()
+        self.uncompressed = 0
+        self.error = String()
+
+
+@fieldwise_init
+struct _PageTask(ParTask):
+    """Page `i` of the jobs into slot `i` of the outputs; nothing is shared but the table, which is only read."""
+    var table: Int                   # address of the Table
+    var optional: Int                # address of the Bool per column
+    var jobs: Int                    # address of the first _PageJob
+    var outs: Int                    # address of the first _PageOut
+    var codec: Int
+
+    def run(self, i: Int):
+        var t = UnsafePointer[Table, MutAnyOrigin](unsafe_from_address=self.table)
+        var opt = UnsafePointer[Bool, MutAnyOrigin](unsafe_from_address=self.optional)
+        var job = UnsafePointer[_PageJob, MutAnyOrigin](unsafe_from_address=self.jobs) + i
+        var slot = UnsafePointer[_PageOut, MutAnyOrigin](unsafe_from_address=self.outs) + i
+        try:
+            var buf = List[UInt8]()
+            if job[].dict:
+                slot[].uncompressed = _dict_page(buf, t[].cols[job[].col], self.codec)
+            else:
+                slot[].uncompressed = _data_page(buf, t[].cols[job[].col], job[].lo, job[].hi, opt[job[].col], self.codec)
+            slot[].bytes = buf^
+        except e:
+            slot[].error = String(e)
 
 
 struct ParquetWriter(Movable):
@@ -394,9 +507,11 @@ struct ParquetWriter(Movable):
     var groups: List[List[_Chunk]]
     var rows: List[Int]
     var total: Int
+    var threads: Int                     # F-187: most threads that compress the columns of a group (0: all the build has)
 
     def __init__(out self, path: String, shape: Table, optional: List[Bool], compression: Int) raises:
         self.codec = compression
+        self.threads = 0
         self.path = path
         # The temp name carries the process id, so two processes saving the same path never share a temp file.
         # (F-175) and the address of a fresh allocation and the clock: two saves to one path in one process (a cancelled save that is
@@ -431,17 +546,43 @@ struct ParquetWriter(Movable):
         """Appends rows lo..hi of `t` as one row group."""
         if t.columns() != self.schema.columns():
             raise Error("a row group has " + String(t.columns()) + " columns, the file " + String(self.schema.columns()))
-        var buf = List[UInt8]()
+        var cols = t.columns()
+        var jobs = List[_PageJob]()                          # per column: its dictionary page, then its data pages, in file order
+        for c in range(cols):
+            if t.cols[c].kind == TEXT:
+                jobs.append(_PageJob(c, 0, 0, True))
+            var step = _page_rows(t.cols[c])
+            var r = lo
+            while True:                                      # (a group with no rows still has one page)
+                var e = min(r + step, hi)
+                jobs.append(_PageJob(c, r, e, False))
+                r = e
+                if r >= hi:
+                    break
+        var outs = List[_PageOut]()
+        for _ in range(len(jobs)):
+            outs.append(_PageOut())
+        # every page is built and compressed on its own (F-187), then laid out in order: the same bytes for any thread count
+        run_tasks(_PageTask(Int(UnsafePointer(to=t)), Int(self.optional.unsafe_ptr()), Int(jobs.unsafe_ptr()), Int(outs.unsafe_ptr()), self.codec),
+                  len(jobs), self.threads)
+        for j in range(len(jobs)):                           # (a group with a bad page writes nothing)
+            if outs[j].error.byte_length() > 0:
+                raise Error(outs[j].error)
         var chunks = List[_Chunk]()
-        for c in range(t.columns()):
-            var ch = _column_pages(buf, t.cols[c], lo, hi, self.optional[c], self.codec)
-            ch.offset += self.offset                       # `buf` starts where the file stands
-            ch.data_offset += self.offset
-            if ch.dict_offset >= 0:
-                ch.dict_offset += self.offset
-            chunks.append(ch^)
-        self.file.write_bytes(Span(buf))
-        self.offset += len(buf)
+        for _ in range(cols):
+            chunks.append(_Chunk(-1, 0, -1, 0, 0, hi - lo))
+        for j in range(len(jobs)):
+            var c = jobs[j].col
+            if chunks[c].offset < 0:
+                chunks[c].offset = self.offset
+            if jobs[j].dict:
+                chunks[c].dict_offset = self.offset
+            elif chunks[c].data_offset == 0:
+                chunks[c].data_offset = self.offset
+            chunks[c].uncompressed += outs[j].uncompressed
+            chunks[c].compressed += len(outs[j].bytes)
+            self.file.write_bytes(Span(outs[j].bytes))
+            self.offset += len(outs[j].bytes)
         self.groups.append(chunks^)
         self.rows.append(hi - lo)
         self.total += hi - lo

@@ -115,21 +115,35 @@ the code is written from RFC 8878 (zstd) and snappy's `format_description.txt`, 
 (`tests/test_codec_mojo.py`, through `mojo/tools/pq_recode.mojo` built with `-D MXFRAME_NO_CODECS`). The decoder reads
 all of zstd but dictionaries, and is strict: checksums verified, offsets bounded by frame start and window, sizes
 checked before allocating; the encoder writes one frame with a 1 MB
-window. Against libzstd level 3 / libsnappy on a realistic table (`mojo/tools/bench_codec_write.mojo`: 2 million
-orders, 8 columns with nulls, text and dates, 74.6 MB plain; Linux, best of three, a lightly loaded machine):
+window per page. Against libzstd level 3 / libsnappy on a realistic table (`mojo/tools/bench_codec_write.mojo <rows> <path>
+[threads]`: 2 million orders, 8 columns with nulls, text and dates, 74.6 MB plain; Linux, Ryzen 9 5900X, best of five inside
+the bench, run twice, load average 2 on a 24-thread machine that is not quiet):
 
-| | file | save (all of `write_parquet`) | open (`read_parquet`) |
-|---|---|---|---|
-| zstd, libzstd level 3 | 16,058,417 bytes (4.64x) | 0.28 s | 0.031 s |
-| zstd, Mojo | 16,067,618 bytes (4.64x) | 0.60 s | 0.040 s |
-| snappy, libsnappy | 31,411,775 bytes (2.37x) | 0.15 s | 0.034 s |
-| snappy, Mojo | 31,189,911 bytes (2.39x) | 0.18 s | 0.027 s |
-| no codec | 74,587,922 bytes | 0.14 s | 0.014 s |
+| | file | save, 1 thread | save, all threads | open (`read_parquet`) |
+|---|---|---|---|---|
+| zstd, libzstd level 3 | 15,994,016 bytes (4.66x) | 0.220 s | 0.035 s | 0.017 s |
+| zstd, Mojo | 16,025,403 bytes (4.65x) | 0.36 s | 0.058 to 0.071 s | 0.022 to 0.028 s |
+| snappy, libsnappy | 31,420,051 bytes (2.37x) | 0.093 s | 0.034 to 0.038 s | 0.019 to 0.028 s |
+| snappy, Mojo | 31,209,841 bytes (2.39x) | 0.124 s | 0.034 to 0.043 s | 0.016 s |
+| no codec | 74,589,554 bytes | 0.073 s | 0.063 s | 0.013 s |
 
-The same size to a few hundredths of a percent; reading about as fast; snappy as fast; zstd writing about twice the
-time of a whole save (the compression itself roughly three times libzstd's: ~160 MB/s of page bytes against ~500).
-Writing is the slow side: the matcher is plain and single-threaded (a Mac build with a thread pool could compress the
-columns of a row group in parallel).
+Before F-187 the same save took 0.595 s with the Mojo zstd and 0.268 s with libzstd (one thread each, files 16,067,618 and
+16,058,417 bytes). The Mojo zstd save is now 1.6x libzstd's on one thread (was 2.2x) and 1.7 to 2x with every thread (the pool has
+the 12 physical cores); compressing alone, on the columns of that table plus TPC-H lineitem columns, source text and a shared
+library (13 inputs, 64 MB), the encoder takes 342 ms against libzstd level 3's 186 ms on one thread (1.8x; it was 528 ms,
+2.8x) and writes 0.5% fewer bytes. The 1.5x target was not reached on one thread.
+
+**Threads in a save** (F-187, `omxcore/fan.mojo`). A column of a row group is cut into data pages of about 1 MB (131,072
+INT rows; smaller columns stay one page), and every page is built and compressed on its own; the pages are then written in
+order, so the file is the same bytes for any number of threads (`write_parquet(..., threads=n)`: 0 is every thread the build
+has, 1 the calling thread; tested for 1, 2, 3, 5, 8 and all, both codecs, with pyarrow and DuckDB reading the result).
+The threads are the build's own: Linux with the pool uses `par_n` (workers take the next page as they finish one, because
+pages differ 50-fold in cost), a **plain Mac build stays serial** (no async runtime, as before), and a serial build
+with `-D MXFRAME_JOB_THREADS` fans out over pthreads with the calls its jobs already need (`pthread_create`, `pthread_join`,
+`pthread_attr_*`) and `sysconf`: `scripts/check_mac_link.sh` reports no new symbol. A save that streams a file (a Frame over a
+scan) uses at most 4 threads, because its memory is bounded by one row group and each worker adds a few MB. Reading is
+faster too: a file saved this way has several pages per column, which `read_parquet` decodes in parallel (0.040 s to
+0.022 s on the table above).
 
 AUTO and the GPU: `compute(AUTO)` goes to the CPU when the GPU path fails for one of two reasons only, an allocation
 failure for the query's buffers or a program the kernel declines (-5 shared memory, -6 group table; on an Apple GPU
