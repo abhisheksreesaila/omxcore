@@ -18,7 +18,13 @@ priced in bits; literals are Huffman coded (1 or 4 streams, weights direct or FS
 sequences are coded with the predefined, a repeated-symbol or a purpose-built FSE table, whichever costs fewer bits,
 and with repeat offsets; a block that does not shrink is stored, a block of one byte repeated is a run. It does not
 reuse tables between blocks. On the tables omxcore saves, files come out the size of libzstd level 3's or smaller,
-at about a third of its speed (mojo/README.md: Build switches).
+at about half of its speed on one thread (mojo/README.md: Build switches); `write_parquet` compresses the pages of a row
+group on every thread the build has (fan.mojo), each page a frame of its own.
+
+Speed (F-187): the hot loops (matcher, sequences, literal and Huffman streams) work through raw pointers into buffers sized
+before the loop, because a bounds-checked List index and an append in a per-byte or per-sequence loop cost about as much as the
+work itself (the same output, a quarter faster). The matcher indexes every position of a short match but only the first and
+last 8 of a long one, and after a long stretch with no match it skips up to 16 bytes at a step (libzstd's acceleration).
 """
 from std.bit import count_trailing_zeros, count_leading_zeros
 
@@ -1645,15 +1651,6 @@ struct _ZEnc:
             while c + 1 < 53 and self.ml_base[c + 1] <= v + 3:
                 c += 1
             self.ml_lut[v] = c
-
-    @always_inline
-    def ll_code(self, v: Int) -> Int:
-        return self.ll_lut[v] if v < 64 else _highbit(v) + 19
-
-    @always_inline
-    def ml_code(self, m: Int) -> Int:
-        var v = m - 3
-        return self.ml_lut[v] if v < 128 else _highbit(v) + 36
 
     def offset_value(mut self, off: Int, ll: Int) -> Int:
         """The offset as a sequence states it, updating the repeat offsets the way the decoder will."""

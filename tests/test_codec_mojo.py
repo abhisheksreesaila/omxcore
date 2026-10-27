@@ -92,8 +92,9 @@ SOURCES = {
 }
 
 
-def run(recode, src, dst, codec, group=1 << 20):
-    subprocess.run([str(recode), str(src), str(dst), codec, str(group)], check=True, capture_output=True)
+def run(recode, src, dst, codec, group=1 << 20, threads=None):
+    extra = [] if threads is None else [str(threads)]
+    subprocess.run([str(recode), str(src), str(dst), codec, str(group), *extra], check=True, capture_output=True)
 
 
 def same_table(got, want):
@@ -191,3 +192,30 @@ def test_a_c_codec_file_opens_on_the_no_codec_build_and_back(recode, tmp_path):
     run(recode, a, b, "snappy")           # the Mojo codecs read zstd and write snappy
     run(c_build, b, c, "zstd")            # libsnappy reads what the Mojo snappy wrote
     assert same_table(pq.read_table(c), table)
+
+
+@pytest.mark.parametrize("build", ["mojo codecs", "C libraries"])
+def test_the_file_is_the_same_bytes_for_any_thread_count(recode, tmp_path, build):
+    """F-187: the pages of a row group are compressed on several threads and laid out in order. 400,000 rows in two row groups
+    (an INT column is cut into pages of 131,072 rows): one thread, two, five and all of them write the same file, and
+    pyarrow and DuckDB read it."""
+    if build == "mojo codecs":
+        tool = recode
+    else:
+        tool = tmp_path / "pq_recode_c"
+        subprocess.run(["bash", str(ROOT / "scripts/mojo_build.sh"), str(ROOT / "mojo/tools/pq_recode.mojo"), str(tool), "--no-package"],
+                       check=True, capture_output=True, text=True)
+    table = schema_table(400_000)
+    src = tmp_path / "src.parquet"
+    pq.write_table(table, src, compression="none", row_group_size=1 << 20)
+    for codec in ("zstd", "snappy"):
+        files = {}
+        for threads in (1, 2, 5, 0):
+            dst = tmp_path / f"{codec}-{threads}.parquet"
+            run(tool, src, dst, codec, group=250_000, threads=threads)
+            files[threads] = dst.read_bytes()
+        assert files[2] == files[1] and files[5] == files[1] and files[0] == files[1], f"{codec}: the bytes depend on the thread count"
+        dst = tmp_path / f"{codec}-0.parquet"
+        assert pq.read_metadata(dst).num_row_groups == 2
+        assert same_table(pq.read_table(dst), table)
+        assert same_table(duck_rows(dst), table)
