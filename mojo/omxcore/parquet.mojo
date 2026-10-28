@@ -2678,6 +2678,7 @@ struct _ScanInfo(Movable):
     var extra: List[String]          # the file's other key-value metadata (key, value, ...)
     var build_lock: List[Int64]      # F-175: one word, 1 while a thread builds a dictionary (a job and its caller share a scan)
     var is_csv: Bool                 # F-178: the rows are a CSV file's (`scan_csv`): `csv` holds its row groups, and `leaves` / `groups` are made from it
+    var gpu_oom_free: Int            # F-189: the free GPU bytes when a query over this file last ran out of GPU memory (0: none did)
     var csv: CsvSource
 
     def __init__(out self, path: String, var file: FileHandle, size: Int, var leaves: List[_Leaf],
@@ -2688,6 +2689,7 @@ struct _ScanInfo(Movable):
         self.loaded = List[Int64](length=len(leaves), fill=0)
         self.build_lock = List[Int64](length=1, fill=0)
         self.is_csv = False
+        self.gpu_oom_free = 0
         self.csv = CsvSource()
         self.extra = List[String]()
         self.widx = List[_WordIndex]()
@@ -2738,6 +2740,17 @@ struct ParquetScan(Copyable, Movable):
     def is_csv(self) -> Bool:
         """The rows are a CSV file's (`scan_csv`, F-178), not a Parquet file's."""
         return self._info[].is_csv
+
+    def gpu_oom_free(self) -> Int:
+        """F-189: the free GPU bytes when a query over this file last ran out of GPU memory, 0 if none did (copies of the scan
+        share it): AUTO keeps the file on the CPU until 1.5x that is free."""
+        return self._info[].gpu_oom_free
+
+    def remember_gpu_oom(self, free: Int):
+        self._info[].gpu_oom_free = max(free, 1)
+
+    def forget_gpu_oom(self):
+        self._info[].gpu_oom_free = 0
 
     def csv_report(self) raises -> CsvReport:
         """A CSV scan's import report (F-178): the columns' kinds, empty and failed cells, the failed cells themselves (`failures()`: row,

@@ -434,8 +434,8 @@ def test_many_groups_run_on_auto_without_scratch() raises:
 
 
 def test_a_device_failure_falls_back_on_auto() raises:
-    """With the device full the query's output buffers cannot be allocated: AUTO answers on the CPU and says why, GPU
-    raises. OPT-IN (`MXFRAME_TEST_FILL_GPU=1`): the test fills GPU 0, which other processes share. A cap does not
+    """With the device full the query's output buffers cannot be allocated: AUTO and (F-189) GPU answer on the CPU and
+    say why. OPT-IN (`MXFRAME_TEST_FILL_GPU=1`): the test fills GPU 0, which other processes share. A cap does not
     work: the device allocator pools, so the piece that crosses any margin takes all the memory left and a later
     query allocation is served from the pool. Run it on an idle GPU."""
     if getenv("MXFRAME_TEST_FILL_GPU") != "1":
@@ -460,14 +460,11 @@ def test_a_device_failure_falls_back_on_auto() raises:
     expect(len(hogs) > 0, "the test filled the device")
     var auto = Query(s).on_device(dt).group_by(col("k"), groups=GROUPS).agg(sum(col("k")), count()).compute(AUTO)
     expect(auto.device == CPU, "AUTO fell back to the CPU when the device was full")
-    expect("could not allocate" in auto.fallback_reason, "and says why: `" + auto.fallback_reason + "`")
+    expect("over the GPU budget" in auto.fallback_reason, "and says why (F-189: the free memory is read first): `" + auto.fallback_reason + "`")
     expect(auto.counts[5] == 1 and auto.sums[5] == 5, "and the CPU answer is right")
-    var msg = String("")
-    try:
-        _ = Query(s).on_device(dt).group_by(col("k"), groups=GROUPS).agg(sum(col("k")), count()).compute(GPU)
-    except e:
-        msg = String(e)
-    expect(msg.byte_length() > 0, "GPU raises when the device is full")
+    var g = Query(s).on_device(dt).group_by(col("k"), groups=GROUPS).agg(sum(col("k")), count()).compute(GPU)      # (F-189: a full GPU is the CPU's on GPU too)
+    expect(g.device == CPU and "over the GPU budget" in g.fallback_reason, "GPU answers on the CPU when the device is full: `" + g.fallback_reason + "`")
+    expect(g.counts[5] == 1 and g.sums[5] == 5, "and the CPU answer is right")
     hogs.clear()
     dt.release()
 
