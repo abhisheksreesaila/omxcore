@@ -83,6 +83,12 @@ Root cause (F-162 review): `/` is already FLOAT (bind.mojo); `OP_I2F` (query.moj
 The gate asks each device to beat DuckDB, but the SQL path runs everything on the CPU ("SQL runs on the CPU"); the builder's GPU / AUTO (with F-189's budget) is not reached from SQL.
 - [ ] the aggregate stages the GPU kernel can run (the builder's GPU programs: integer / DECIMAL filters and aggregates, AUTO's size rule, F-189's pieces) run on the GPU from SQL; everything else stays on the CPU with a `fallback_reason`; results equal the CPU; NVIDIA PTX unchanged
 
+## F-192 DECIMAL sums past int64 as DuckDB (128-bit totals; TPC-H Q11) [todo] (found by F-159, 2026-10-28)
+- [ ] `sum(decimal * decimal)` (Q11's `sum(ps_supplycost * ps_availqty)`) and other DECIMAL sums whose total passes int64 give DuckDB's answer (DuckDB sums DECIMAL into HUGEINT) instead of raising; the result type follows DuckDB's DECIMAL width rules; exact everywhere; GPU keeps declining or matches (PTX unchanged)
+
+## F-193 A typed NULL constant keeps its own kind beside other constants (wrong column kind) [todo] (found by F-159, 2026-10-28)
+- [ ] `SELECT CAST(NULL AS DATE) AS m, CAST(NULL AS BIGINT) AS q` returns q as BIGINT (today DATE: a wrong answer); every constant select item keeps its type whatever else is in the list (exec.mojo); fuzz constant lists of every kind vs DuckDB
+
 ## F-057 Morsel co-processing that wins [done]
 Needs: F-053, F-055 · Builds on F-006 (`coproc.py`, `coproc_fused.py`, the Router) · Agreed 2026-10-15
 - [ ] research first (added to `docs/spec-auto-mode.md`): morsel-driven parallelism (Leis 2014), HetExchange, "Pump Up the Volume" and later CPU+GPU co-processing work; what F-006 measured (PCIe x8: streaming host data loses to CPU, resident data splits win) decides which ideas are worth it on this hardware
