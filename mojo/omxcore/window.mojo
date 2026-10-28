@@ -419,12 +419,25 @@ def _sort_pass(t: Table, c: Int, keys: List[Int64], desc: Bool, nulls_first: Boo
     return out^
 
 
-def _same_key(t: Table, c: Int, keys: List[Int64], a: Int, b: Int) -> Bool:
-    var an = t.cols[c].is_null(a)
-    var bn = t.cols[c].is_null(b)
-    if an or bn:
-        return an and bn
-    return keys[a] == keys[b]
+def _mark_changes(t: Table, c: Int, keys: List[Int64], perm: List[Int], mut flag: List[UInt8], v: UInt8):
+    """Marks in `flag` (to at least `v`) every position whose row differs from the one before it on column `c` (NULLs equal each other)."""
+    var n = len(perm)
+    var kp = keys.unsafe_ptr()
+    var pp = perm.unsafe_ptr()
+    var fp = flag.unsafe_ptr()
+    if t.cols[c].nulls == 0:
+        for p in range(1, n):
+            if kp[pp[p - 1]] != kp[pp[p]] and fp[p] < v:
+                fp[p] = v
+    else:
+        var vp = t.cols[c].validity.unsafe_ptr()
+        for p in range(1, n):
+            var a = pp[p - 1]
+            var b = pp[p]
+            var na = (vp[a >> 3] >> UInt8(a & 7)) & 1 == 0
+            var nb = (vp[b >> 3] >> UInt8(b & 7)) & 1 == 0
+            if (na != nb or (not na and kp[a] != kp[b])) and fp[p] < v:
+                fp[p] = v
 
 
 # ── one group ────────────────────────────────────────────────────────────────────────────────────────
@@ -451,29 +464,21 @@ def _prepare(t: Table, g: WinGroup, n: Int, threads: Int, mut outs: List[_Out]) 
     while k >= 0:
         perm = _sort_pass(t, g.part[k], pkeys[k], False, False, perm)
         k -= 1
-    # 2. partitions and peer runs
+    # 2. partitions and peer runs: flag 2 where a partition starts, 1 where a run of peers does
+    var flag = List[UInt8](length=n, fill=0)
+    for j in range(len(g.part)):
+        _mark_changes(t, g.part[j], pkeys[j], perm, flag, 2)
+    for j in range(len(g.order)):
+        _mark_changes(t, g.order[j].col, okeys[j], perm, flag, 1)
     var pb = List[Int]()
     if ctx.has_order:
         ctx.peer_lo = List[Int](length=n, fill=0)
         ctx.peer_hi = List[Int](length=n, fill=0)
     for p in range(n):
-        var new_part = p == 0
-        var new_run = p == 0
-        if p > 0:
-            for j in range(len(g.part)):
-                if not _same_key(t, g.part[j], pkeys[j], perm[p - 1], perm[p]):
-                    new_part = True
-                    break
-            new_run = new_part
-            if not new_run:
-                for j in range(len(g.order)):
-                    if not _same_key(t, g.order[j].col, okeys[j], perm[p - 1], perm[p]):
-                        new_run = True
-                        break
-        if new_part:
+        if p == 0 or flag[p] == 2:
             pb.append(p)
         if ctx.has_order:
-            ctx.peer_lo[p] = p if new_run else ctx.peer_lo[p - 1]
+            ctx.peer_lo[p] = p if (p == 0 or flag[p] != 0) else ctx.peer_lo[p - 1]
     pb.append(n)
     if ctx.has_order:
         var p = n - 1

@@ -176,6 +176,19 @@ def test_windows_then_order_by_limit_equal_duckdb(mx, probe, data, ds_name, mode
     check(mode, data[ds_name], mx, probe, q[1], q[2] if len(q) > 2 else None, ordered=True)
 
 
+MILLION = [
+    ("million-partitions-running", f"SELECT id, {over(f'PARTITION BY g ORDER BY {ORD}', 'row_number()', 'lag(x)', 'sum(d)')} FROM t"),
+    ("million-partitions-peers", f"SELECT id, {over('PARTITION BY g ORDER BY x', 'rank()', 'cume_dist()', 'min(d)')} FROM t"),
+    ("one-partition-moving", f"SELECT id, {over(f'ORDER BY {ORD} ROWS BETWEEN 100 PRECEDING AND 100 FOLLOWING', 'sum(x)', 'max(d)', 'avg(e)')} FROM t"),
+]
+
+
+@pytest.mark.parametrize("mode", ["table", "scan"])
+@pytest.mark.parametrize("q", MILLION, ids=qid)
+def test_a_million_rows_in_a_million_partitions_and_in_one(mx, probe, data, mode, q):
+    check(mode, data["g1m"], mx, probe, q[1])
+
+
 def test_threads_do_not_change_a_window_result(mx, data):
     """1 thread and 8 threads give the same rows, bit for bit (a FLOAT sum included)."""
     ds = data["g10k"]
@@ -265,3 +278,48 @@ def test_a_csv_file_is_a_source(mx, data, tmp_path):
     out = run_mx(mx, ["sql", "--max-rows", "0", sql], {"c": path})
     want = ds.table.execute(sql.replace("FROM c", "FROM t")).fetchall()
     compare(typed_rows(out), want, False, sql)
+
+
+@pytest.fixture(scope="module")
+def specials(tmp_path_factory):
+    """3,000 rows of DOUBLEs with NaN, inf, -inf, -0.0, 0.0 and NULL among ordinary values, in 12 groups."""
+    import duckdb
+    d = tmp_path_factory.mktemp("specials")
+    con = duckdb.connect()
+    con.execute("set threads=1")
+    con.execute("select setseed(0.5)")
+    con.execute("""create table t as select i::BIGINT as id, (i % 12)::BIGINT as g,
+        case (random() * 14)::int
+          when 0 then 'nan'::double when 1 then 'inf'::double when 2 then '-inf'::double when 3 then -0.0::double when 4 then 0.0::double
+          when 5 then null when 6 then 1e300 when 7 then -1e300 else ((random() * 2000)::int - 1000) / 8.0 end as v
+        from range(3000) r(i)""")
+    path = d / "specials.parquet"
+    con.execute(f"copy t to '{path}' (format parquet, row_group_size 700)")
+    return con, path
+
+
+SPECIAL_QUERIES = [
+    ("rank-by-v", "SELECT id, rank() OVER (PARTITION BY g ORDER BY v) AS a, dense_rank() OVER (ORDER BY v DESC) AS b, percent_rank() OVER (ORDER BY v NULLS FIRST) AS c FROM t"),
+    ("partition-by-v", "SELECT id, count(*) OVER (PARTITION BY v) AS n, row_number() OVER (PARTITION BY v ORDER BY id) AS r FROM t"),
+    ("minmax-running", "SELECT id, min(v) OVER (PARTITION BY g ORDER BY id) AS lo, max(v) OVER (PARTITION BY g ORDER BY id) AS hi FROM t"),
+    ("minmax-moving", "SELECT id, min(v) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 3 PRECEDING AND 1 FOLLOWING) AS lo, "
+                      "max(v) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN 3 PRECEDING AND 1 FOLLOWING) AS hi FROM t"),
+    ("sums-running", "SELECT id, sum(v) OVER (PARTITION BY g ORDER BY id) AS s, avg(v) OVER (PARTITION BY g ORDER BY id) AS a, count(v) OVER (PARTITION BY g ORDER BY id) AS c FROM t"),
+    ("sums-whole", "SELECT id, sum(v) OVER (PARTITION BY g) AS s, avg(v) OVER () AS a FROM t"),
+    ("lag-first-last", "SELECT id, lag(v, 1, 0.5) OVER (PARTITION BY g ORDER BY id) AS l, first_value(v) OVER (PARTITION BY g ORDER BY id) AS f, "
+                       "last_value(v) OVER (PARTITION BY g ORDER BY id ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING) AS la FROM t"),
+]
+
+
+@pytest.mark.parametrize("mode", ["table", "scan"])
+@pytest.mark.parametrize("q", SPECIAL_QUERIES, ids=qid)
+def test_nan_infinities_signed_zeros_and_nulls_equal_duckdb(mx, specials, mode, q):
+    con, path = specials
+    out = run_mx(mx, ["sql", "--max-rows", "0", "--stream", "always" if mode == "scan" else "never", q[1]], {"t": path})
+    cur = con.execute(q[1])
+    want = cur.fetchall()
+    for i, desc in enumerate(cur.description):
+        dk = duck_kind(desc[1])
+        assert out["columns"][i]["kind"] == dk[0], f"{q[1]}: column {i}: {out['columns'][i]}, DuckDB has {dk}"
+    got = typed_rows(out)
+    compare(sorted(got, key=lambda r: r[0]), sorted(want, key=lambda r: r[0]), True, q[1])

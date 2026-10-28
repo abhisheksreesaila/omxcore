@@ -433,7 +433,7 @@ var h = sql(cat, "SELECT ...", o)
 | Part | Supported |
 |---|---|
 | Statement | `[EXPLAIN] SELECT ... FROM table [AS alias]` (table names and columns match without regard to case; `;` and `--` / `/* */` comments allowed) |
-| Select list | expressions with aliases; group keys, aggregates, and expressions over them (`sum(a) / count(*)`, `max(d) - min(d)`, `g + 1`); a number, date or string constant; `CASE`, `COALESCE`, `CAST`, text and date functions (see Expressions below); with no aggregate and no `GROUP BY` the query returns rows (below): `*`, `t.*`, columns and expressions; `SELECT DISTINCT` |
+| Select list | expressions with aliases; group keys, aggregates, and expressions over them (`sum(a) / count(*)`, `max(d) - min(d)`, `g + 1`); a number, date or string constant; `CASE`, `COALESCE`, `CAST`, text and date functions (see Expressions below); with no aggregate and no `GROUP BY` the query returns rows (below): `*`, `t.*`, columns and expressions; `SELECT DISTINCT`; window functions `f(...) OVER (PARTITION BY ... ORDER BY ... [frame])` (F-168, below) |
 | `WHERE` | `= <> != < <= > >=`, `BETWEEN`, `IN (literals)` of any length, `LIKE` / `ILIKE`, `IS [NOT] NULL`, `IS [NOT] DISTINCT FROM`, `AND OR NOT`, a BOOL column; text, DATE (`DATE '2024-01-31'` or a string next to a DATE column) and decimal literals (aligned to the column's scale); `+ - *`, `//`, `%` on INT and DECIMAL (scales aligned as DuckDB does) and `date + n`, `date - date` |
 | `GROUP BY` | columns, expressions, ordinals (`GROUP BY 1`), select aliases; none at all (one group) |
 | `HAVING`, `ORDER BY` | aggregates and group keys in any expression (a row query: any column or expression, selected or not, several keys); `ORDER BY` keys, aggregates, aliases, ordinals; `ASC` / `DESC`; `NULLS FIRST` / `LAST` (NULLS LAST by default, also for `DESC`, as DuckDB); `LIMIT n [OFFSET m]` |
@@ -600,6 +600,67 @@ Informal timings (F-152; the same 12-core Ryzen 9 5900X under a load average of 
 Aggregates after the move of HAVING / ORDER BY / the select list onto the executor (same data; 983,770 groups for `g`): `GROUP BY g ORDER BY 2 DESC, 1 LIMIT 10` 57 ms (DuckDB 20),
 `GROUP BY g` with all groups out 108 ms (61), `GROUP BY g HAVING count(*) > 1 ORDER BY sum(x) / count(*) DESC LIMIT 10` 67 ms (18), 7 groups 3.6 ms (2.0). DuckDB is faster where the result is a million rows or the query is a
 full sort; the heaps, the early stop and `DISTINCT` over few values are where this executor wins or ties.
+
+### Window functions (F-168, `window.mojo`, `winsql.mojo`, `winquery.mojo`)
+
+```mojo
+var r = sql(cat, "SELECT region, day, sum(qty) OVER (PARTITION BY region ORDER BY day) AS running, "
+                 "avg(price) OVER (ORDER BY day ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS moving, "
+                 "rank() OVER (PARTITION BY region ORDER BY qty DESC) AS place FROM orders ORDER BY region, day")
+```
+
+`f(...) OVER (PARTITION BY a, b ORDER BY c [ASC | DESC] [NULLS FIRST | LAST] [ROWS | RANGE frame])` in the select list and in `ORDER BY`, over a table, a Frame (its edits and formula
+columns), a Parquet scan, a CSV scan and a join, with `WHERE` (it runs first) and with `GROUP BY` (the window runs over the grouped result: `rank() OVER (ORDER BY sum(x) DESC) ... GROUP BY k`).
+Results equal DuckDB's, row for row (checked by `tests/test_mojo_window.py`: 100 queries x table, scan, edited frame and edited scan, x two sizes; and `mojo/tests/test_window.mojo`).
+
+| Function | Result | Notes |
+|---|---|---|
+| `row_number()` | INT | 1, 2, ... in the partition's order; ties keep the source's row order |
+| `rank()`, `dense_rank()` | INT | peers (equal on every ORDER BY key) share a place; `rank` skips, `dense_rank` does not; both are 1 without an ORDER BY |
+| `percent_rank()`, `cume_dist()` | FLOAT | `(rank - 1) / (rows - 1)` (0 for one row); rows up to the last peer / rows |
+| `ntile(k)` | INT | `k` a literal; the first `rows % k` buckets hold one row more (DuckDB's) |
+| `lag(x [, offset [, default]])`, `lead(...)` | the type of x | offset a whole-number literal (default 1; negative reverses); the default a literal read as x's type (a number for INT / DECIMAL / FLOAT, text, a date, true / false), NULL when none; a NULL value stays NULL |
+| `first_value(x)`, `last_value(x)`, `nth_value(x, n)` | the type of x | of the frame (the default frame ends at the last peer: `last_value` is the current peer group's value); a NULL value is a value; an empty frame gives NULL |
+| `sum(x)`, `count(x)`, `count(*)`, `avg(x)`, `min(x)`, `max(x)` | as the plain aggregates | over the frame; INT / DECIMAL sums are exact (a 128-bit running total; a frame's own sum past int64 raises `a window sum passed the int64 range`); `avg` is DuckDB's `ld_div` bit for bit; `min` / `max` also of TEXT (the engine's text order), DATE, BOOL; a FLOAT follows the other FLOAT aggregates (NaN above +inf, -0.0 = 0.0) |
+
+**Frames.** `ROWS [BETWEEN] <bound> [AND <bound>]` with `UNBOUNDED PRECEDING`, `n PRECEDING`, `CURRENT ROW`, `n FOLLOWING`, `UNBOUNDED FOLLOWING` (`n` a literal, any size; the frame is cut at the
+partition's edges, and may be empty: sums, `min`, `max` are NULL and counts 0). `RANGE` takes `UNBOUNDED` and `CURRENT ROW` bounds (peers included). With no frame the default is
+`RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` (a running total that includes every peer), and the whole partition when there is no ORDER BY. The ranking functions, `ntile`, `lag` and `lead` ignore the frame.
+Frames DuckDB's parser refuses (`2 FOLLOWING AND 1 PRECEDING`, `CURRENT ROW AND 1 PRECEDING`, ...) are refused with its words.
+**Refused by name** (a positioned `SQL error`): a window function in WHERE, GROUP BY, HAVING or ON (and QUALIFY, which does not parse); `RANGE` with an offset; `GROUPS` frames; `EXCLUDE`; `IGNORE NULLS` / `RESPECT NULLS`;
+a named window (`OVER w`, `WINDOW w AS`); `FILTER`; `DISTINCT` inside the call; a window function that is not in the list above (`median(x) OVER`, `stddev(x) OVER`, ...); a window inside a window's arguments or inside an aggregate;
+`sum` / `avg` of TEXT, DATE or BOOL; `*` or `t.*` beside a window over a join (name the columns); `EXPLAIN ANALYZE` of a window query (`EXPLAIN` works). A window's result cannot be filtered in the same query
+(QUALIFY and a subquery in FROM do not exist yet, F-159).
+
+**How it runs.** `winsql.mojo` splits the statement: the *inner* query is the original without its windows, selecting every window-free part the select list, the windows' arguments, PARTITION BY and ORDER BY read (each a column of
+the result, computed once in the kernel); it runs as any query. `window.mojo` adds one column per function to that result: the rows are put in (partition, order) order by the same stable radix passes as ORDER BY (a shared
+sort for functions with the same PARTITION BY and ORDER BY), partitions and peer runs are found in one pass, and every partition is evaluated by a task on the thread pool (`fan.run_tasks`; tasks of about 16,384 rows, a
+bigger partition is one task), each writing only the slots of its own rows: **the result is the same for 1 and N threads, bit for bit**. Frames only move forward, so sums, counts and averages are running totals (add the rows
+entering, subtract the rows leaving), `min` / `max` a monotone deque, `first_value` / `lag` direct reads: O(rows) for every function except a FLOAT sum or average over a frame that does not start at the partition's start (a binary tree, O(rows log rows); the
+running total would lose digits to cancellation, and a tree is what DuckDB uses). The *outer* query is an ordinary row query over the result (`FROM __win`): the select list, `DISTINCT`, `ORDER BY` (which may use windows,
+aliases and ordinals), `LIMIT` and `OFFSET` run after the windows, as in SQL; without an ORDER BY the rows come in the inner query's order. **A scan materialises the columns the query needs** (the inner query reads them
+whole: a window over a file bigger than memory is F-167's streaming work); a Frame's edits are in the inner result. Notes: `window: 2 functions in 1 sort over 10 rows, ...` and the time of the step;
+`SqlResult.fallback_reason` is `window functions run on the CPU` (SQL always runs there). EXPLAIN prints a `Window functions (after the query below, on the CPU)` block, then the inner query's plan.
+
+**The builder** has the same functions (`Window`, `WindowFn`, `Query.window`, `compute_windows`):
+
+```mojo
+var w = Window().partition_by(col("region")).order_by(col("day")).rows(-6, CURRENT_ROW)            # ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+var q = Query(orders).where(col("qty") > 0).window(row_number().over(Window().partition_by(col("region")).order_by(col("day"))),
+                                                      sum(col("price")).over(w).alias("moving"), lag(col("qty"), 1, lit(0)).over(w.copy()))
+var r = compute_windows(q)          # r.table: the source's columns for the rows `where` keeps, then one column per function (w0, w1, ... or the alias)
+r.fallback_reason                   # "window functions run on the CPU" under AUTO (the default), "" for CPU; GPU raises
+```
+
+`rank()`, `dense_rank()`, `percent_rank()`, `cume_dist()`, `ntile(k)`, `lag` / `lead(e [, offset [, default]])`, `first_value`, `last_value`, `nth_value(e, n)`, and `sum`, `count`, `mean`, `min_of`, `max_of` `.over(w)`;
+`Window.order_by(e, descending=False, nulls_first=False)` (NULLs last either way, DuckDB's default), `.rows(start, end)` (negative: PRECEDING, 0: the current row, positive: FOLLOWING, `UNBOUNDED_PRECEDING` /
+`UNBOUNDED_FOLLOWING`), `.range(start, end)` (UNBOUNDED / CURRENT_ROW only). `compute_windows` writes the Query as SQL (`window_sql(q)` shows the text; the expressions are SQL's, so `x // 0` is
+SQL's) and runs it through the path above: the filters of `where` are SQL's too, on a table, a Frame (formula columns included) or a Parquet scan. A Query with `group_by` / `agg` takes no windows (use SQL).
+
+Informal timings (F-168; the 12-core Ryzen 9 5900X, 5 million rows, 1,000 partitions, a Parquet file read into memory, one fresh process, whole `mx sql` time with the 190 ms read; DuckDB 1.5.1 on a loaded table, 8 threads,
+result an Arrow table): `rank() OVER (PARTITION BY g ORDER BY x)` 0.74 s (DuckDB 0.34 s), `row_number() OVER (ORDER BY x, id)` 0.68 s (0.26 s), `sum(x) OVER (PARTITION BY g ORDER BY id)` 0.62 s (0.98 s), a
+6-row moving average 0.64 s (0.41 s), `x - lag(x) OVER (...)` 0.67 s (0.27 s). The window step is about 0.3 s of that for the sort (single-threaded radix passes, the same as ORDER BY) and the rest in the
+partitions' tasks; DuckDB is faster where the sort dominates (it sorts in parallel). Not tuned for speed beyond using the thread pool for the partitions: a parallel sort is the next step.
 
 ### The `mx` command line (F-151, for agents)
 
