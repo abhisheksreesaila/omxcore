@@ -19,6 +19,9 @@ from .planner import (Planner, RulePlanner, PlannerOptions, PhysicalPlan, KeyLay
                       G_NONE, G_DENSE, G_HASHED)
 from .plan import LogicalPlan, PlanNode, build_plan
 from .sqlexec import sql, sql_with, SqlResult
+from .window import (Window, WindowFn, UNBOUNDED_PRECEDING, UNBOUNDED_FOLLOWING, CURRENT_ROW, row_number, rank, dense_rank, percent_rank, cume_dist, ntile, lag, lead,
+                     first_value, last_value, nth_value)      # F-168
+from .winquery import compute_windows, window_sql
 from .blocks import range_aggregate, read_block, RangeResult, RangeAgg, MORSEL
 # F-175: background jobs (jobs.mojo holds the start functions)
 from .job import (Job, JobCtl, JobProgress, JobBody, JobDone, NoCallback, start_job, start_job_then, JOB_RUNNING, JOB_DONE, JOB_FAILED, JOB_CANCELLED, CANCELLED_MESSAGE,

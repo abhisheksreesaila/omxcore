@@ -24,6 +24,7 @@ from .holistic import float_key
 from .sqleval import float_bits, ld_div
 from .fan import ParTask, run_tasks
 from .sql import FM_NONE, FM_ROWS, FM_RANGE, FB_UNB_PREC, FB_PREC, FB_CUR, FB_FOL, FB_UNB_FOL
+from .expr import Expr
 
 comptime W_ROW_NUMBER = 0
 comptime W_RANK = 1
@@ -214,6 +215,172 @@ struct _Out(Movable):
         self.nul = List[UInt8](length=n, fill=0)
         self.dict = ArcPointer(WordDict())
         self.name = name
+
+
+# ── the builder's side: `Window` and `WindowFn` (Query.window, compute_windows in winquery.mojo) ─────────
+
+comptime UNBOUNDED_PRECEDING = -(1 << 62)      # a frame bound of `Window.rows` / `Window.range`: every row from the partition's start
+comptime UNBOUNDED_FOLLOWING = 1 << 62         # ... every row to the partition's end
+comptime CURRENT_ROW = 0                       # ... the row itself (`range`: with its peers); a negative number is rows PRECEDING, a positive one FOLLOWING
+
+
+struct Window(Copyable, Movable):
+    """`OVER (PARTITION BY ... ORDER BY ... [frame])` as a builder:
+
+        var w = Window().partition_by(col("region")).order_by(col("day")).rows(-2, CURRENT_ROW)    # ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+
+    With no `rows` / `range` the frame is the SQL default: RANGE UNBOUNDED PRECEDING to CURRENT ROW (the rows up to the last peer), the whole partition without
+    an `order_by`. NULLs sort last unless `nulls_first`, in either direction (DuckDB's default)."""
+    var partition: List[Expr]
+    var order: List[Expr]
+    var order_desc: List[Bool]
+    var order_nulls_first: List[Bool]
+    var mode: Int
+    var start: Int
+    var end: Int
+
+    def __init__(out self):
+        self.partition = List[Expr]()
+        self.order = List[Expr]()
+        self.order_desc = List[Bool]()
+        self.order_nulls_first = List[Bool]()
+        self.mode = FM_NONE
+        self.start = UNBOUNDED_PRECEDING
+        self.end = CURRENT_ROW
+
+    def partition_by(var self, *keys: Expr) -> Self:
+        for k in keys:
+            self.partition.append(k.copy())
+        return self^
+
+    def order_by(var self, key: Expr, descending: Bool = False, nulls_first: Bool = False) -> Self:
+        self.order.append(key.copy())
+        self.order_desc.append(descending)
+        self.order_nulls_first.append(nulls_first)
+        return self^
+
+    def rows(var self, start: Int, end: Int) -> Self:
+        """ROWS BETWEEN `start` AND `end`: a negative number is that many rows PRECEDING, 0 the current row, a positive number FOLLOWING; `UNBOUNDED_PRECEDING` /
+        `UNBOUNDED_FOLLOWING` reach the partition's edges."""
+        self.mode = FM_ROWS
+        self.start = start
+        self.end = end
+        return self^
+
+    def range(var self, start: Int, end: Int) -> Self:
+        """RANGE BETWEEN `start` AND `end`, the bounds `UNBOUNDED_PRECEDING`, `CURRENT_ROW` (with its peers) and `UNBOUNDED_FOLLOWING` only: another offset raises
+        when the windows are computed."""
+        self.mode = FM_RANGE
+        self.start = start
+        self.end = end
+        return self^
+
+
+struct WindowFn(Copyable, Movable):
+    """A window function with its `Window` (`row_number().over(w)`, `sum(col("v")).over(w)`) and the name of its result column (`alias`; `w0`, `w1`, ... when none)."""
+    var kind: Int
+    var arg: Expr
+    var n: Int                       # ntile's buckets, nth_value's n, lag / lead's offset
+    var has_default: Bool
+    var default: Expr                # lag / lead: a number literal
+    var win: Window
+    var has_over: Bool
+    var name: String
+
+    def __init__(out self, kind: Int):
+        self.kind = kind
+        self.arg = Expr(0)
+        self.n = 1
+        self.has_default = False
+        self.default = Expr(0)
+        self.win = Window()
+        self.has_over = False
+        self.name = String()
+
+    def over(var self, var w: Window) -> Self:
+        self.win = w^
+        self.has_over = True
+        return self^
+
+    def alias(var self, name: String) -> Self:
+        self.name = name
+        return self^
+
+
+def row_number() -> WindowFn:
+    return WindowFn(W_ROW_NUMBER)
+
+
+def rank() -> WindowFn:
+    """The place of a row's peer group in the partition's order, counting rows (1, 1, 3, ...)."""
+    return WindowFn(W_RANK)
+
+
+def dense_rank() -> WindowFn:
+    return WindowFn(W_DENSE_RANK)
+
+
+def percent_rank() -> WindowFn:
+    return WindowFn(W_PERCENT_RANK)
+
+
+def cume_dist() -> WindowFn:
+    return WindowFn(W_CUME_DIST)
+
+
+def ntile(buckets: Int) -> WindowFn:
+    var f = WindowFn(W_NTILE)
+    f.n = buckets
+    return f^
+
+
+def lag(e: Expr, offset: Int = 1) -> WindowFn:
+    """The value `offset` rows before the current one in the partition's order (NULL when there is none)."""
+    var f = WindowFn(W_LAG)
+    f.arg = e.copy()
+    f.n = offset
+    return f^
+
+
+def lag(e: Expr, offset: Int, default: Expr) -> WindowFn:
+    """`lag` with a default (a number literal) for rows with no row that far back."""
+    var f = lag(e, offset)
+    f.has_default = True
+    f.default = default.copy()
+    return f^
+
+
+def lead(e: Expr, offset: Int = 1) -> WindowFn:
+    var f = WindowFn(W_LEAD)
+    f.arg = e.copy()
+    f.n = offset
+    return f^
+
+
+def lead(e: Expr, offset: Int, default: Expr) -> WindowFn:
+    var f = lead(e, offset)
+    f.has_default = True
+    f.default = default.copy()
+    return f^
+
+
+def first_value(e: Expr) -> WindowFn:
+    var f = WindowFn(W_FIRST)
+    f.arg = e.copy()
+    return f^
+
+
+def last_value(e: Expr) -> WindowFn:
+    var f = WindowFn(W_LAST)
+    f.arg = e.copy()
+    return f^
+
+
+def nth_value(e: Expr, n: Int) -> WindowFn:
+    var f = WindowFn(W_NTH)
+    f.arg = e.copy()
+    f.n = n
+    return f^
 
 
 # ── ordering ─────────────────────────────────────────────────────────────────────────────────────────
