@@ -176,3 +176,36 @@ def test_aggregates_read_as_doubles_follow_the_same_rule(mx, tmp_path):
     con.execute(f"create table t as select * from read_parquet('{path}')")
     for s in (0, 1, 2, 5, 9):
         check(mx, f"SELECT g, sum(d{s}) * 1.5e0 AS a, sum(d{s}) / 3 AS b, avg(d{s}) * 1.0e0 AS c, max(d{s}) + 0.5e0 AS m FROM t GROUP BY g", con, {"t": path})
+
+
+def test_window_sums_and_averages_read_as_doubles_follow_the_same_rule(mx, tmp_path):
+    """Review 2: `sum(d) OVER (...) * 1.5e0`, `/ 3`, `avg(d) OVER (...) * 1.0e0` over window sums past 2^53 (inside int64), bit for bit.
+    The result goes out as Parquet so no JSON text rounds it."""
+    import subprocess
+    rnd = random.Random(11)
+    n = 600
+    cols = {"g": pa.array([i % 5 for i in range(n)], pa.int64()), "o": pa.array(range(n), pa.int64())}
+    scales = (0, 2, 5, 9)
+    for s in scales:
+        vals = [rnd.randrange(10**15, 4 * 10**16) if i % 4 else rnd.randrange(10**3, 10**9) for i in range(n)]
+        cols[f"d{s}"] = pa.array([Decimal(v).scaleb(-s) for v in vals], pa.decimal128(18, s))
+    src = tmp_path / "w.parquet"
+    pq.write_table(pa.table(cols), src)
+    con = duckdb.connect()
+    con.execute(f"create table t as select * from read_parquet('{src}')")
+    for s in scales:
+        for sql in [
+            f"SELECT o, sum(d{s}) OVER (ORDER BY o ROWS BETWEEN 5 PRECEDING AND CURRENT ROW) * 1.5e0 AS a, "
+            f"avg(d{s}) OVER (ORDER BY o ROWS BETWEEN 3 PRECEDING AND 3 FOLLOWING) * 1.0e0 AS b FROM t ORDER BY o",
+            f"SELECT o, sum(d{s}) OVER (PARTITION BY g ORDER BY o ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) / 3 AS a, "
+            f"avg(d{s}) OVER (PARTITION BY g ORDER BY o ROWS BETWEEN 6 PRECEDING AND 1 FOLLOWING) * 1.0e0 AS b FROM t ORDER BY o",
+        ]:
+            out = tmp_path / "o.parquet"
+            p = subprocess.run([str(mx), "sql", sql, "-t", f"t={src}", "--format", "parquet", "--out", str(out), "--max-rows", "1000000"], capture_output=True)
+            assert p.returncode == 0, (sql, p.stdout[-300:], p.stderr[-300:])
+            got = pq.read_table(out)
+            want = con.execute(sql).fetchall()
+            assert got.num_rows == len(want) == n
+            for ci in (1, 2):
+                g = got.column(ci).to_pylist()
+                assert [_bits(x) for x in g] == [_bits(float(r[ci])) for r in want], f"{sql} column {ci}"
