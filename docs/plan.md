@@ -1645,6 +1645,7 @@ Needs: F-155 · Size: L · engine-first; F-058's losses are joins
 - [ ] informal timings on dbgen SF1 / SF10 (Q3, Q12, Q18 shapes, the random suite's join shape) through `mx` vs DuckDB, A/B against F-155
 
 ## F-162 M8 gate: TPC-H 22 and the random suite through `mx sql` equal DuckDB [todo]
+- Harness built 2026-10-28 (review PASS): `tests/test_mx_tpch_gate.py` (22 queries through `mx sql`, a gap xfails only with its exact engine error), `tests/test_mx_random_gate.py` (80 seeds), `scripts/gate_scoreboard.py` (quiet-night timing, `--stream never`, median of 3 fresh processes, failures count as losses), `docs/bench/f162-coverage.md`. On main: 8/22 equal DuckDB, 80/80 random; the 14 gaps are F-159 shapes, Q16 / Q21 (subquery beside a join, two subqueries), Q14 (F-190). `mx sql --device gpu|auto` runs the CPU (F-191).
 Needs: F-157, F-159, F-161 · Size: M
 - [ ] the 22 TPC-H queries as DuckDB writes them on dbgen SF1 (DECIMAL / DATE) and the repo's SF1 Parquet (FLOAT), equal to DuckDB; the random suite through `mx` equal to DuckDB; EXPLAINs and timings recorded, not gated (benchmarks paused)
 - [ ] omxplorer runs a SQL cell, EXPLAIN, a two-table join and a cached Explore pipeline on the package (its own goal checks)
