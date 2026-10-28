@@ -344,3 +344,108 @@ def test_tpch_shape_equals_duckdb(mx, tpch, name, stream):
     sql, ordered = TPCH[name]
     res = tpch_q(mx, tpch, sql, ordered=ordered, extra=("--stream", stream))
     assert len(res["rows"]) > 0 or name in ("Q17",)
+
+
+# ── step 3: UNION ALL, UNION, INTERSECT, EXCEPT ──────────────────────────────────────────────────
+
+SETOPS = {
+    "union-all": "SELECT id, k FROM t WHERE {f} UNION ALL SELECT uid, k FROM u",
+    "union-all-empty-right": "SELECT id, k FROM t WHERE {f} UNION ALL SELECT uid, k FROM u WHERE 1 = 0",
+    "union-all-text-dictionaries": "SELECT s FROM t WHERE {f} UNION ALL SELECT s FROM u",
+    "union-all-int-and-decimal": "SELECT v FROM t WHERE {f} UNION ALL SELECT d FROM t WHERE id < 20",
+    "union-all-decimal-scales": "SELECT d FROM t WHERE {f} UNION ALL SELECT CAST(d AS DECIMAL(12,4)) FROM t WHERE id < 20",
+    "union-all-int-and-double": "SELECT v FROM t WHERE {f} UNION ALL SELECT w / 4.0 FROM u",
+    "union-all-columns-of-every-kind": "SELECT id, s, d, v IS NULL AS b FROM t WHERE {f} UNION ALL SELECT uid, s, w * 0.5, w > 3 FROM u",
+    "union-all-three": "SELECT id FROM t WHERE {f} UNION ALL SELECT uid FROM u UNION ALL SELECT id FROM t WHERE id < 3",
+    "union-all-names-from-the-first": "SELECT id AS a, k AS b FROM t WHERE {f} UNION ALL SELECT uid, k FROM u",
+    "union-all-aggregates": "SELECT k, count(*) FROM t WHERE {f} GROUP BY k UNION ALL SELECT k, sum(w) FROM u GROUP BY k",
+    "union-all-order-limit": "SELECT id, k FROM t WHERE {f} UNION ALL SELECT uid, k FROM u ORDER BY 1 DESC LIMIT 7",
+    "union-all-order-by-name": "SELECT id AS a, k FROM t WHERE {f} UNION ALL SELECT uid, k FROM u ORDER BY k NULLS FIRST, a LIMIT 9 OFFSET 2",
+    "union-all-parenthesized": "(SELECT id FROM t WHERE {f}) UNION ALL (SELECT uid FROM u)",
+    "union": "SELECT k FROM t WHERE {f} UNION SELECT k FROM u",
+    "union-several-columns": "SELECT k, s FROM t WHERE {f} UNION SELECT k, s FROM u",
+    "union-every-kind": "SELECT s, d, v IS NULL AS b, k FROM t WHERE {f} UNION SELECT s, w * 0.01, w > 3, k FROM u",
+    "union-order-by": "SELECT k FROM t WHERE {f} UNION SELECT k FROM u ORDER BY k NULLS LAST",
+    "union-then-union-all": "SELECT k FROM t WHERE {f} UNION SELECT k FROM u UNION ALL SELECT k FROM u WHERE k = 1",
+    "intersect": "SELECT k FROM t WHERE {f} INTERSECT SELECT k FROM u",
+    "intersect-two-columns": "SELECT k, s FROM t WHERE {f} INTERSECT SELECT k, s FROM u",
+    "except": "SELECT k FROM t WHERE {f} EXCEPT SELECT k FROM u",
+    "except-reversed": "SELECT k FROM u EXCEPT SELECT k FROM t WHERE {f}",
+    "except-two-columns": "SELECT k, s FROM t WHERE {f} EXCEPT SELECT k, s FROM u",
+    "intersect-binds-tighter": "SELECT k FROM t WHERE {f} UNION SELECT k FROM u INTERSECT SELECT k FROM t WHERE k > 2",
+    "left-to-right": "SELECT k FROM t WHERE {f} EXCEPT SELECT k FROM u WHERE k = 1 UNION SELECT k FROM u WHERE k = 4",
+    "parenthesized-changes-the-order": "SELECT k FROM t WHERE {f} EXCEPT (SELECT k FROM u WHERE k = 1 UNION SELECT k FROM u WHERE k = 4)",
+    "set-op-in-a-derived-table": "SELECT count(*), sum(k) FROM (SELECT k FROM t WHERE {f} UNION ALL SELECT k FROM u) x",
+    "set-op-in-a-cte-read-twice": "WITH a AS (SELECT k FROM t WHERE {f} UNION SELECT k FROM u) SELECT x.k, y.k FROM a x JOIN a y ON x.k = y.k",
+    "set-op-in-a-subquery": "SELECT id FROM t WHERE k IN (SELECT k FROM u WHERE {f} UNION SELECT 6)",
+    "set-op-with-a-window": "SELECT id, rank() OVER (ORDER BY id DESC) FROM t WHERE {f} UNION ALL SELECT uid, rank() OVER (ORDER BY uid) FROM u",
+}
+SETOPS_ORDERED = {"union-all-order-limit", "union-all-order-by-name", "union-order-by"}
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("f", FILTERS)
+@pytest.mark.parametrize("name", list(SETOPS))
+def test_set_operation_equals_duckdb(mx, data, name, f, mode):
+    sql = SETOPS[name].format(f=f)
+    if name == "set-op-in-a-subquery":
+        sql = sql.replace("SELECT 6", "SELECT k FROM u WHERE k = 4")
+    q(mx, data, mode, sql, ordered=name in SETOPS_ORDERED)
+
+
+def test_the_result_columns_of_a_union_are_the_first_operands(mx, data):
+    res = q(mx, data, "memory", "SELECT id AS a, s AS word FROM t UNION ALL SELECT uid, s FROM u")
+    assert [c["name"] for c in res["columns"]] == ["a", "word"]
+
+
+def test_a_union_over_csv_files(mx, data):
+    q(mx, data, "csv", "SELECT k FROM t UNION SELECT k FROM u")
+
+
+@pytest.mark.parametrize("sql,message", [
+    ("SELECT id FROM t UNION ALL SELECT uid, k FROM u", "the operands of the set operation have 1 and 2 columns"),
+    ("SELECT id FROM t UNION ALL SELECT s FROM u", "the operands of the set operation cannot be combined: column 1 is INT in one and TEXT in the other"),
+    ("SELECT id FROM t INTERSECT ALL SELECT uid FROM u", "`INTERSECT ALL` is not supported yet"),
+    ("SELECT id FROM t EXCEPT ALL SELECT uid FROM u", "`EXCEPT ALL` is not supported yet"),
+    ("SELECT id FROM t UNION BY NAME SELECT uid FROM u", "`UNION BY NAME` is not supported yet"),
+])
+def test_unsupported_set_operations_raise_by_name(mx, data, sql, message):
+    assert message in error_of(mx, data, sql)
+
+
+def test_the_plan_names_the_set_operation(mx, data):
+    text = plan(mx, data, "SELECT k FROM t UNION SELECT k FROM u")
+    assert "UNION: 340 rows in, 8 out" in text
+
+
+# ── step 4: filtering on a window result: QUALIFY ────────────────────────────────────────────────
+
+QUALIFY = {
+    "row-number-one": "SELECT id, k FROM t WHERE {f} QUALIFY row_number() OVER (PARTITION BY k ORDER BY id) = 1",
+    "rank-alias": "SELECT id, k, rank() OVER (PARTITION BY k ORDER BY v, id) AS r FROM t WHERE {f} QUALIFY r <= 2",
+    "window-not-selected": "SELECT id FROM t WHERE {f} QUALIFY dense_rank() OVER (PARTITION BY s ORDER BY v DESC NULLS LAST, id) <= 3",
+    "running-total": "SELECT id, v FROM t WHERE {f} QUALIFY sum(v) OVER (ORDER BY id) > 150",
+    "over-groups": "SELECT k, count(*) AS c FROM t WHERE {f} GROUP BY k QUALIFY rank() OVER (ORDER BY count(*) DESC, k) <= 3",
+    "and-or": "SELECT id FROM t WHERE {f} QUALIFY row_number() OVER (PARTITION BY k ORDER BY id) = 1 OR lag(v) OVER (ORDER BY id) IS NULL",
+    "order-limit": "SELECT id, k FROM t WHERE {f} QUALIFY row_number() OVER (PARTITION BY k ORDER BY id DESC) <= 2 ORDER BY k NULLS LAST, id LIMIT 6",
+    "order-by-ordinal": "SELECT id, k FROM t WHERE {f} QUALIFY row_number() OVER (PARTITION BY k ORDER BY id) <= 3 ORDER BY 2 NULLS FIRST, 1 DESC",
+    "order-by-an-unselected-column": "SELECT id FROM t WHERE {f} QUALIFY row_number() OVER (ORDER BY id) <= 8 ORDER BY v NULLS LAST, id",
+    "order-by-an-expression": "SELECT id, k FROM t WHERE {f} QUALIFY row_number() OVER (ORDER BY id) <= 8 ORDER BY id % 3, id",
+    "distinct": "SELECT DISTINCT k FROM t WHERE {f} QUALIFY row_number() OVER (PARTITION BY k, s ORDER BY id) <= 2",
+    "star": "SELECT * FROM t WHERE {f} QUALIFY row_number() OVER (PARTITION BY k ORDER BY id) = 1",
+    "in-a-derived-table": "SELECT count(*) FROM (SELECT id FROM t WHERE {f} QUALIFY row_number() OVER (PARTITION BY k ORDER BY id) = 1) x",
+    "in-a-cte": "WITH a AS (SELECT id, k FROM t WHERE {f} QUALIFY row_number() OVER (PARTITION BY k ORDER BY id) <= 2) SELECT k, count(*) FROM a GROUP BY k",
+    "limit-offset": "SELECT id FROM t WHERE {f} QUALIFY rank() OVER (PARTITION BY k ORDER BY id) = 1 ORDER BY id LIMIT 3 OFFSET 1",
+}
+QUALIFY_ORDERED = {"order-limit", "order-by-ordinal", "order-by-an-unselected-column", "order-by-an-expression", "limit-offset"}
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("f", FILTERS)
+@pytest.mark.parametrize("name", list(QUALIFY))
+def test_qualify_equals_duckdb(mx, data, name, f, mode):
+    q(mx, data, mode, QUALIFY[name].format(f=f), ordered=name in QUALIFY_ORDERED)
+
+
+def test_qualify_over_a_csv_file(mx, data):
+    q(mx, data, "csv", "SELECT id, k FROM t QUALIFY row_number() OVER (PARTITION BY k ORDER BY id) = 1")

@@ -464,6 +464,14 @@ def qualify_run[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: Sql
             known.append(lower_ascii(it.alias))
         elif st.exprs[it.expr].kind == X_COL:
             known.append(lower_ascii(st.exprs[it.expr].text))
+    var under = List[Int]()
+    collect(st, q, under)
+    for u in under:                                  # a select item's alias in the condition means the item
+        if st.exprs[u].kind == X_COL and st.exprs[u].text2.byte_length() == 0:
+            for it in st.items:
+                if it.has_alias and lower_ascii(it.alias) == lower_ascii(st.exprs[u].text):
+                    st.exprs[u] = st.exprs[it.expr].copy()
+                    break
     st.items.append(SelectItem(q, String("__q"), True, line, col))
     var frags = List[String]()                    # the ORDER BY's keys as text; "#n" is output column n, resolved when the columns are known
     var hidden = 1
@@ -1013,6 +1021,8 @@ def sql_with[P: Planner](mut catalog: Catalog, text: String, planner: P, options
     var run = QueryRun(q, text)
     var t0 = perf_counter_ns()
     var r = exec_statement(run, work, root, planner, options)
+    for step in run.steps:
+        r.notes.append("step: " + step)
     r.ms = Float64(perf_counter_ns() - t0) / 1e6
     return r^
 
