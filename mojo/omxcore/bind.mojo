@@ -75,16 +75,72 @@ struct Catalog(Movable):
     """The named sources a query may read. `add_table`, `add_frame` and `add_scan` register one under a name
     (case does not matter); a frame is snapshotted when added: add it again after more edits."""
     var sources: List[SqlSource]
+    var view_names: List[String]     # F-159: named views, see `view`
+    var view_sql: List[String]
 
     def __init__(out self):
         self.sources = List[SqlSource]()
+        self.view_names = List[String]()
+        self.view_sql = List[String]()
 
     def copy(self) -> Catalog:
         """A catalog of the same sources (tables and scans are shared handles, a frame's snapshot is copied): what a background job (F-175) works on."""
         var out = Catalog()
         for s in self.sources:
             out.sources.append(s.copy())
+        out.view_names = self.view_names.copy()
+        out.view_sql = self.view_sql.copy()
         return out^
+
+    def view(mut self, name: String, query: String) raises:
+        """F-159: a named view. Any query that reads `name` in FROM reads the result of `query` (a SELECT, WITH or UNION over the catalog's sources
+        and the views added before it); the query runs once per query that reads it, as a CTE read once does. A source and a view may not share a name."""
+        if self.find(name) >= 0:
+            raise Error("`" + name + "` is a source of this catalog: a view needs a name of its own")
+        var key = lower_ascii(name)
+        for i in range(len(self.view_names)):
+            if lower_ascii(self.view_names[i]) == key:
+                self.view_sql[i] = query
+                return
+        self.view_names.append(name)
+        self.view_sql.append(query)
+
+    def view_index(self, name: String) -> Int:
+        var key = lower_ascii(name)
+        for i in range(len(self.view_names)):
+            if lower_ascii(self.view_names[i]) == key:
+                return i
+        return -1
+
+    def view_text(self, i: Int) -> String:
+        return self.view_sql[i]
+
+    def without_view(self, i: Int) -> Catalog:
+        """A copy of the catalog that has the views defined before view `i` (a view reads only those: no recursion)."""
+        var out = Catalog()
+        for s in self.sources:
+            out.sources.append(s.copy())
+        for k in range(i):
+            out.view_names.append(self.view_names[k])
+            out.view_sql.append(self.view_sql[k])
+        return out^
+
+    def row_count(self, name: String) -> Int:
+        var i = self.find(name)
+        return self.sources[i].rows() if i >= 0 else 0
+
+    def reads_a_view(self, st: SqlStatement) -> Bool:
+        """Whether a FROM entry of the statement names a view."""
+        if len(self.view_names) == 0:
+            return False
+        if st.table_kid < 0 and not st.table_is_file and self.view_index(st.table) >= 0:
+            return True
+        if st.has_right and st.right_kid < 0 and not st.right_is_file and self.view_index(st.right_table) >= 0:
+            return True
+        for ex in st.extra:
+            if ex.kid < 0 and not ex.is_file and self.view_index(ex.name) >= 0:
+                return True
+        return False
 
     def _put(mut self, var s: SqlSource):
         var key = lower_ascii(s.name)

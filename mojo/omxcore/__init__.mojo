@@ -18,7 +18,9 @@ from .bind import Catalog, SqlSource, BoundQuery, bind_sql, SRC_TABLE, SRC_FRAME
 from .planner import (Planner, RulePlanner, PlannerOptions, PhysicalPlan, KeyLayout, Stats, ColStat, GROUP_AUTO, GROUP_DENSE, GROUP_HASHED, BUILD_AUTO, BUILD_LEFT, BUILD_RIGHT, JoinStats, JoinPlan, JoinStep, rule_join_order,
                       G_NONE, G_DENSE, G_HASHED)
 from .plan import LogicalPlan, PlanNode, build_plan
-from .sqlexec import sql, sql_with, sql_to_parquet, sql_to_parquet_with, SqlResult
+from .sqlexec import SqlResult
+from .sqlquery import sql, sql_with, sql_to_parquet, sql_to_parquet_with
+from .sql import parse_query, query_files, SqlQuery
 from .window import (Window, WindowFn, UNBOUNDED_PRECEDING, UNBOUNDED_FOLLOWING, CURRENT_ROW, row_number, rank, dense_rank, percent_rank, cume_dist, ntile, lag, lead,
                      first_value, last_value, nth_value)      # F-168
 from .winquery import compute_windows, window_sql

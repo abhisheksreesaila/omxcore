@@ -17,7 +17,8 @@ from .floatfmt import float_text
 from .query import Query, P_FILTER, P_AGGREGATE, CPU, GPU, AUTO
 from .bind import Catalog, SqlSource, SRC_TABLE, SRC_FRAME, SRC_SCAN
 from .planner import PlannerOptions
-from .sqlexec import sql, SqlResult
+from .sqlexec import SqlResult
+from .sqlquery import sql
 from .sql import FM_NONE, FM_ROWS
 from .window import (WindowFn, Window, UNBOUNDED_PRECEDING, UNBOUNDED_FOLLOWING, W_ROW_NUMBER, W_RANK, W_DENSE_RANK, W_PERCENT_RANK, W_CUME_DIST, W_NTILE, W_LAG,
                      W_LEAD, W_FIRST, W_LAST, W_NTH, W_SUM, W_COUNT, W_COUNT_STAR, W_AVG, W_MIN, W_MAX)

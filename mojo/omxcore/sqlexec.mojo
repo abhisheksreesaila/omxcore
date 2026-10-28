@@ -1820,9 +1820,8 @@ def _explain_analyze[P: Planner](mut catalog: Catalog, q0: BoundQuery, planner: 
     return out^
 
 
-def sql_with[P: Planner](mut catalog: Catalog, text: String, planner: P, options: PlannerOptions = PlannerOptions()) raises -> SqlResult:
-    """`sql` with the physical planner of your choice (anything that implements `Planner`)."""
-    var st = parse_sql(text)
+def run_plain[P: Planner](mut catalog: Catalog, var st: SqlStatement, text: String, planner: P, options: PlannerOptions) raises -> SqlResult:
+    """Runs one statement that reads only named sources (F-159's sqlquery.mojo takes the rest apart first): window functions, or bind and run."""
     if len(st.wins) > 0:
         return _run_windows(catalog, st^, text, planner, options)
     var q = bind_statement(catalog, st^, text)
@@ -1883,40 +1882,3 @@ def _run_windows[P: Planner](mut catalog: Catalog, var st: SqlStatement, text: S
     out.fallback_reason = "window functions run on the CPU"
     out.ms = Float64(perf_counter_ns() - t0) / 1e6
     return out^
-
-
-def sql(mut catalog: Catalog, text: String, options: PlannerOptions = PlannerOptions()) raises -> SqlResult:
-    """Runs one SELECT (or EXPLAIN SELECT) over the catalog's sources with the rule-based planner. The result owns its table."""
-    return sql_with(catalog, text, RulePlanner(), options)
-
-
-def sql_to_parquet_with[P: Planner](mut catalog: Catalog, text: String, path: String, planner: P, options: PlannerOptions = PlannerOptions(),
-                                    metadata: String = "", compression: Int = ZSTD, row_group_rows: Int = DEFAULT_ROW_GROUP) raises -> SqlResult:
-    """F-167: `sql_to_parquet` with the planner of your choice."""
-    if row_group_rows < 8 or row_group_rows % 8 != 0:
-        raise Error("row_group_rows must be a positive multiple of 8, got " + String(row_group_rows))
-    var counter = unsafe_alloc[Int64](1)
-    counter[0] = -1
-    var opts = options.copy()
-    opts.sink = ResultSink(path, metadata, compression, row_group_rows, Int(counter))
-    var r = SqlResult()
-    try:
-        r = sql_with(catalog, text, planner, opts)
-        if counter[0] < 0:                                   # not streamed (the rows fitted the sort budget, or the query is not a sorting row query)
-            write_parquet(path, r.table, metadata, compression, row_group_rows, options.job)
-            counter[0] = Int64(r.table.rows())
-    except e:
-        counter.free()
-        raise e^
-    r.rows_written = Int(counter[0])
-    counter.free()
-    return r^
-
-
-def sql_to_parquet(mut catalog: Catalog, text: String, path: String, options: PlannerOptions = PlannerOptions(), metadata: String = "",
-                   compression: Int = ZSTD, row_group_rows: Int = DEFAULT_ROW_GROUP) raises -> SqlResult:
-    """Runs one SELECT and writes its rows to a Parquet file, atomically (a temporary file renamed into place; an error or a cancel leaves
-    `path` as it was). `ORDER BY` over rows bigger than the sort budget (`PlannerOptions.sort_budget`) is sorted in runs on disk and the merged
-    rows go straight into row groups of `row_group_rows`: a file bigger than memory sorted into a new file. The result's `table` is then
-    the empty table of the result's columns; `rows_written` says how many rows the file has."""
-    return sql_to_parquet_with(catalog, text, path, RulePlanner(), options, metadata, compression, row_group_rows)

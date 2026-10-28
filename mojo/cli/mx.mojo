@@ -10,7 +10,7 @@ from std.sys import argv, exit
 from std.time import perf_counter_ns
 from std.os.path import dirname, isdir
 from omxcore import (Catalog, PlannerOptions, GROUP_AUTO, GROUP_DENSE, GROUP_HASHED, BUILD_LEFT, BUILD_RIGHT, sql, SqlResult, Table, SharedTable, read_csv, CsvOptions,
-                     read_parquet, scan_parquet, write_parquet, sql_to_parquet, ZSTD, parse_sql, TEXT, INT, DECIMAL, DATE, BOOL, FLOAT)
+                     read_parquet, scan_parquet, write_parquet, sql_to_parquet, ZSTD, parse_query, query_files, TEXT, INT, DECIMAL, DATE, BOOL, FLOAT)
 from omxcore.output import (json_string, columns_json, rows_json, rows_json_one, row_jsonl, csv_header, csv_row, cell_json, kind_text)
 from omxcore.parquet import physical_memory, DEFAULT_ROW_GROUP
 
@@ -243,11 +243,9 @@ def open_tables(mut cat: Catalog, args: Args, text: String, mut notes: List[Stri
         var eq = spec.find("=")
         load_file(cat, String(spec[byte=:eq]), String(spec[byte=eq + 1:]), args.stream, args.memory, notes)
     try:
-        var st = parse_sql(text)
-        if st.table_is_file and cat.find(st.table) < 0:
-            load_file(cat, st.table, st.table, args.stream, args.memory, notes)
-        if st.has_right and st.right_is_file and cat.find(st.right_table) < 0:
-            load_file(cat, st.right_table, st.right_table, args.stream, args.memory, notes)
+        for f in query_files(parse_query(text)):
+            if cat.find(f) < 0:
+                load_file(cat, f, f, args.stream, args.memory, notes)
     except e:
         _ = query_error(String(e))
 
