@@ -1675,11 +1675,11 @@ Order: F-162 gate → F-166 scoreboard → F-161 / F-167 / F-168 gaps → F-165 
 ## F-166 Scoreboard: omxcore vs DuckDB and Polars, CPU and GPU, quiet machine [todo, needs the owner's go]
 - [ ] TPC-H SF1 / SF10 and the random suite through the Mojo engine (`mx`) and the Python package; CPU, GPU and AUTO; DuckDB and Polars on the same files; quiet machine (load < 2), engine-only first runs; published to the README and the docs site with every gap
 
-## F-167 Sort and large outputs at DuckDB speed [todo, tonight 2026-10-27 after F-189: the spill part] (app #14)
+## F-167 Sort and large outputs at DuckDB speed [doing: the spill part, 2026-10-27] (app #14)
 - [ ] (tonight) a sort bigger than the memory budget spills sorted runs to disk and merges them (Table, Frame, Parquet and CSV scans; ORDER BY in SQL and the builder), results equal to DuckDB, memory bounded by the budget; speed work (radix, gather) after a quiet-machine measurement
 - [ ] full multi-key sorts and million-row results (today ~2x DuckDB): parallel radix sort with merge, column gather without per-row work, streamed output
 
-## F-168 Window functions [todo, tonight 2026-10-27 after F-189] (app #17)
+## F-168 Window functions [doing, 2026-10-27] (app #17)
 - [ ] `OVER (PARTITION BY … ORDER BY …)`: row_number, rank, dense_rank, lag / lead, running and framed sums, first / last value; equal to DuckDB
 
 ## F-169 MCP server for `mx` [todo]
