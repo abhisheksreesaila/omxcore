@@ -100,12 +100,13 @@ Needs: F-055, F-056, F-057 · Quiet machine only · Report: `docs/bench/f058-rep
 - [x] engine-only TPC-H SF1 + SF10 (stored and shuffled) and the random suite, for `cpu`, `gpu` (cold) and `auto`, against DuckDB and Polars, every result checked against DuckDB (2026-10-17): all 388 MXFrame results equal DuckDB. SF10 cpu 2.67 s / auto 2.75 / DuckDB 4.83 / Polars 11.58; SF1 445 / 482 / 618 / 1,307 ms; random auto vs DuckDB 0.99x (SF1), 1.35x (SF1 shuffled), 1.38x (SF10). The first pass found auto at 11.7 s (F-128) and two small-query regressions (F-130); spill at 512 MB measured and sped up (F-129). `gpu` was measured cold only (0/22 wins against cpu); warm, resident GPU runs are F-057's open item
 - [ ] each device beats DuckDB on at least 90% of queries: NOT met. auto beats DuckDB on 10/22 TPC-H at SF10 (8/22 shuffled, 8/22 SF1), 49-78% of random queries; faster in total at every scale. Misses (report table): multi-stage queries Q17, Q11, Q22, Q20 (2.1-2.3x: several computes with Python between them) and the lineitem x orders family Q12, Q3, Q18 (1.2-1.6x); Q6, Q10, Q16, Q8, Q15 close
 - [ ] when it passes: the rings below can start
+- Owner 2026-10-28: "finish the DuckDB gate first, make it fast first". The 2026-10-17 run measured the Python front end; the gate is re-measured on the Mojo engine (`mx sql`, F-162) once F-159 makes the multi-stage queries (Q2, Q11, Q17, Q20, Q21, Q22) single SQL statements. Order: F-159 → F-162 (all 22 equal DuckDB through `mx sql`) → a quiet-night scoreboard of omxcore vs DuckDB (owner's go for the quiet night) → speed work on whatever loses (F-161 join speed, F-167 parallel / radix sort, a parallel window sort).
 
 ## Rings (after the core gate, not before)
 Proposed 2026-10-15, not yet briefed; each goes through `clarify` when its turn comes.
 - Mojo front end for MXFrame: a Mojo plan builder over `mx_execute`, so MX App / DataLens can use MXFrame where there is no Python (iPhone). Depends on F-033, F-034, F-021 (every query native, native Parquet).
 - Tables loaded once per process, shared read-only across sessions (MX App's `App.init_shared`, fh-saas dashboards).
-- Embedding columns and filtered top-k vector search (CPU, then GPU), built on the `mx_filter_topk` pattern.
+- Embedding columns and filtered top-k vector search (CPU, then GPU), built on the `mx_filter_topk` pattern. Owner 2026-10-28: a passing thought, parked until the gate passes; when it comes: first user omxplorer ("find rows like this one"), the app brings the vectors (no model in the core).
 - Vision kernels, LLM operators, an MCP server: parked.
 
 ## Wave 1: foundations (parallel)
