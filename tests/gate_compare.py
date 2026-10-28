@@ -63,3 +63,14 @@ def compare_with_duckdb(mx, sql, paths, con, label=None, extra=()):
     res = run_mx(mx, ["sql", "--max-rows", "0", *extra, sql], {n: paths[n] for n in tables_named(sql)})
     compare_json_with_duckdb(res, sql, con, label)
     return res
+
+
+def gap_must_still_fail_with(error, run):
+    """A known gap: xfail when `run()` fails with exactly this engine error; any other failure, or a pass, fails the test."""
+    import pytest
+    try:
+        run()
+    except AssertionError as e:
+        assert error in str(e), f"the engine's error is no longer `{error}`: {str(e)[:600]}"
+        pytest.xfail(error)
+    pytest.fail(f"the gap `{error}` is closed: delete its entry from GAPS")

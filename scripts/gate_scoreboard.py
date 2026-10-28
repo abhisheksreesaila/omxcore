@@ -77,7 +77,7 @@ def run_duck(sql: str, tables: list, paths: dict, workdir: Path, timeout: float)
 
 
 def run_mx_once(mx: str, sql: str, tables: list, paths: dict, device: str, gpu: str, timeout: float) -> dict:
-    cmd = [mx, "sql", "--max-rows", "0", "--device", device, sql]
+    cmd = [mx, "sql", "--max-rows", "0", "--stream", "never", "--device", device, sql]   # never stream the file inside the clock
     for t in tables:
         cmd += ["-t", f"{t}={paths[t]}"]
     env = dict(os.environ, CUDA_VISIBLE_DEVICES=gpu if device != "cpu" else "-1")
@@ -170,7 +170,7 @@ def ratio(rec, dev):
 def report(args, out, loads, path: Path, started: str):
     L = [f"# M8 gate scoreboard: {datetime.date.today().isoformat()}", "",
          f"omxcore `mx sql` ({', '.join(args.devices)}) against DuckDB {__import__('duckdb').__version__}, engine-only first runs: a fresh process per (engine, query, run), the tables "
-         f"loaded outside the clock, no warm-up, the median of {args.repeats} run(s). Typed TPC-H Parquet (DuckDB dbgen: DECIMAL, DATE), queries as DuckDB's "
+         f"loaded outside the clock, no warm-up, the median of {args.repeats} run(s); omxcore runs with `--stream never` (the file is read whole before the query, never streamed inside its clock), DuckDB queries preloaded tables. Typed TPC-H Parquet (DuckDB dbgen: DECIMAL, DATE), queries as DuckDB's "
          f"tpch extension writes them. Started {started}; load average before each run: median {median(loads):.1f}, max {max(loads):.1f}"
          f"{' (NOT QUIET: re-run on an idle machine)' if max(loads) > 4 else ''}. Command: `{' '.join(sys.argv)}`.", ""]
     notes = {r[dev]["device_note"] for r in out.values() for dev in args.devices if dev in r and "device_note" in r[dev]}

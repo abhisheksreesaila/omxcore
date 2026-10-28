@@ -38,11 +38,15 @@ Equal: Q1, Q3, Q4, Q5, Q6, Q10, Q12, Q19 (8). Every failure is an error from the
 **Grouped**
 - **Needs F-159 (CTE, derived table, scalar subquery, `GROUP` in a subquery): 11 queries.** Q2, Q11, Q17, Q20 (scalar subquery); Q7, Q8, Q9, Q13, Q22 (derived table in FROM); Q15 (`WITH`); Q18 (`GROUP BY` inside an `IN` subquery). Q2/Q11/Q17/Q20 may also need the correlated form; Q22 needs `NOT EXISTS` next to a scalar subquery. Whether these reach "equal" after F-159 is for the xfails to say.
 - **Needs F-155 (subqueries in a query that also joins; several subqueries in one WHERE): 2 queries.** Q16 (`NOT IN` subquery plus a join), Q21 (two `EXISTS` / `NOT EXISTS` with `<>`).
-- **Other gap: 1 query (Q14), a bug, not a missing feature.** The cause, isolated by running the pieces: `SELECT 100.00 * sum(l_extendedprice * (1 - l_discount)) AS a ...` works (DECIMAL scale 6), and `100.00 * sum(x) / sum(x)` fails. DuckDB types DECIMAL / DECIMAL as DOUBLE (`typeof(100.00*cast(1 as decimal(38,4))/cast(1 as decimal(38,4)))` is DOUBLE); the engine's DECIMAL division scales the numerator up inside int64 and raises past 9.2e18. Q8, Q14 and any `sum(decimal) / sum(decimal)` shape will hit it. No ticket yet.
+- **Other gap: 1 query (Q14), a bug, not a missing feature (F-190).** `/` is typed FLOAT (`bind.mojo`), so nothing scales up inside int64. The failure is the cast of a large DECIMAL to DOUBLE: `OP_I2F` (`query.mojo`) rejects the raw DECIMAL integer when it is past 2^53 and raises "a sum or an expression passed the int64 range ... integer past 2^53 met a float64", where DuckDB rounds to the nearest double. Isolated: `sum(l_extendedprice) / 3` and `100.00 * sum(l_extendedprice)` alone work; `100.00 * sum(l_extendedprice) / 2.0` fails (raw sum about 2.3e17 > 2^53); the Q14 shape works when filtered to `l_orderkey < 100000`. Any DECIMAL aggregate with a raw value past 2^53 divided or cast to DOUBLE will hit it (Q8 is the same shape, behind F-159 for now).
 
 ## Random suite: 80 of 80 seeds equal DuckDB
 
 `scripts/bench_random/gen.py` (the F-044 / F-058 generator: filters, joins along the foreign keys, group-by, HAVING, top-N, COUNT(DISTINCT), SELECT DISTINCT), seeds 0-79, rendered as SQL over the typed tables (`gate_common.random_sql`: date filters become `DATE '…'` literals; the constants come from the quantiles of the typed SF1 files). All 80 equal DuckDB, FLOAT to 1e-9. No gap, so none is xfailed. The comparison itself is tested to fail on a wrong answer (`test_the_comparison_sees_a_different_answer`).
+
+**Ties at a LIMIT cut.** The comparison is exact and ordered, with no tie handling. Q3, Q10 and Q18 order by revenue / price and cut at a LIMIT; if two rows ever tied at the cut and the engines picked different ones, it would show as a false alarm (a row differing), not a hidden bug. None does at SF1 today.
+
+**Timing note.** The scoreboard runs `mx` with `--stream never`, so a file is never streamed inside the clock.
 
 ## Not covered here
 
