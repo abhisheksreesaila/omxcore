@@ -500,16 +500,17 @@ struct _Emitter(Movable):
         if x.op == B_I2F:                                      # an INT or DECIMAL read as a float: float(v) / 10^scale, as DuckDB casts it
             var a = self.value(x.a)
             self.p.has_float = True
-            self.ins(OP_I2F, a.reg, a.reg)
             var real = x.scale == F32_COLUMN                       # cast to a 32-bit float (DuckDB's REAL): rounded after each step
-            if real:
-                self.ins(OP_F32, a.reg, a.reg)
+            if not real:                                           # F-190: the kernel does DuckDB's whole cast, also past 2^53
+                self.ins(OP_I2F, a.reg, a.reg, 0, 1 + Int(x.value))
+                return V(a.reg, a.nul, False, True)
+            self.ins(OP_I2F, a.reg, a.reg)                         # (REAL past 2^53 still raises: DuckDB's 32-bit rule differs and is not reproduced)
+            self.ins(OP_F32, a.reg, a.reg)
             if x.value > 0:
                 var k = self.const_f(Float64(Int(pow10_checked(Int(x.value)))))
                 self.ins(OP_DIV, a.reg, a.reg, k)
                 self.free(k)
-                if real:
-                    self.ins(OP_F32, a.reg, a.reg)
+                self.ins(OP_F32, a.reg, a.reg)
             return V(a.reg, a.nul, False, True)
         if x.op == B_NEG:
             var a = self.value(x.a)

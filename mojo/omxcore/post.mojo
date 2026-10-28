@@ -11,7 +11,7 @@ column (its value converted to a double here, exactly as DuckDB casts it), so an
 integer-to-float conversion.
 """
 from .table import Table, SharedTable, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
-from .bind import (BoundQuery, BExpr, SqlSource, SortKey, B_COL, B_LIT, B_KEY, B_AGG, B_ADD, B_SUB, B_MUL, B_DIV, B_CMP, B_NEG, B_I2F)
+from .bind import (decimal_to_float, BoundQuery, BExpr, SqlSource, SortKey, B_COL, B_LIT, B_KEY, B_AGG, B_ADD, B_SUB, B_MUL, B_DIV, B_CMP, B_NEG, B_I2F)
 from .plan import build_plan
 from .planner import RulePlanner, PlannerOptions, commas, Stats, plan_sinks
 from .sqlprog import DictAccess
@@ -22,13 +22,6 @@ from .rows import prepare_rows, execute_rows
 
 def _is_number(kind: Int) -> Bool:
     return kind == INT.value or kind == DECIMAL.value
-
-
-def _p10(k: Int) -> Float64:
-    var v = Float64(1.0)
-    for _ in range(k):
-        v *= 10.0
-    return v
 
 
 struct _Shadows(Movable):
@@ -115,7 +108,7 @@ def run_post(q: BoundQuery, keys: List[ValCol], aggs: List[ValCol], dicts: DictA
         var v = keys[src_col].copy() if src_col < nk else aggs[src_col - nk].copy()
         var f = ValCol(FLOAT.value, 0, v.n())
         for i in range(v.n()):
-            f.v[i] = float_bits(Float64(v.v[i]) / _p10(v.scale)) if not v.is_null(i) else 0
+            f.v[i] = float_bits(decimal_to_float(v.v[i], v.scale)) if not v.is_null(i) else 0
         f.nul = v.nul.copy()
         _put_column(g, "f" + String(s), f, dicts)
     var shared = g^.share()

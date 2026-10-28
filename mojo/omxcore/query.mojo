@@ -910,17 +910,10 @@ struct _Slot(Copyable, Movable):
 
 def _to_float(mut p: Program, mut a: _Slot) raises:
     """Reads an int register as a float64, in place: float(v) / 10^scale, as DuckDB casts an INT or DECIMAL to DOUBLE. A value past
-    +-2^53 is not exact as a double: the kernel flags it and the query raises."""
+    +-2^53 is converted the way DuckDB does it (F-190): the kernel's OP_I2F with 1 + decimal places in its last field does the whole cast."""
     if a.fl:
         return
-    p.emit(OP_I2F, a.reg, a.reg)
-    if a.scale > 0:
-        var f = Float64(1.0)
-        for _ in range(a.scale):
-            f *= 10.0
-        var k = p.reg()
-        p.emit(OP_LOAD_CONST, k, p.const(Int64(f.to_bits())))
-        p.emit(OP_DIV, a.reg, a.reg, k)
+    p.emit(OP_I2F, a.reg, a.reg, 0, 1 + max(a.scale, 0))
     a.fl = True
     a.scale = -1
     p.has_float = True
@@ -1523,7 +1516,7 @@ def _run_cpu(t: SharedTable, p: Program, mask_addr: Int, start: Int = 0, end: In
                             0, 1, start, stop, Int(out_vals.unsafe_ptr()), Int(out_cnt.unsafe_ptr()), threads, p.repro)
     _ = code^, consts^, set_bytes^, set_meta^, tbl^, dtypes^      # the kernel read them: keep them past the call
     if rc == E_OVERFLOW:
-        raise Error(overflow_message(p.has_float, p.conv_text()))
+        raise Error(overflow_message(p.conv_text()))
     if rc != 0:
         raise Error("the CPU kernel failed with code " + String(rc))
     var r = _make_result(p, out_vals, out_cnt)
@@ -1850,12 +1843,10 @@ comptime OVERFLOW_MESSAGE = "a sum or an expression passed the int64 range (abou
 comptime FOOTER_LIE = "footer statistics wrong: "              # the prefix `run_sql` reads to run a query again without a file's statistics
 
 
-def overflow_message(has_float: Bool, conv: String = "") -> String:
-    """The kernel's overflow flag: an int64 total or result past its range, and, when the program holds float64 values, an integer past
-    2^53 meeting one (it is not exact as a double); F-156: and a CAST that met a value it cannot convert (`conv` names them)."""
+def overflow_message(conv: String = "") -> String:
+    """The kernel's overflow flag: an int64 total or result past its range (an integer past 2^53 read as a double rounds, F-190: it no
+    longer raises,); F-156: and a CAST that met a value it cannot convert (`conv` names them)."""
     var base = OVERFLOW_MESSAGE
-    if has_float:
-        base = "a sum or an expression passed the int64 range (about 9.2e18), or an integer past 2^53 met a float64 (it is not exact as a double)"
     if conv.startswith(FOOTER_LIE):
         return conv
     if conv.byte_length() > 0:

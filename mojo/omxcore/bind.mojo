@@ -462,13 +462,23 @@ def _is_num(kind: Int) -> Bool:
 
 
 def decimal_to_float(v: Int64, scale: Int) -> Float64:
-    """A stored decimal as a float64, as DuckDB casts DECIMAL to DOUBLE: the integer as a double, divided by the power of ten."""
+    """A stored decimal as a float64, as DuckDB casts DECIMAL to DOUBLE (F-190, probed bit for bit): up to +-2^53 the integer as a double,
+    divided by the power of ten; past it the whole part and the fraction apart, double(v / 10^scale) + double(v % 10^scale) / 10^scale
+    (the kernel's OP_I2F does the same, `_decimal_f64`)."""
     if scale == 0:
         return Float64(v)
     var p = Float64(1.0)
+    var pu = UInt64(1)
     for _ in range(scale):
         p *= 10.0                     # exact up to 10^22
-    return Float64(v) / p
+        pu *= 10
+    if (v >= -(Int64(1) << 53) and v <= (Int64(1) << 53)) or scale > 18:
+        return Float64(v) / p
+    var neg = v < 0
+    var m = UInt64(0) - UInt64(v) if neg else UInt64(v)
+    var q = m // pu
+    var x = Float64(q) + Float64(m - q * pu) / p
+    return -x if neg else x
 
 
 def decimal_to_f32(v: Int64, scale: Int) -> Float64:

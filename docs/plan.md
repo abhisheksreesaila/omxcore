@@ -75,15 +75,17 @@ F-056 built this in the Python front end; apps now call the Mojo engine, whose `
 - [x] results equal the CPU for every source kind (Table, Frame, Parquet scan, CSV scan) and on the Apple plan (`-D OMXCORE_APPLE_GPU_SHAPE`); NVIDIA PTX unchanged unless a kernel change is unavoidable (then re-pinned with a timing A/B); Mac link check green
 - Later (not this ticket): the second GPU as its own pool and worker, NVLink peer access, quiet-machine timings
 
-## F-190 A large DECIMAL read as a double rounds instead of raising (TPC-H Q14) [todo] (found by the F-162 harness, 2026-10-28)
+## F-190 A large DECIMAL read as a double rounds instead of raising (TPC-H Q14) [done 2026-10-28] (found by the F-162 harness, 2026-10-28)
 Root cause (F-162 review): `/` is already FLOAT (bind.mojo); `OP_I2F` (query.mojo) refuses a raw DECIMAL integer past 2^53 when it reads it as a double, so `100.00 * sum(l_extendedprice) / sum(...)` raises `int64 range exceeded` at SF1.
-- [ ] a DECIMAL past 2^53 converted to DOUBLE rounds to the nearest double as DuckDB does (exactness kept everywhere a DECIMAL stays a DECIMAL); Q14 and the magnitude probes equal DuckDB through `mx sql`; NVIDIA PTX unchanged unless unavoidable (OP_I2F may also exist in the GPU kernel: then the GPU keeps declining such programs or matches)
+- Built: DuckDB 1.5.1's rule probed on ~90,000 values a scale: up to 2^53 `float(raw) / 10^s`, past it `float(raw / 10^s) + float(raw % 10^s) / 10^s` (truncating); the CPU kernel's `OP_I2F` does the whole cast for Mojo programs (field 0, the Python API, unchanged); one shared `decimal_to_float` for constants, frames, aggregates read as doubles (post.mojo) and variance / stddev (holistic.mojo). GPU untouched (such programs never reach it). Review: round 1 NEEDS WORK (aggregates read as doubles kept the old rule), round 2 PASS (bit for bit with DuckDB on casts, grouped and window aggregates, Parquet and CSV).
+- [x] a DECIMAL past 2^53 converted to DOUBLE rounds to the nearest double as DuckDB does (exactness kept everywhere a DECIMAL stays a DECIMAL); Q14 and the magnitude probes equal DuckDB through `mx sql`; NVIDIA PTX unchanged unless unavoidable (OP_I2F may also exist in the GPU kernel: then the GPU keeps declining such programs or matches)
 
 ## F-191 SQL honours GPU and AUTO (`mx sql --device gpu|auto`, `sql_with` on a device) [todo] (found by the F-162 harness, 2026-10-28)
 The gate asks each device to beat DuckDB, but the SQL path runs everything on the CPU ("SQL runs on the CPU"); the builder's GPU / AUTO (with F-189's budget) is not reached from SQL.
 - [ ] the aggregate stages the GPU kernel can run (the builder's GPU programs: integer / DECIMAL filters and aggregates, AUTO's size rule, F-189's pieces) run on the GPU from SQL; everything else stays on the CPU with a `fallback_reason`; results equal the CPU; NVIDIA PTX unchanged
 
 ## F-192 DECIMAL sums past int64 as DuckDB (128-bit totals; TPC-H Q11) [todo] (found by F-159, 2026-10-28)
+- [ ] also a window `sum(d) OVER (...)` past int64 (raises "a window sum passed the int64 range"; DuckDB uses HUGEINT), found in the F-190 review
 - [ ] `sum(decimal * decimal)` (Q11's `sum(ps_supplycost * ps_availqty)`) and other DECIMAL sums whose total passes int64 give DuckDB's answer (DuckDB sums DECIMAL into HUGEINT) instead of raising; the result type follows DuckDB's DECIMAL width rules; exact everywhere; GPU keeps declining or matches (PTX unchanged)
 
 ## F-193 A typed NULL constant keeps its own kind beside other constants (wrong column kind) [todo] (found by F-159, 2026-10-28)

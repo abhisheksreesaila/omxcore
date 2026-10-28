@@ -21,7 +21,6 @@ SF = 1
 # query -> the engine's error today. Keep the text exact (the xfail reason is what the F-159 / F-155 reviewer greps).
 GAPS = {
     11: "a sum or an expression passed the int64 range (about 9.2e18)",       # F-192
-    14: "a sum or an expression passed the int64 range (about 9.2e18), or an integer past 2^53 met a float64 (it is not exact as a double)",   # F-190
 }
 
 
