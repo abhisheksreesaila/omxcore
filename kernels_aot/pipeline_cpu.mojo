@@ -234,13 +234,45 @@ def _f2i(d: FP, a: FP, n: Int):
         dd[i] = Int64(a[i])
         i += 1
 
-def _i2f(d: FP, a: FP, n: Int, ovf: LP):
-    """OP_I2F: the first n lanes of an "int" register as doubles. A value outside +-2^53 is not exact as a double: *ovf is
-    set and the caller's exact path answers."""
+def _decimal_f64(v: Int64, scale_u: UInt64, scale_f: Float64) -> Float64:
+    """An int64 DECIMAL storage integer as a double, DuckDB's rule (probed bit for bit in tests/test_f190_decimal_to_double.py): up to
+    +-2^53 the integer is exact and the double is v / 10^scale; past it, the whole part and the fraction are converted apart,
+    double(v / 10^scale) + double(v % 10^scale) / 10^scale (truncating division). scale_u = 10^scale as an integer, scale_f as a double."""
+    if v >= -LIM53 and v <= LIM53:
+        return Float64(v) / scale_f
+    var neg = v < 0
+    var m = UInt64(0) - UInt64(v) if neg else UInt64(v)
+    var q = m // scale_u
+    var x = Float64(q) + Float64(m - q * scale_u) / scale_f
+    return -x if neg else x
+
+def _i2f(d: FP, a: FP, n: Int, ovf: LP, mode: Int):
+    """OP_I2F: the first n lanes of an "int" register as doubles. `mode` is the instruction's last field. 0 (the Python API): a value
+    outside +-2^53 is not exact as a double, *ovf is set and the caller's exact path answers. 1 + k (the Mojo API, F-190, which has no
+    exact path and whose SQL is DuckDB's): the DECIMAL(k) integer read as a double the way DuckDB casts it, v / 10^k, rounded
+    past 2^53 (`_decimal_f64`); k = 0 is a plain integer cast."""
     var xa = _ibits(a)
     var lim = SIMD[DType.int64, W](LIM53)
-    var oor = SIMD[DType.bool, W](fill=False)
     var i = 0
+    if mode > 0:
+        var scale_u = UInt64(1)
+        var scale_f = Float64(1.0)
+        for _ in range(mode - 1):
+            scale_u *= 10
+            scale_f *= 10.0
+        while i + W <= n:
+            var v = xa.load[width=W](i)
+            if (v.gt(lim) | v.lt(-lim)).reduce_or():
+                for k in range(W):
+                    d[i + k] = _decimal_f64(v[k], scale_u, scale_f)
+            else:
+                d.store(i, v.cast[F64]() / scale_f)
+            i += W
+        while i < n:
+            d[i] = _decimal_f64(xa[i], scale_u, scale_f)
+            i += 1
+        return
+    var oor = SIMD[DType.bool, W](fill=False)
     while i + W <= n:
         var v = xa.load[width=W](i)
         d.store(i, v.cast[F64]())
@@ -943,7 +975,7 @@ def _run_ops(p: Prog, regs: FP, cols: LP, base: Int, count: Int, i0: Int, sel: I
             elif op == OP_F2I:
                 _f2i(d, regs + Int(ins[2]) * VEC, n)
             else:
-                _i2f(d, regs + Int(ins[2]) * VEC, n, p.ovf)
+                _i2f(d, regs + Int(ins[2]) * VEC, n, p.ovf, Int(ins[4]))
         elif op >= OP_IDIV and op <= OP_ICMP:
             var ra = regs + Int(ins[2]) * VEC
             var rb = regs + Int(ins[3]) * VEC

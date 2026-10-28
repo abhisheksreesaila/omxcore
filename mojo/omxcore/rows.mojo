@@ -180,7 +180,7 @@ def _run_rows(t: SharedTable, sp: SqlProgram, mask_addr: Int, start: Int, stop: 
     else:
         rc = run.keyed(_rows_hook, 1, start, stop, threads)
     if rc == E_OVERFLOW:
-        raise Error(overflow_message(p.has_float, p.conv_text()))
+        raise Error(overflow_message(p.conv_text()))
     if rc != 0:
         raise Error("the CPU kernel failed with code " + String(rc))
     _compact_rows(run, ids_r, cnt_r, val_r, nul_r, nblk, out)
@@ -527,7 +527,7 @@ def _run_topk(t: SharedTable, sp: SqlProgram, mask_addr: Int, K: Int, key_slot: 
     else:
         rc = run.keyed(_topk_hook, 1, 0, t.rows(), threads)
     if rc == E_OVERFLOW:
-        raise Error(overflow_message(p.has_float, p.conv_text()))
+        raise Error(overflow_message(p.conv_text()))
     if rc != 0:
         raise Error("the CPU kernel failed with code " + String(rc))
     var out = RowChunk()

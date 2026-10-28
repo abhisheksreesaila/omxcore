@@ -40,14 +40,6 @@ struct ValCol(Copyable, Movable):
                 return True
         return False
 
-    def f(self, i: Int) -> Float64:
-        """The value as a float64 (a DECIMAL divided by its scale, as DuckDB casts it)."""
-        if self.kind == FLOAT.value:
-            return Float64(from_bits=UInt64(self.v[i]))
-        if self.scale > 0:
-            return Float64(self.v[i]) / Float64(Int(_p10(self.scale)))
-        return Float64(self.v[i])
-
 
 def _fcmp(a: Float64, b: Float64) -> Int:
     if a != a:
@@ -56,12 +48,6 @@ def _fcmp(a: Float64, b: Float64) -> Int:
         return -1
     return -1 if a < b else 1 if a > b else 0
 
-
-def _p10(k: Int) -> Int64:
-    var v: Int64 = 1
-    for _ in range(k):
-        v *= 10
-    return v
 
 
 def float_bits(x: Float64) -> Int64:

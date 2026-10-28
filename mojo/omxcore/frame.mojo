@@ -29,7 +29,7 @@ from .expr import (Expr, Node, col, least, greatest, N_COL, N_LIT, N_LITF, N_DIV
 from .csv import _parse_int, _parse_decimal, _parse_date, _parse_bool, _parse_float, F_OK, F_RANGE, F_NAN_BITS
 from .holistic import float_key
 from .sortspill import SpillSort, sort_budget_bytes
-from .bind import SortKey
+from .bind import SortKey, decimal_to_float
 from .sqleval import ValCol
 from .sqlprog import DictAccess
 from .parquet import ParquetScan, ParquetWriter, write_parquet, ZSTD, DEFAULT_ROW_GROUP, STREAM_WRITE_BUDGET
@@ -1596,13 +1596,6 @@ def _fcmp(a: Float64, b: Float64) -> Int:
     return -1 if a < b else 1 if a > b else 0
 
 
-def _p10f(k: Int) -> Float64:
-    var f = Float64(1.0)
-    for _ in range(k):
-        f *= 10.0
-    return f
-
-
 def _eval_row_t(e: Expr, base: SharedTable, raw: List[Int64], marker: Int64 = NULL_EDIT) raises -> Tuple[Int64, Bool, Bool]:
     """(value, null, is a float64) of an expression over stored columns on one row's values (NULL_EDIT: null), with the kernel's
     semantics: exact int64 (overflow raises), Mojo's floor // and %, x // 0 = x % 0 = 0. A null operand makes the result null,
@@ -1743,10 +1736,5 @@ def _eval_row_t(e: Expr, base: SharedTable, raw: List[Int64], marker: Int64 = NU
 
 
 def _to_float_bits(a: Int64, scale: Int) raises -> Int64:
-    """An INT or DECIMAL value as the bits of a float64, as the kernel's conversion does (exact up to 2^53, else it raises)."""
-    if a > Int64(1) << 53 or a < -(Int64(1) << 53):
-        raise Error("an integer past 2^53 cannot be read as a float64 exactly")
-    var f = Float64(a)
-    if scale > 0:
-        f = f / _p10f(scale)
-    return Int64(f.to_bits())
+    """An INT or DECIMAL value as the bits of a float64, as the kernel's conversion does (DuckDB's cast, also past 2^53, F-190)."""
+    return Int64(decimal_to_float(a, scale).to_bits())
