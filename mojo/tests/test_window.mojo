@@ -2,7 +2,7 @@
 # except where the engine's text order differs from DuckDB's binary one), the notes, EXPLAIN, the errors. (tests/test_mojo_window.py compares
 # many more queries with DuckDB on generated data; mojo/tests/test_window_builder.mojo covers the builder.)
 from omxcore import (Table, SharedTable, Frame, Catalog, PlannerOptions, sql, SqlResult, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, write_parquet, scan_parquet,
-                     ZSTD)
+                     scan_csv, CsvOptions, ZSTD)
 
 
 def fail(msg: String) raises:
@@ -169,6 +169,18 @@ def main() raises:
     var b = sql(cat, "SELECT region, day, rank() OVER (PARTITION BY region ORDER BY qty) AS r, avg(price) OVER (ORDER BY day ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS a FROM filed ORDER BY day")
     check(rows_of(b.table), rows_of(a.table), "the scan equals the table")
     has_note(b, "ran: scan filed: ")
+
+    # a streamed CSV file is a source too (its row groups are read for the columns the query needs)
+    var csv = String("g,v\n")
+    for k in range(30):
+        csv += String(k % 3) + "," + String((k * 7) % 11) + "\n"
+    var out = open("window-test.csv", "w")
+    out.write(csv)
+    out.close()
+    cat.add_scan("csvfile", scan_csv("window-test.csv", CsvOptions(group_rows=8)))
+    r = sql(cat, "SELECT g, v, sum(v) OVER (PARTITION BY g ORDER BY v, g ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS s, rank() OVER (PARTITION BY g ORDER BY v) AS r FROM csvfile "
+                 "WHERE v > 5 ORDER BY g, v, s")
+    check(rows_of(r.table), "0 6 6 1\n0 7 13 2\n0 8 15 3\n0 9 17 4\n0 10 19 5\n1 6 6 1\n1 7 13 2\n1 9 16 3\n1 10 19 4\n2 6 6 1\n2 7 13 2\n2 8 15 3\n2 9 17 4\n2 10 19 5\n", "a CSV scan")
 
     # unsupported forms raise by name
     fails_with(cat, "SELECT qty FROM orders WHERE rank() OVER (ORDER BY qty) = 1", "window functions are only allowed in the SELECT list and ORDER BY")
