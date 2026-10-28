@@ -1676,8 +1676,9 @@ Order: F-162 gate → F-166 scoreboard → F-161 / F-167 / F-168 gaps → F-165 
 ## F-166 Scoreboard: omxcore vs DuckDB and Polars, CPU and GPU, quiet machine [todo, needs the owner's go]
 - [ ] TPC-H SF1 / SF10 and the random suite through the Mojo engine (`mx`) and the Python package; CPU, GPU and AUTO; DuckDB and Polars on the same files; quiet machine (load < 2), engine-only first runs; published to the README and the docs site with every gap
 
-## F-167 Sort and large outputs at DuckDB speed [doing: the spill part, 2026-10-27] (app #14)
-- [ ] (tonight) a sort bigger than the memory budget spills sorted runs to disk and merges them (Table, Frame, Parquet and CSV scans; ORDER BY in SQL and the builder), results equal to DuckDB, memory bounded by the budget; speed work (radix, gather) after a quiet-machine measurement
+## F-167 Sort and large outputs at DuckDB speed [spill part done 2026-10-28; speed part todo] (app #14)
+- Built (spill): `PlannerOptions.sort_budget` / `spill_dir`, `sortspill.mojo` (runs sorted by `_order_rows`, k-way merge with the one comparison `_SortCols.cmp`, row number as the last key, TEXT ranked once across runs, the spill file unlinked right after it opens), `sql_to_parquet` (ORDER BY merged straight into a Parquet file), `mx sql --sort-budget / --spill-dir / --row-group-rows`, and `Frame.permutation` / `permutation_job` (`budget=`, `spill_dir=`): the app's sheet sort. 3M rows: SQL sort into a file 401 MB in memory to 46-95 MB at 16-64 MiB; a permutation 169 MB to 64 MB at 16 MiB. Default budget 2 GiB; spill dir TMPDIR, then ~/.cache/omxcore on Linux, then /tmp. Review: round 1 NEEDS WORK (the builder sort did not spill), round 2 PASS. Limits: no multi-pass merge; no O_EXCL / 0600 on the spill file (unlinked at once); an aggregate's groups stay in memory.
+- [x] (tonight) a sort bigger than the memory budget spills sorted runs to disk and merges them (Table, Frame, Parquet and CSV scans; ORDER BY in SQL and the builder), results equal to DuckDB, memory bounded by the budget; speed work (radix, gather) after a quiet-machine measurement
 - [ ] full multi-key sorts and million-row results (today ~2x DuckDB): parallel radix sort with merge, column gather without per-row work, streamed output
 
 ## F-168 Window functions [doing, 2026-10-27] (app #17)
