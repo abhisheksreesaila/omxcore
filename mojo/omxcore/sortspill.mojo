@@ -17,7 +17,8 @@ of a run is read with one seek and read per column. The file is removed when the
 """
 from std.ffi import external_call
 from std.memory.alloc import unsafe_alloc
-from std.os import getenv
+from std.os import getenv, mkdir
+from std.sys import CompilationTarget
 from std.time import perf_counter_ns
 from .table import TEXT, FLOAT, INT
 from .job import JobCtl
@@ -50,12 +51,37 @@ def run_row_cap(budget: Int, columns: Int, keys: Int, forced: Int) -> Int:
     return max(VEC, (budget // per_row // VEC) * VEC)
 
 
+def _make_dir(path: String):
+    try:
+        mkdir(path)
+    except:
+        pass
+
+
+def _default_dir() -> String:
+    """Where the runs go when the caller names no folder: the TMPDIR environment variable (macOS and iOS apps: the app's temporary folder);
+    on Linux, where /tmp is often a RAM disk that would defeat the memory bound, a cache folder (XDG_CACHE_HOME or ~/.cache, then `omxcore`
+    in it, made on the way); else /tmp. Apps should pass `spill_dir`."""
+    var tmp = getenv("TMPDIR")
+    if tmp.byte_length() > 0:
+        return tmp^
+    comptime if CompilationTarget.is_linux():
+        var cache = getenv("XDG_CACHE_HOME")
+        if cache.byte_length() == 0:
+            var home = getenv("HOME")
+            if home.byte_length() > 0:
+                _make_dir(home + "/.cache")
+                cache = home + "/.cache"
+        if cache.byte_length() > 0:
+            _make_dir(cache + "/omxcore")
+            return cache + "/omxcore"
+    return String("/tmp")
+
+
 def _spill_name(dir: String) -> String:
     var base = dir
     if base.byte_length() == 0:
-        base = getenv("TMPDIR")
-    if base.byte_length() == 0:
-        base = "/tmp"
+        base = _default_dir()
     if base.byte_length() > 1 and base.endswith("/"):
         var trimmed = String(base[byte=:base.byte_length() - 1])
         base = trimmed^
@@ -178,13 +204,26 @@ struct SpillSort(Movable):
         self.merged = 0
         self.job = job
         self.total_rows = 0
+        var taken = False                         # (Mojo's open has no exclusive mode: the name is unpredictable, and a name in use is refused)
         try:
-            self.file = open(path, "w")
+            var probe = open(path, "r")
+            probe.close()
+            taken = True
+        except:
+            pass
+        if taken:
+            raise Error("the sort's temporary file name `" + path + "` is already in use")
+        try:
+            var made = open(path, "w")
+            made.close()
+            self.file = open(path, "rw")
         except:
             raise Error("couldn't write a temporary file for the sort in `" + (dir if dir.byte_length() > 0 else "the temporary folder") +
                         "`: no such folder, or no permission to write there (PlannerOptions.spill_dir)")
-        self.path = path^
         self.fd = self.file._get_raw_fd()
+        # the open descriptor keeps the data; the name goes now, so a crash or a kill leaves nothing (where unlink fails, `__del__` tries again)
+        var gone = external_call["unlink", Int32](path.as_c_string_span().ptr()) == 0
+        self.path = String() if gone else path^
 
     def __del__(deinit self):
         if self.path.byte_length() > 0:
@@ -272,9 +311,6 @@ struct SpillSort(Movable):
     def begin_merge(mut self, dicts: DictAccess, budget: Int, skip: Int, limit: Int) raises:
         """Ranks the TEXT keys' words, sizes the blocks to the budget, loads the first block of every run. `skip` rows are dropped from the
         front of the order, then `limit` (-1: all) are given."""
-        self.file.close()
-        self.file = open(self.path, "r")
-        self.fd = self.file._get_raw_fd()
         for j in range(len(self.key_col)):
             if self.kind[self.key_col[j]] != TEXT.value:
                 continue

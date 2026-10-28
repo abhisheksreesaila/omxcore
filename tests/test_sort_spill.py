@@ -14,6 +14,7 @@ import subprocess
 from pathlib import Path
 
 import duckdb
+import pyarrow.parquet as pq
 import pytest
 
 from mx_oracle import mx_binary, run_mx, check, typed_rows, assert_equal
@@ -125,7 +126,7 @@ def test_merged_straight_into_a_parquet_file(env, run_rows):
                        "--spill-dir", str(env["spill"]), sql], files={"t": env["pq"]})
     assert out.exists()
     con = env["con"]
-    got = con.execute(f"select * from read_parquet('{out}')").fetchall()
+    got = [tuple(r.values()) for r in pq.read_table(out).to_pylist()]       # file order, read without a query
     want = con.execute(duck).fetchall()
     assert_equal(got, want, True, "sorted file")
     groups = con.execute(f"select count(*) from parquet_metadata('{out}') where column_id = 0").fetchone()[0]

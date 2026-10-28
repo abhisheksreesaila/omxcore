@@ -17,6 +17,8 @@ import subprocess
 from pathlib import Path
 
 import duckdb
+import numpy as np
+import pyarrow.parquet as pq
 import pytest
 
 from engine_sources import engine_sources
@@ -80,13 +82,12 @@ def test_the_peak_is_the_budget_not_the_file(probe, files):
 
 def test_the_sorted_file_equals_duckdb(probe, files):
     run(probe, files, "file", "small", BUDGET, files["dir"] / "small-out.parquet")
-    con = duckdb.connect()
-    src, out = files["small"], files["dir"] / "small-out.parquet"
-    same = con.execute(f"""select count(*) from (select id, row_number() over () rn from read_parquet('{out}')) a
-        join (select id, row_number() over ({DUCK}) rn from read_parquet('{src}')) b using (id, rn)""").fetchone()[0]
-    assert same == SMALL
-    cols = con.execute(f"select * from read_parquet('{out}') limit 1").description
-    assert [c[0] for c in cols] == ["id", "k", "txt", "x"]
+    # the file's rows in file order, read with pyarrow (no query that could reorder them), against DuckDB's sort of the source
+    out = pq.ParquetFile(files["dir"] / "small-out.parquet")
+    assert out.schema_arrow.names == ["id", "k", "txt", "x"]
+    got = np.concatenate([out.read_row_group(g, columns=["id"]).column("id").to_numpy() for g in range(out.num_row_groups)])
+    want = duckdb.connect().execute(f"select id from read_parquet('{files['small']}') {DUCK}").fetchnumpy()["id"]
+    assert len(got) == SMALL and (got == want).all()
 
 
 def test_the_sort_in_memory_needs_several_times_its_input(probe, files):
@@ -97,3 +98,24 @@ def test_the_sort_in_memory_needs_several_times_its_input(probe, files):
     assert plain["runs"] == 0
     assert plain["vm_hwm_kb"] - plain["base_hwm_kb"] > 3 * values_kb, (plain, values_kb)
     assert plain["vm_hwm_kb"] > 3 * spilled["vm_hwm_kb"], (plain, spilled)
+
+
+def run_perm(probe, files, name, column, budget):
+    p = subprocess.run([str(probe), "perm", str(files[name]), column, str(budget), "", str(files["dir"] / "spill")], check=True, capture_output=True, text=True)
+    return json.loads(p.stdout)
+
+
+@pytest.mark.parametrize("column", ["txt", "k"])
+def test_frame_permutation_spills_within_its_budget(probe, files, column):
+    """Frame.permutation over a streamed file (the app's sort of a big sheet): the same order as the in-memory one, and a peak of the 8 bytes
+    a row the answer needs, plus the budget, plus the runtime and a fixed extra; the in-memory sort needs about 35 bytes a row more (measured)."""
+    budget = 16 << 20
+    plain = run_perm(probe, files, "small", column, 0)
+    small = run_perm(probe, files, "small", column, budget)
+    big = run_perm(probe, files, "big", column, budget)
+    assert plain["rows"] == small["rows"] == SMALL and big["rows"] == BIG
+    assert small["checksum"] == plain["checksum"], (plain, small)                       # element for element the in-memory order
+    assert small["spill_files_left"] == big["spill_files_left"] == 0
+    for r, n in ((small, SMALL), (big, BIG)):
+        assert r["vm_hwm_kb"] < (25 << 10) + (n * 8 >> 10) + (budget >> 10) + (35 << 10), r
+    assert plain["vm_hwm_kb"] > small["vm_hwm_kb"] + (SMALL * 25 >> 10), (plain, small)   # the in-memory sort holds ~35 bytes a row more (measured)

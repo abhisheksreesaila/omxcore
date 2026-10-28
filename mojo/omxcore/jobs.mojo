@@ -201,17 +201,22 @@ struct PermutationJob(JobBody):
     var frame: Frame
     var column: Int
     var descending: Bool
+    var budget: Int
+    var spill_dir: String
 
-    def __init__(out self, var frame: Frame, column: Int, descending: Bool):
+    def __init__(out self, var frame: Frame, column: Int, descending: Bool, budget: Int, spill_dir: String):
         self.frame = frame^
         self.column = column
         self.descending = descending
+        self.budget = budget
+        self.spill_dir = spill_dir
 
     def run(mut self, ctl: JobCtl) raises -> List[Int]:
-        return self.frame.permutation(self.column, self.descending, ctl)
+        return self.frame.permutation(self.column, self.descending, ctl, self.budget, self.spill_dir)
 
 
-def permutation_job[CB: JobDone = NoCallback](frame: Frame, column: Int, descending: Bool = False, var done: CB = NoCallback()) -> Job[List[Int]]:
+def permutation_job[CB: JobDone = NoCallback](frame: Frame, column: Int, descending: Bool = False, var done: CB = NoCallback(), budget: Int = 0,
+                                              spill_dir: String = "") -> Job[List[Int]]:
     """`frame.permutation(column, descending)` (a sort) on a thread of its own, over a snapshot of the frame taken now. The cancel checks
     are inside the key pass and every radix pass (every 1M elements)."""
-    return start_job_then(PermutationJob(frame_snapshot(frame), column, descending), done^)
+    return start_job_then(PermutationJob(frame_snapshot(frame), column, descending, budget, spill_dir), done^)

@@ -9,7 +9,7 @@
 from std.sys import argv
 from std.time import perf_counter_ns
 from std.os import listdir
-from omxcore import (Catalog, PlannerOptions, sql, sql_to_parquet, read_parquet, scan_parquet, scan_csv, read_csv, CsvOptions, ZSTD, Table)
+from omxcore import (Frame, JobCtl, Catalog, PlannerOptions, sql, sql_to_parquet, read_parquet, scan_parquet, scan_csv, read_csv, CsvOptions, ZSTD, Table)
 
 
 def status_kb(key: String) raises -> Int:
@@ -46,6 +46,17 @@ def main() raises:
     var group = Int(String(args[7])) if len(args) > 7 else (1 << 20)
     if len(args) > 8:
         popts.threads = Int(String(args[8]))
+    if mode == "perm":                                   # F-167 review: Frame.permutation over the streamed file; the column is the SQL's first word after ORDER BY
+        var fr = Frame(scan_csv(path, CsvOptions(group_rows=100000)) if path.endswith(".csv") else scan_parquet(path)) if False else Frame(scan_parquet(path))
+        var col = fr.column(text)
+        var p0 = perf_counter_ns()
+        var order = fr.permutation(col, False, JobCtl(), popts.sort_budget, dir)
+        var h = 0
+        for r in range(len(order)):
+            h = (h * 1000003 + order[r] + 7) % 1000000000000000007
+        print('{"rows": ' + String(len(order)) + ', "checksum": ' + String(h) + ', "vm_hwm_kb": ' + String(status_kb("VmHWM:")) + ', "query_ms": ' +
+              String(Float64(perf_counter_ns() - p0) / 1e6) + ', "spill_files_left": ' + String(len(listdir(dir)) if dir.byte_length() > 0 else 0) + "}")
+        return
     var cat = Catalog()
     var csv = path.endswith(".csv")
     if mode == "table":
