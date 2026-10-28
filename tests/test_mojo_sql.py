@@ -534,7 +534,7 @@ ERRORS = [
     ("SELECT sum(x) FROM t WHERE s GLOB 'a*'", "SQL error at line 1, column 30: `GLOB` is not supported yet"),
     ("SELECT sum(x) FROM t WHERE s SIMILAR TO 'a'", "SQL error at line 1, column 30: `SIMILAR` is not supported yet"),
     ("SELECT count(*) FROM t WHERE s IN (SELECT s, x FROM t)", "SQL error at line 1, column 44: a subquery with more than one column is not supported yet"),
-    ("SELECT sum(x) OVER () FROM t", "SQL error at line 1, column 15: `OVER` (window functions) is not supported yet"),
+    ("SELECT sum(x) OVER w FROM t", "SQL error at line 1, column 20: `OVER w` (a named window) is not supported yet (write the window out: OVER (PARTITION BY ... ORDER BY ...))"),
     ("SELECT 1e3x, count(*) FROM t", "SQL error at line 1, column 8: the number `1e3` runs into the letters after it"),
     ("SELECT skewness(x) FROM t", "SQL error at line 1, column 8: function `skewness` is not supported: SQL here has the aggregates sum, count, min, max, avg, median, quantile_disc, stddev, stddev_samp, stddev_pop, variance, var_samp, var_pop and the scalar functions coalesce, ifnull, nvl, nullif, lower, upper, trim, ltrim, rtrim, substr, substring, length, starts_with, ends_with, contains, strpos, instr, left, right, reverse, replace, concat, extract, date_part, year, month, day, quarter, dayofweek, isodow, dayofyear, date_trunc, datediff, date_diff, week, weekofyear, isoyear, quantile_bin"),
     ("SELECT summ(x) FROM t", "SQL error at line 1, column 8: function `summ` is not supported (did you mean `sum`?)"),

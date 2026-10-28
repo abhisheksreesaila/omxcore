@@ -279,6 +279,41 @@ struct OrderItem(Copyable, Movable):
     var nulls: Int              # -1 the default (last), 0 NULLS LAST, 1 NULLS FIRST
 
 
+# F-168: window frame bounds
+comptime FB_UNB_PREC = 0    # UNBOUNDED PRECEDING
+comptime FB_PREC = 1        # n PRECEDING
+comptime FB_CUR = 2         # CURRENT ROW
+comptime FB_FOL = 3         # n FOLLOWING
+comptime FB_UNB_FOL = 4     # UNBOUNDED FOLLOWING
+comptime FM_NONE = 0        # no frame written: the default (RANGE UNBOUNDED PRECEDING to CURRENT ROW; the whole partition with no ORDER BY)
+comptime FM_ROWS = 1
+comptime FM_RANGE = 2
+
+
+struct WinSpec(Copyable, Movable):
+    """`OVER (PARTITION BY ... ORDER BY ... [ROWS|RANGE frame])` of a call (F-168). A call refers to it by index in `SqlStatement.wins` (the call's `c`)."""
+    var partition: List[Int]
+    var order: List[OrderItem]
+    var mode: Int
+    var s_kind: Int
+    var s_n: Int
+    var e_kind: Int
+    var e_n: Int
+    var line: Int
+    var col: Int
+
+    def __init__(out self, line: Int, col: Int):
+        self.partition = List[Int]()
+        self.order = List[OrderItem]()
+        self.mode = FM_NONE
+        self.s_kind = FB_UNB_PREC
+        self.s_n = 0
+        self.e_kind = FB_CUR
+        self.e_n = 0
+        self.line = line
+        self.col = col
+
+
 struct TableRef(Copyable, Movable):
     """A table of FROM beyond the second (F-155): `a JOIN b ON .. JOIN c ON ..`, `a, b, c WHERE ..`."""
     var name: String
@@ -352,8 +387,10 @@ struct SqlStatement(Movable):
     var subs: List[SubQuery]    # F-154: the subqueries of WHERE conditions
     var extra: List[TableRef]   # F-155: the third table of FROM and the ones after it (inner joins only)
     var from_subquery: Bool     # set by the binder when it turned a WHERE subquery into the right table of a semi / anti join
+    var wins: List[WinSpec]     # F-168: the OVER clauses of the calls (an X_CALL with `c` >= 0 refers to one)
 
     def __init__(out self, text: String):
+        self.wins = List[WinSpec]()
         self.distinct = False
         self.has_right = False
         self.right_table = String()
@@ -451,13 +488,46 @@ struct SqlStatement(Movable):
             s += "DISTINCT "
         for k in range(len(x.items)):
             s += (", " if k > 0 else "") + self.render(x.items[k])
-        return s + ")"
+        s += ")"
+        if x.c >= 0:
+            s += " OVER (" + self.render_window(x.c) + ")"
+        return s
+
+    def render_window(self, w: Int) -> String:
+        """The inside of an OVER clause as SQL text (the name DuckDB gives a window column)."""
+        ref ws = self.wins[w]
+        var s = String()
+        if len(ws.partition) > 0:
+            s += "PARTITION BY "
+            for k in range(len(ws.partition)):
+                s += (", " if k > 0 else "") + self.render(ws.partition[k])
+        if len(ws.order) > 0:
+            s += (" " if s.byte_length() > 0 else "") + "ORDER BY "
+            for k in range(len(ws.order)):
+                s += (", " if k > 0 else "") + self.render(ws.order[k].expr) + (" DESC" if ws.order[k].desc else "")
+                if ws.order[k].nulls == 1:
+                    s += " NULLS FIRST"
+                elif ws.order[k].nulls == 0:
+                    s += " NULLS LAST"
+        if ws.mode != FM_NONE:
+            s += (" " if s.byte_length() > 0 else "") + ("ROWS" if ws.mode == FM_ROWS else "RANGE") + " BETWEEN " + _bound_text(ws.s_kind, ws.s_n) + " AND " + _bound_text(ws.e_kind, ws.e_n)
+        return s
 
     def render_operand(self, e: Int) -> String:
         var k = self.exprs[e].kind
         if k == X_BIN or k == X_NOT or k == X_ISNULL or k == X_BETWEEN or k == X_IN or k == X_NEG or k == X_SUBIN or k == X_LIKE or k == X_DISTINCT or k == X_ISBOOL:
             return "(" + self.render(e) + ")"
         return self.render(e)
+
+
+def _bound_text(kind: Int, n: Int) -> String:
+    if kind == FB_UNB_PREC:
+        return "UNBOUNDED PRECEDING"
+    if kind == FB_UNB_FOL:
+        return "UNBOUNDED FOLLOWING"
+    if kind == FB_CUR:
+        return "CURRENT ROW"
+    return String(n) + (" PRECEDING" if kind == FB_PREC else " FOLLOWING")
 
 
 # ── the parser ───────────────────────────────────────────────────────────────────────────────────────
@@ -720,24 +790,7 @@ struct _Parser(Movable):
             if self.is_kw("ALL"):
                 raise self.unsupported(self.tok(), "`ORDER BY ALL`", "")
             while True:
-                var e = self.expr()
-                var desc = False
-                var nulls = -1
-                if self.is_kw("ASC"):
-                    _ = self.advance()
-                elif self.is_kw("DESC"):
-                    _ = self.advance()
-                    desc = True
-                if self.is_kw("NULLS"):
-                    _ = self.advance()
-                    if self.is_kw("FIRST"):
-                        nulls = 1
-                    elif self.is_kw("LAST"):
-                        nulls = 0
-                    else:
-                        raise self.expected("FIRST or LAST after NULLS")
-                    _ = self.advance()
-                self.st.order_by.append(OrderItem(e, desc, nulls))
+                self.st.order_by.append(self.order_item())
                 if self.is_sym(","):
                     _ = self.advance()
                     continue
@@ -752,6 +805,118 @@ struct _Parser(Movable):
                 self.st.offset = self.count_literal("OFFSET")
         if self.is_kw("FETCH"):
             raise self.unsupported(self.tok(), "`FETCH`", "use LIMIT")
+
+    def order_item(mut self) raises -> OrderItem:
+        """`expr [ASC | DESC] [NULLS FIRST | LAST]`."""
+        var e = self.expr()
+        var desc = False
+        var nulls = -1
+        if self.is_kw("ASC"):
+            _ = self.advance()
+        elif self.is_kw("DESC"):
+            _ = self.advance()
+            desc = True
+        if self.is_kw("NULLS"):
+            _ = self.advance()
+            if self.is_kw("FIRST"):
+                nulls = 1
+            elif self.is_kw("LAST"):
+                nulls = 0
+            else:
+                raise self.expected("FIRST or LAST after NULLS")
+            _ = self.advance()
+        return OrderItem(e, desc, nulls)
+
+    def frame_bound(mut self, mode: Int, start: Bool, mut kind: Int, mut n: Int) raises:
+        var t = self.tok()
+        if self.is_kw("UNBOUNDED"):
+            _ = self.advance()
+            if self.is_kw("PRECEDING"):
+                kind = FB_UNB_PREC
+            elif self.is_kw("FOLLOWING"):
+                kind = FB_UNB_FOL
+            else:
+                raise self.expected("PRECEDING or FOLLOWING after UNBOUNDED")
+            _ = self.advance()
+        elif self.is_kw("CURRENT"):
+            _ = self.advance()
+            _ = self.expect_kw("ROW")
+            kind = FB_CUR
+        elif t.kind == T_INT:
+            _ = self.advance()
+            if mode == FM_RANGE:
+                raise self.unsupported(t, "`RANGE` with an offset (" + t.text + ")", "use ROWS, or UNBOUNDED / CURRENT ROW bounds")
+            if t.text.byte_length() > 15:
+                raise _tok_error(t, "the frame offset " + t.text + " is too large")
+            n = Int(t.text)
+            if self.is_kw("PRECEDING"):
+                kind = FB_PREC
+            elif self.is_kw("FOLLOWING"):
+                kind = FB_FOL
+            else:
+                raise self.expected("PRECEDING or FOLLOWING after the offset")
+            _ = self.advance()
+        else:
+            raise self.unsupported(t, "a frame offset that is not a whole-number literal (" + self.describe(t) + ")", "write ROWS BETWEEN 2 PRECEDING AND CURRENT ROW")
+        if start and kind == FB_UNB_FOL:
+            raise _tok_error(t, "a window frame cannot start at UNBOUNDED FOLLOWING")
+        if (not start) and kind == FB_UNB_PREC:
+            raise _tok_error(t, "a window frame cannot end at UNBOUNDED PRECEDING")
+
+    def window_spec(mut self) raises -> Int:
+        """After OVER: `(PARTITION BY a, b ORDER BY c [ROWS | RANGE [BETWEEN x AND y | x]])` (F-168). Named windows, GROUPS frames and EXCLUDE raise by name."""
+        var t = self.tok()
+        if not self.is_sym("("):
+            if t.kind == T_IDENT:
+                raise self.unsupported(t, "`OVER " + t.text + "` (a named window)", "write the window out: OVER (PARTITION BY ... ORDER BY ...)")
+            raise self.expected("`(` after OVER")
+        _ = self.advance()
+        var w = WinSpec(t.line, t.col)
+        if self.is_kw("PARTITION"):
+            _ = self.advance()
+            _ = self.expect_kw("BY")
+            while True:
+                w.partition.append(self.expr())
+                if self.is_sym(","):
+                    _ = self.advance()
+                    continue
+                break
+        if self.is_kw("ORDER"):
+            _ = self.advance()
+            _ = self.expect_kw("BY")
+            while True:
+                w.order.append(self.order_item())
+                if self.is_sym(","):
+                    _ = self.advance()
+                    continue
+                break
+        if self.is_kw("GROUPS"):
+            raise self.unsupported(self.tok(), "a `GROUPS` frame", "use ROWS or RANGE")
+        if self.is_kw("ROWS") or self.is_kw("RANGE"):
+            w.mode = FM_ROWS if self.is_kw("ROWS") else FM_RANGE
+            _ = self.advance()
+            if self.is_kw("BETWEEN"):
+                _ = self.advance()
+                self.frame_bound(w.mode, True, w.s_kind, w.s_n)
+                _ = self.expect_kw("AND")
+                self.frame_bound(w.mode, False, w.e_kind, w.e_n)
+            else:
+                self.frame_bound(w.mode, True, w.s_kind, w.s_n)
+                w.e_kind = FB_CUR
+                if w.s_kind == FB_UNB_FOL:
+                    raise _tok_error(t, "a window frame cannot start at UNBOUNDED FOLLOWING")
+        if w.mode != FM_NONE:                                                   # (the combinations DuckDB's parser refuses, with its words)
+            if w.s_kind == FB_FOL and w.e_kind == FB_CUR:
+                raise _tok_error(t, "frame starting from following row cannot end with current row")
+            if w.s_kind == FB_FOL and w.e_kind == FB_PREC:
+                raise _tok_error(t, "frame starting from following row cannot have preceding rows")
+            if w.s_kind == FB_CUR and w.e_kind == FB_PREC:
+                raise _tok_error(t, "frame starting from current row cannot have preceding rows")
+        if self.is_kw("EXCLUDE"):
+            raise self.unsupported(self.tok(), "`EXCLUDE` in a window frame", "")
+        _ = self.expect_sym(")")
+        self.st.wins.append(w^)
+        return len(self.st.wins) - 1
 
     def reject_misspelled_clause(self) raises:
         """A word that is not a keyword but nearly is (`form`, `wher`), right before a name or a number, is a typo, not an alias."""
@@ -1366,8 +1531,12 @@ struct _Parser(Movable):
             if self.is_kw("ORDER"):
                 raise self.unsupported(self.tok(), "`ORDER BY` inside " + name.up + "(...)", "")
             _ = self.expect_sym(")")
+        if self.is_kw("IGNORE") or self.is_kw("RESPECT"):
+            raise self.unsupported(self.tok(), "`" + self.tok().up + " NULLS`", "")
         if self.is_kw("OVER"):
-            raise self.unsupported(self.tok(), "`OVER` (window functions)", "")
+            _ = self.advance()
+            var w = self.window_spec()
+            self.st.exprs[id].c = w
         if self.is_kw("FILTER"):
             raise self.unsupported(self.tok(), "`FILTER`", "")
         if self.is_kw("WITHIN"):

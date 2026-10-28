@@ -103,5 +103,10 @@ def main() raises:
     renders("explain analyze select a from t", "a FROM t")
     fails("select a from t; select b from t", "SQL error at line 1, column 18: expected the end of the statement, found `select`")
     fails("select f(a over (partition by b)) from t", "SQL error at line 1, column 12: expected `)`, found `over`")
-    fails("select sum(a) over (order by b) from t", "SQL error at line 1, column 15: `OVER` (window functions) is not supported yet")
+    renders("select sum(a) over (partition by g order by b desc nulls first rows between 2 preceding and current row) from t",       # (F-168)
+            "sum(a) OVER (PARTITION BY g ORDER BY b DESC NULLS FIRST ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM t")
+    renders("select row_number() over (), rank() over (order by a) from t", "row_number() OVER (), rank() OVER (ORDER BY a) FROM t")
+    fails("select sum(a) over (order by b range between 1 preceding and current row) from t",
+          "SQL error at line 1, column 46: `RANGE` with an offset (1) is not supported yet (use ROWS, or UNBOUNDED / CURRENT ROW bounds)")
+    fails("select sum(a) over (order by b groups between 1 preceding and current row) from t", "SQL error at line 1, column 32: a `GROUPS` frame is not supported yet (use ROWS or RANGE)")
     print("ok")
