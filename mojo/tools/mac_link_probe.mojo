@@ -6,7 +6,7 @@ from std.ffi import c_int
 from omxcore import (Table, SharedTable, Frame, INT, DECIMAL, TEXT, Query, col, sum, count, CPU, GPU, AUTO,
                      DeviceTable, gpu_available, read_csv, scan_csv, CsvOptions, write_parquet, read_parquet, scan_parquet, UNCOMPRESSED, ZSTD, SNAPPY,
                      count_distinct, median, percentile, top_k, stddev, var_pop, Catalog, PlannerOptions, GROUP_HASHED, sql, range_aggregate, read_block,
-                     compute_job, sql_job, read_csv_job, scan_csv_job, read_parquet_job, save_job, write_parquet_job, permutation_job, JOB_DONE)
+                     compute_job, sql_job, read_csv_job, scan_csv_job, read_parquet_job, save_job, write_parquet_job, permutation_job, JOB_DONE, sql_to_parquet, JobCtl)
 
 
 def run() raises:
@@ -43,6 +43,7 @@ def run() raises:
     sf.set(1, 2, Int64(9))
     sf.remove(0)
     print(Query(sf).group_by(col("k"), 3).agg(sum(col("v")), count()).compute(AUTO).counts[0], sf.permutation(1).__len__(), sf.get(1, 2))
+    print(sf.permutation(1, True, JobCtl(), 0, ".", 2).__len__())          # F-167: a permutation sorted in spilled runs
     sf.save("probe-edited.parquet", "{}", ZSTD)
     var c = read_csv("probe.csv")
     print(c.table.rows())
@@ -65,6 +66,13 @@ def run() raises:
         var r2 = sql(cat, "SELECT DISTINCT k FROM " + name)
         var r3 = sql(cat, "SELECT * FROM " + name + " LIMIT 5")
         print(r1.table.rows(), r2.table.rows(), r3.table.rows())
+        # F-167: a sort that spills runs to disk and merges them (into a table, and straight into a file)
+        var spillo = PlannerOptions()
+        spillo.sort_run_rows = 4
+        spillo.spill_dir = "."
+        var r4 = sql(cat, "SELECT k, v FROM " + name + " ORDER BY v DESC, k", spillo)
+        var r5 = sql_to_parquet(cat, "SELECT k, v FROM " + name + " ORDER BY k, v", "probe-sorted.parquet", spillo)
+        print(r4.table.rows(), r5.rows_written)
         # F-153: an inner join (fused, then materialized) of each source with the table, and the builder's join
         var j1 = sql(cat, "SELECT a.k, count(*), sum(b.v) FROM " + name + " a JOIN t b ON a.v = b.v GROUP BY a.k")
         var nofuse = PlannerOptions()

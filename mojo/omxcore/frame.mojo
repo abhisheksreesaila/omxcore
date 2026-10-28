@@ -28,6 +28,10 @@ from .expr import (Expr, Node, col, least, greatest, N_COL, N_LIT, N_LITF, N_DIV
                    N_LEAST, N_GREATEST, N_LT, N_LE, N_GT, N_GE, N_EQ, N_NE, N_AND, N_OR, N_NOT, N_BOOL2INT, N_SCALE_TO)
 from .csv import _parse_int, _parse_decimal, _parse_date, _parse_bool, _parse_float, F_OK, F_RANGE, F_NAN_BITS
 from .holistic import float_key
+from .sortspill import SpillSort, sort_budget_bytes
+from .bind import SortKey
+from .sqleval import ValCol
+from .sqlprog import DictAccess
 from .parquet import ParquetScan, ParquetWriter, write_parquet, ZSTD, DEFAULT_ROW_GROUP, STREAM_WRITE_BUDGET
 
 comptime SET = 0
@@ -834,11 +838,16 @@ struct Frame(Movable):
 
     # ── sort ────────────────────────────────────────────────────────────────────────────────────────
 
-    def permutation(self, c: Int, descending: Bool = False, job: JobCtl = JobCtl()) raises -> List[Int]:
+    def permutation(self, c: Int, descending: Bool = False, job: JobCtl = JobCtl(), budget: Int = 0, spill_dir: String = "", run_rows: Int = 0) raises -> List[Int]:
         """The live rows in the column's order, stable (ties keep row order); text alphabetical (ignoring ASCII case, bytes break ties; merges
         applied), nulls last either way. The data never moves. A radix sort over Int64 keys; a column with no edits
         is read straight from the shared values. `job` (F-175, `permutation_job`): a cancel is seen every 1M rows of the key pass and of each
-        radix pass; progress counts the key pass's rows, then the sort's element steps."""
+        radix pass; progress counts the key pass's rows, then the sort's element steps.
+
+        F-167: `budget` (bytes, 0: SORT_BUDGET_DEFAULT) bounds the sort's own memory, about 56 bytes a live row (the keys, the row numbers and the radix
+        buffers). A frame with more rows than that allows is sorted in runs of (key, row) pairs that fit: each is sorted, written to a temporary file
+        in `spill_dir` ("": TMPDIR, else a cache folder, else /tmp) and freed, then the runs are merged into the list of row numbers (8 bytes a row,
+        the answer). The order is exactly the in-memory one. `run_rows` > 0 is a test's override: rows per run, always spilling."""
         job.stage(STAGE_SORT)
         job.add_total(self.rows())
         var n = self.nbase
@@ -850,8 +859,13 @@ struct Frame(Movable):
         var keys = List[Int64]()
         var rows = List[Int]()
         var nulls = List[Int]()
-        keys.reserve(self.rows())
-        rows.reserve(self.rows())
+        var limit = sort_budget_bytes(budget)
+        var spilling = run_rows > 0 or self.rows() * PERM_BYTES_PER_ROW > limit
+        var cap = run_rows if run_rows > 0 else max(1024, limit // PERM_RUN_BYTES_PER_ROW)
+        var spill = Optional[SpillSort]()
+        if not spilling:
+            keys.reserve(self.rows())
+            rows.reserve(self.rows())
         if c >= self.stored():
             var prog = self.program(c)
             for row in range(self.rows()):
@@ -865,6 +879,8 @@ struct Frame(Movable):
                     else:
                         keys.append(float_key(v[0]) if isfloat else v[0])
                         rows.append(row)
+                        if spilling and len(keys) >= cap:
+                            _perm_run(spill, keys, rows, descending, spill_dir, job)
         else:
             var edited = False
             for key in self.cells.keys():
@@ -920,6 +936,22 @@ struct Frame(Movable):
                         raw = self.alias(c, raw)
                     keys.append(rank[Int(raw)] if text else float_key(raw) if isfloat else raw)
                     rows.append(row)
+                    if spilling and len(keys) >= cap:
+                        _perm_run(spill, keys, rows, descending, spill_dir, job)
+        if spill:                                             # F-167: the last pairs are a run too; the runs merge into the answer
+            _perm_run(spill, keys, rows, descending, spill_dir, job)
+            var dicts = DictAccess(Table.empty().share(), Optional[ParquetScan](), List[List[String]]())
+            spill.value().begin_merge(dicts, limit, 0, -1)
+            var merged = List[Int]()
+            merged.reserve(self.rows())
+            while True:
+                var batch = spill.value().merge_batch(1 << 16, dicts)
+                if len(batch[1].v) == 0:
+                    break
+                for v in batch[1].v:
+                    merged.append(Int(v))
+            merged.extend(nulls^)
+            return merged^
         var out = _radix_order_job(keys, rows, descending, job)
         out.extend(nulls^)
         return out^
@@ -1176,6 +1208,37 @@ def _radix_order(keys: List[Int64], rows: List[Int], descending: Bool) -> List[I
         return _radix_order_job(keys, rows, descending, JobCtl())
     except:
         return List[Int]()
+
+
+comptime PERM_BYTES_PER_ROW = 56        # F-167: a permutation in memory: keys, row numbers, and the radix passes' two buffers and row orders (measured)
+comptime PERM_RUN_BYTES_PER_ROW = 160   # a spilled run: the pairs, their columns, the sort of them and the buffer being written
+
+
+def _perm_run(mut spill: Optional[SpillSort], mut keys: List[Int64], mut rows: List[Int], descending: Bool, dir: String, job: JobCtl) raises:
+    """F-167: the (key, row) pairs so far become a sorted run on disk; the lists are emptied. The keys are already Int64 in sort order (text
+    ranks, float keys), the rows ascend, so ties keep the row order: the merge's last key is the row number."""
+    var n = len(keys)
+    if n == 0:
+        return
+    var kc = ValCol(INT.value, 0, n)
+    var rc = ValCol(INT.value, 0, n)
+    var seq = List[Int64](length=n, fill=0)
+    for i in range(n):
+        kc.v[i] = keys[i]
+        rc.v[i] = Int64(rows[i])
+        seq[i] = Int64(rows[i])
+    keys = List[Int64]()
+    rows = List[Int]()
+    var cols = List[ValCol]()
+    cols.append(kc^)
+    cols.append(rc^)
+    if not spill:
+        var order = List[SortKey]()
+        order.append(SortKey(0, descending, False))
+        var key_col: List[Int] = [0]
+        spill = SpillSort(dir, order, key_col, cols, job)
+    var dicts = DictAccess(Table.empty().share(), Optional[ParquetScan](), List[List[String]]())
+    spill.value().add_run(cols, seq, 0, dicts)
 
 
 comptime JOB_SORT_STEP = 1 << 20      # F-175: elements a sort handles between two cancel checks (and one progress add)

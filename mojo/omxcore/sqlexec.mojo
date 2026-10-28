@@ -38,6 +38,9 @@ from .kargs import KernelRun
 from .jfront import FusedJoin, StageData, front_spec, jf_front
 from std.memory import ArcPointer
 from .rows import RowStage, prepare_rows, execute_rows, _Item
+from .sink import ResultSink                  # F-167
+from .parquet import write_parquet, ZSTD, DEFAULT_ROW_GROUP
+from std.memory.alloc import unsafe_alloc
 from .sqlprog import lower_rows
 from .planner import (plan_sinks, Planner, RulePlanner, PlannerOptions, PhysicalPlan, Stats, ColStat, G_NONE, G_DENSE, G_HASHED, commas, JoinStats, JoinPlan,
                       BUILD_AUTO, BUILD_LEFT, BUILD_RIGHT)
@@ -56,9 +59,11 @@ struct SqlResult(Movable):
     var fallback_reason: String
     var notes: List[String]          # what the planner decided and what ran, one line each: tests assert them
     var actuals: List[String]        # F-155: what each operator really did (rows, milliseconds), one line each: EXPLAIN ANALYZE prints them
+    var rows_written: Int            # F-167: `sql_to_parquet`: the rows written to the file (-1 for a plain `sql`)
 
     def __init__(out self):
         self.actuals = List[String]()
+        self.rows_written = -1
         self.table = Table.empty()
         self.explain = String()
         self.ms = 0.0
@@ -1667,7 +1672,7 @@ def _run_sql_once[P: Planner](mut catalog: Catalog, q0: BoundQuery, planner: P, 
         return res^
     var notes = res.notes.copy()
     if q.rows:
-        res.table = execute_rows(src, q, plan, opts, dicts, notes, inp, stage^, trust, fj)
+        res.table = execute_rows(src, q, plan, opts, dicts, notes, inp, stage^, trust, fj, True)
     else:
         res.table = _execute(src, q, plan, opts, dicts, notes, inp, sp^, trust, fj)
     res.notes = notes^
@@ -1823,3 +1828,35 @@ def sql_with[P: Planner](mut catalog: Catalog, text: String, planner: P, options
 def sql(mut catalog: Catalog, text: String, options: PlannerOptions = PlannerOptions()) raises -> SqlResult:
     """Runs one SELECT (or EXPLAIN SELECT) over the catalog's sources with the rule-based planner. The result owns its table."""
     return sql_with(catalog, text, RulePlanner(), options)
+
+
+def sql_to_parquet_with[P: Planner](mut catalog: Catalog, text: String, path: String, planner: P, options: PlannerOptions = PlannerOptions(),
+                                    metadata: String = "", compression: Int = ZSTD, row_group_rows: Int = DEFAULT_ROW_GROUP) raises -> SqlResult:
+    """F-167: `sql_to_parquet` with the planner of your choice."""
+    if row_group_rows < 8 or row_group_rows % 8 != 0:
+        raise Error("row_group_rows must be a positive multiple of 8, got " + String(row_group_rows))
+    var counter = unsafe_alloc[Int64](1)
+    counter[0] = -1
+    var opts = options.copy()
+    opts.sink = ResultSink(path, metadata, compression, row_group_rows, Int(counter))
+    var r = SqlResult()
+    try:
+        r = sql_with(catalog, text, planner, opts)
+        if counter[0] < 0:                                   # not streamed (the rows fitted the sort budget, or the query is not a sorting row query)
+            write_parquet(path, r.table, metadata, compression, row_group_rows, options.job)
+            counter[0] = Int64(r.table.rows())
+    except e:
+        counter.free()
+        raise e^
+    r.rows_written = Int(counter[0])
+    counter.free()
+    return r^
+
+
+def sql_to_parquet(mut catalog: Catalog, text: String, path: String, options: PlannerOptions = PlannerOptions(), metadata: String = "",
+                   compression: Int = ZSTD, row_group_rows: Int = DEFAULT_ROW_GROUP) raises -> SqlResult:
+    """Runs one SELECT and writes its rows to a Parquet file, atomically (a temporary file renamed into place; an error or a cancel leaves
+    `path` as it was). `ORDER BY` over rows bigger than the sort budget (`PlannerOptions.sort_budget`) is sorted in runs on disk and the merged
+    rows go straight into row groups of `row_group_rows`: a file bigger than memory sorted into a new file. The result's `table` is then
+    the empty table of the result's columns; `rows_written` says how many rows the file has."""
+    return sql_to_parquet_with(catalog, text, path, RulePlanner(), options, metadata, compression, row_group_rows)

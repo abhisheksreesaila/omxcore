@@ -10,14 +10,14 @@ from std.sys import argv, exit
 from std.time import perf_counter_ns
 from std.os.path import dirname, isdir
 from omxcore import (Catalog, PlannerOptions, GROUP_AUTO, GROUP_DENSE, GROUP_HASHED, BUILD_LEFT, BUILD_RIGHT, sql, SqlResult, Table, SharedTable, read_csv, CsvOptions,
-                     read_parquet, scan_parquet, write_parquet, ZSTD, parse_sql, TEXT, INT, DECIMAL, DATE, BOOL, FLOAT)
+                     read_parquet, scan_parquet, write_parquet, sql_to_parquet, ZSTD, parse_sql, TEXT, INT, DECIMAL, DATE, BOOL, FLOAT)
 from omxcore.output import (json_string, columns_json, rows_json, rows_json_one, row_jsonl, csv_header, csv_row, cell_json, kind_text)
-from omxcore.parquet import physical_memory
+from omxcore.parquet import physical_memory, DEFAULT_ROW_GROUP
 
 comptime USAGE = ("usage: mx sql \"<SQL>\" [-t name=path ...] [-f query.sql] [--format json|jsonl|csv|parquet] [--out file] [--max-rows N] [--device cpu|gpu|auto]\n"
                   "       mx explain [--analyze] \"<SQL>\" [-t name=path ...] [--format text|json]\n"
                   "       mx schema <file> [--rows N]\n"
-                  "advanced: --group auto|dense|hashed  --dense-limit N  --threads N  --stream auto|always|never (Parquet: stream row groups; auto streams a file over a quarter of memory)  --memory BYTES (the memory auto compares with)  --join auto|materialize (a join with unique build keys is fused into the pipeline; materialize writes its rows first)  --order written|P,P,P (the order to join three or more tables in: the written one, or the tables' positions in FROM, 0 first; default: the planner's)  --build left|right (the side of each hash join the table is built on; default: the smaller)  --join-budget BYTES (the bytes of joined values a materialized join may take)")
+                  "advanced: --group auto|dense|hashed  --dense-limit N  --threads N  --stream auto|always|never (Parquet: stream row groups; auto streams a file over a quarter of memory)  --memory BYTES (the memory auto compares with)  --join auto|materialize (a join with unique build keys is fused into the pipeline; materialize writes its rows first)  --order written|P,P,P (the order to join three or more tables in: the written one, or the tables' positions in FROM, 0 first; default: the planner's)  --build left|right (the side of each hash join the table is built on; default: the smaller)  --join-budget BYTES (the bytes of joined values a materialized join may take)  --sort-budget BYTES (the bytes of rows a sort holds in memory: past it ORDER BY sorts runs on disk and merges them; with --format parquet --out the merged rows go straight into the file)  --spill-dir DIR (where the runs go; default TMPDIR or /tmp)  --row-group-rows N (rows of each Parquet row group written)")
 
 
 # ── errors ───────────────────────────────────────────────────────────────────────────────────────────
@@ -83,6 +83,10 @@ struct Args(Movable):
     var order: String
     var build: String
     var join_budget: Int
+    var sort_budget: Int
+    var sort_run_rows: Int
+    var spill_dir: String
+    var row_group_rows: Int
     var analyze: Bool
     var rows: Int
     var query_file: String
@@ -103,6 +107,10 @@ struct Args(Movable):
         self.order = String()
         self.build = "auto"
         self.join_budget = 0
+        self.sort_budget = 0
+        self.sort_run_rows = 0
+        self.spill_dir = String()
+        self.row_group_rows = 0
         self.analyze = False
         self.rows = 5
         self.query_file = String()
@@ -127,7 +135,7 @@ def parse_args(first: Int) raises -> Args:
     while i < len(all):
         var arg = String(all[i])
         var takes = arg == "-t" or arg == "--table" or arg == "--format" or arg == "--out" or arg == "--max-rows" or arg == "--device" or \
-                    arg == "--group" or arg == "--dense-limit" or arg == "--threads" or arg == "--stream" or arg == "--join" or arg == "--order" or arg == "--build" or arg == "--join-budget" or arg == "--memory" or arg == "--rows" or arg == "-f" or arg == "--file"
+                    arg == "--group" or arg == "--dense-limit" or arg == "--threads" or arg == "--stream" or arg == "--join" or arg == "--order" or arg == "--build" or arg == "--join-budget" or arg == "--sort-budget" or arg == "--sort-run-rows" or arg == "--spill-dir" or arg == "--row-group-rows" or arg == "--memory" or arg == "--rows" or arg == "-f" or arg == "--file"
         if takes:
             if i + 1 >= len(all):
                 _ = usage_error(arg + " needs a value")
@@ -163,6 +171,14 @@ def parse_args(first: Int) raises -> Args:
                 if v != "auto" and v != "left" and v != "right":
                     _ = usage_error("--build is auto, left or right, found `" + v + "`")
                 a.build = v
+            elif arg == "--sort-budget":
+                a.sort_budget = parse_int("--sort-budget", v)
+            elif arg == "--sort-run-rows":
+                a.sort_run_rows = parse_int("--sort-run-rows", v)
+            elif arg == "--spill-dir":
+                a.spill_dir = v
+            elif arg == "--row-group-rows":
+                a.row_group_rows = parse_int("--row-group-rows", v)
             elif arg == "--join-budget":
                 a.join_budget = parse_int("--join-budget", v)
             elif arg == "--stream":
@@ -258,6 +274,9 @@ def options_of(args: Args) raises -> PlannerOptions:
     elif args.build == "right":
         o.build_side = BUILD_RIGHT
     o.join_budget = args.join_budget
+    o.sort_budget = args.sort_budget
+    o.sort_run_rows = args.sort_run_rows
+    o.spill_dir = args.spill_dir
     return o^
 
 
@@ -350,20 +369,21 @@ def cmd_sql(args: Args) raises:
     var r = SqlResult()
     try:
         open_tables(cat, args, text, notes)
-        r = sql(cat, text, options_of(args))
+        if fmt == "parquet":                    # F-167: an ORDER BY bigger than the sort budget is merged straight into the file
+            check_out_directory(args.out)
+            r = sql_to_parquet(cat, text, args.out, options_of(args), "", ZSTD, args.row_group_rows if args.row_group_rows > 0 else DEFAULT_ROW_GROUP)
+        else:
+            r = sql(cat, text, options_of(args))
     except e:
         _ = query_error(String(e))
     for n in r.notes:
         notes.append(n)
-    var total = r.table.rows()
+    var total = r.rows_written if r.rows_written >= 0 else r.table.rows()
     var to_file = args.out.byte_length() > 0
     var shown = total if (to_file or args.max_rows == 0) else min(total, args.max_rows)
     if to_file:
         try:
-            if fmt == "parquet":
-                check_out_directory(args.out)
-                write_parquet(args.out, r.table, "", ZSTD)
-            else:
+            if fmt != "parquet":                    # (a Parquet file was written by sql_to_parquet above)
                 write_rows(args.out, r.table, fmt)
         except e:
             var why = String(e)

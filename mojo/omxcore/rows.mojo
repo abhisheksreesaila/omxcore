@@ -19,7 +19,9 @@ from std.memory import ArcPointer
 from std.atomic import Atomic
 from .table import Table, SharedTable, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
 from .frame import text_ranks, _radix_order
-from .job import JobCtl, STAGE_AGGREGATE, STAGE_FINISH      # F-175
+from .job import JobCtl, STAGE_AGGREGATE, STAGE_FINISH, STAGE_SORT, STAGE_WRITE      # F-175
+from .sortspill import SpillSort, run_row_cap, sort_budget_bytes      # F-167
+from .parquet import ParquetWriter, WRITE_BUDGET
 from .query import Program, MAGIC, SRC_WORDS, CTL_REG, OVERFLOW_MESSAGE, overflow_message
 from .kernels._fpenv import core_count
 from .kernels.pipeline_cpu import IP, LP, FP, BP, VEC, E_OVERFLOW, pipeline_keyed
@@ -536,8 +538,84 @@ def _run_topk(t: SharedTable, sp: SqlProgram, mask_addr: Int, K: Int, key_slot: 
     return out^
 
 
+def _spill_run(mut spill: Optional[SpillSort], mut cols: List[ValCol], mut ords: List[Int64], rows_in: Int, q: BoundQuery, items: List[_Item],
+               opts: PlannerOptions, dicts: DictAccess) raises:
+    """F-167: the rows collected so far become a sorted run on disk (the file is made with the first); the columns are emptied."""
+    if len(cols[0].v) == 0:
+        return
+    if not spill:
+        var key_col = List[Int]()
+        for o in q.rorder:
+            key_col.append(_item_of(items, q, o.expr))
+        spill = SpillSort(opts.spill_dir, q.rorder, key_col, cols, opts.job)
+    opts.job.stage(STAGE_SORT)
+    spill.value().add_run(cols, ords, rows_in - len(cols[0].v), dicts)
+    ords = List[Int64]()
+
+
+def _finish_spilled(mut sp: SpillSort, q: BoundQuery, items: List[_Item], opts: PlannerOptions, dicts: DictAccess, mut notes: List[String],
+                    budget: Int, stream: Bool, ms_run: Float64) raises -> Table:
+    """F-167: merges the runs. The rows come out in the order of a sort in memory, cut by OFFSET and LIMIT: as the result table, or (a sink
+    given and `stream`) as the row groups of a Parquet file, so the result is never held."""
+    var t_ord = perf_counter_ns()
+    var runs = sp.run_count()
+    sp.begin_merge(dicts, budget, q.offset, q.limit)
+    notes.append("order: sorted " + commas(sp.total_rows) + " rows by " + String(len(q.rorder)) + (" key" if len(q.rorder) == 1 else " keys") + " in " +
+                 String(runs) + (" run" if runs == 1 else " runs") + " spilled to disk and merged (sort budget " + commas(budget) + " bytes, blocks of " +
+                 commas(sp.block_rows) + " rows)")
+    var pick = List[Int]()
+    for e in q.routs:
+        pick.append(_item_of(items, q, e))
+    if stream and opts.sink:
+        var sink = opts.sink.value().copy()
+        var empty = List[ValCol]()
+        var optional = List[Bool]()
+        for it in pick:
+            var vc = ValCol(sp.kind[it], sp.scale[it], 0)
+            vc.src = sp.src[it]
+            empty.append(vc^)
+            optional.append(sp.column_has_nulls(it))
+        var shape = _to_table(q, empty, dicts)
+        var w = ParquetWriter(sink.path, shape, optional, sink.compression)
+        w.budget = min(WRITE_BUDGET, max(4 << 20, budget // 4))
+        var total = 0
+        # a row group is built from a batch of merged rows (the batch, its output columns, the table, the pages): about 6 copies of 9 bytes a value,
+        # so the budget caps the rows of a group; the file's row groups are `row_group_rows` rows when the budget allows
+        var group = min(sink.row_group_rows, max(1024, (budget // (54 * max(len(pick), 1))) // 8 * 8))
+        try:
+            opts.job.stage(STAGE_WRITE)
+            while True:
+                opts.job.check()
+                var batch = sp.merge_batch(group, dicts)
+                var n = len(batch[0].v)
+                if n == 0:
+                    break
+                var outs = List[ValCol]()
+                for it in pick:
+                    outs.append(batch[it].copy())
+                w.write_group(_to_table(q, outs, dicts))
+                total += n
+            if total == 0:
+                w.write_group(shape)
+            opts.job.commit()
+            w.finish(sink.metadata)
+        except e:
+            w.abort()
+            raise e^
+        UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=sink.rows_at)[0] = Int64(total)
+        notes.append("output: " + commas(total) + " rows merged straight into " + sink.path + " (the result is not held in memory)")
+        return shape^
+    var merged = sp.merge_batch(1 << 62, dicts)
+    var outs = List[ValCol]()
+    for it in pick:
+        outs.append(merged[it].copy())
+    var table = _to_table(q, outs, dicts)
+    notes.append("time: kernel " + _ms(ms_run) + " ms, order and output " + _ms(Float64(perf_counter_ns() - t_ord) / 1e6) + " ms")
+    return table^
+
+
 def run_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOptions, dicts: DictAccess, mut notes: List[String],
-             inp: _Inputs, sp: SqlProgram, items: List[_Item], trust: Bool, fj: Optional[ArcPointer[FusedJoin]]) raises -> Table:
+             inp: _Inputs, sp: SqlProgram, items: List[_Item], trust: Bool, fj: Optional[ArcPointer[FusedJoin]], stream: Bool = False) raises -> Table:
     """Reads the chunks, collects the selected rows (ordered, cut) and makes the result table."""
     var used = inp.used.copy()
     var ch = _open_chunks(src, used)
@@ -561,6 +639,11 @@ def run_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
     var has_delta = ch.has_delta
     ch.delta_first = plan.early_stop
     var ords = List[Int64]()                                     # the frame row number of each collected row (an edited frame only)
+    # F-167: past the sort budget the rows collected so far are sorted as a run and written to disk (sortspill.mojo)
+    var sorting = len(q.rorder) > 0
+    var budget = sort_budget_bytes(opts.sort_budget)
+    var cap = run_row_cap(budget, len(items), len(q.rorder), opts.sort_run_rows) if sorting else 0
+    var spill = Optional[SpillSort]()
     opts.job.stage(STAGE_AGGREGATE)
     opts.job.add_total(chunk_rows_total(src, ch))
     for kc in range(ch.n()):
@@ -581,6 +664,8 @@ def run_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
             step = max(VEC * 16, ((need * 4) // VEC + 1) * VEC)
         elif opts.job.active():                                 # a background job: slices, so a cancel is seen between them
             step = max(VEC * 16, JOB_SLICE_ROWS)
+        if sorting:
+            step = min(step, max(VEC, (cap // VEC) * VEC))      # a slice never holds more rows than a run may
         var at = 0
         while at < n_rows:
             opts.job.check()
@@ -588,6 +673,8 @@ def run_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
                 stop_early = True
                 break
             var end = min(n_rows, at + step)
+            if sorting and len(cols[0].v) > 0 and len(cols[0].v) + (end - at) > cap:
+                _spill_run(spill, cols, ords, rows_in, q, items, opts, dicts)
             var rc = _run_rows(chunk, sp, ch.mask_addr, at, end, opts.threads, fj)
             if has_delta:
                 var is_d = ch.is_delta(i)
@@ -619,6 +706,9 @@ def run_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
     else:
         notes.append("ran: table " + src.name + ": " + String(chunks_read) + " chunk of " + commas(src.table.rows()) + " rows")
     notes.append("rows: " + commas(rows_in) + " rows selected" + (" (stopped early: the LIMIT was met)" if stop_early else ""))
+    if sorting and rows_in > 0 and (spill or opts.sort_run_rows > 0):
+        _spill_run(spill, cols, ords, rows_in, q, items, opts, dicts)         # the last rows are a run too, then the runs merge
+        return _finish_spilled(spill.value(), q, items, opts, dicts, notes, budget, stream, ms_run)
     # a frame's rows are in the frame's order: the changed rows go back to their places among the shared ones
     if has_delta:
         var by_row = _merge_by_row(ords)
@@ -882,7 +972,7 @@ def prepare_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, dicts: DictA
 
 
 def execute_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOptions, dicts: DictAccess, mut notes: List[String],
-                 inp: _Inputs, var stage: RowStage, trust: Bool, fj: Optional[ArcPointer[FusedJoin]] = None) raises -> Table:
+                 inp: _Inputs, var stage: RowStage, trust: Bool, fj: Optional[ArcPointer[FusedJoin]] = None, stream: Bool = False) raises -> Table:
     if plan.top_k > 0:
         return run_topk_rows(src, q, plan, opts, dicts, notes, inp, stage.sp, stage.items, trust, fj)
-    return run_rows(src, q, plan, opts, dicts, notes, inp, stage.sp, stage.items, trust, fj)
+    return run_rows(src, q, plan, opts, dicts, notes, inp, stage.sp, stage.items, trust, fj, stream)
