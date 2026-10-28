@@ -84,6 +84,7 @@ The gate asks each device to beat DuckDB, but the SQL path runs everything on th
 - [ ] the aggregate stages the GPU kernel can run (the builder's GPU programs: integer / DECIMAL filters and aggregates, AUTO's size rule, F-189's pieces) run on the GPU from SQL; everything else stays on the CPU with a `fallback_reason`; results equal the CPU; NVIDIA PTX unchanged
 
 ## F-192 DECIMAL sums past int64 as DuckDB (128-bit totals; TPC-H Q11) [todo] (found by F-159, 2026-10-28)
+- [ ] also a window `sum(d) OVER (...)` past int64 (raises "a window sum passed the int64 range"; DuckDB uses HUGEINT), found in the F-190 review
 - [ ] `sum(decimal * decimal)` (Q11's `sum(ps_supplycost * ps_availqty)`) and other DECIMAL sums whose total passes int64 give DuckDB's answer (DuckDB sums DECIMAL into HUGEINT) instead of raising; the result type follows DuckDB's DECIMAL width rules; exact everywhere; GPU keeps declining or matches (PTX unchanged)
 
 ## F-193 A typed NULL constant keeps its own kind beside other constants (wrong column kind) [todo] (found by F-159, 2026-10-28)
