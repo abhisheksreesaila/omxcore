@@ -336,20 +336,26 @@ struct _SortCols(Movable):
         self.desc = List[Bool]()
         self.nulls_first = List[Bool]()
 
-    def before(self, a: Int, b: Int) -> Bool:
-        """Row a sorts before row b (ties: the lower row number, as the stable radix order)."""
+    def cmp(self, a: Int, o: Self, b: Int) -> Int:
+        """-1 when row a of this set sorts before row b of `o` (a set with the same keys: the merge of spilled runs, F-167), 1 when after,
+        0 when every key ties. The one definition of the order after `_order_rows`."""
         for k in range(len(self.keys)):
             var an = len(self.nulls[k]) > 0 and self.nulls[k][a] != 0
-            var bn = len(self.nulls[k]) > 0 and self.nulls[k][b] != 0
+            var bn = len(o.nulls[k]) > 0 and o.nulls[k][b] != 0
             if an or bn:
                 if an and bn:
                     continue
-                return an == self.nulls_first[k]
+                return -1 if an == self.nulls_first[k] else 1
             var x = self.keys[k][a]
-            var y = self.keys[k][b]
+            var y = o.keys[k][b]
             if x != y:
-                return (x > y) if self.desc[k] else (x < y)
-        return a < b
+                return -1 if ((x > y) if self.desc[k] else (x < y)) else 1
+        return 0
+
+    def before(self, a: Int, b: Int) -> Bool:
+        """Row a sorts before row b (ties: the lower row number, as the stable radix order)."""
+        var c = self.cmp(a, self, b)
+        return c < 0 or (c == 0 and a < b)
 
 
 def _top_rows(cols: List[ValCol], order: List[SortKey], dicts: DictAccess, n: Int, want: Int) raises -> List[Int]:

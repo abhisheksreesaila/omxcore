@@ -13,6 +13,7 @@ What it decides today: the group strategy.
 - hashed: key words go through per-worker hash tables and a partitioned merge (`hashagg_cpu`): any keys, any range.
 """
 from .job import JobCtl                                   # F-175
+from .sink import ResultSink                              # F-167
 from .table import TEXT, BOOL, FLOAT
 from .plan import LogicalPlan, P_SORT, P_LIMIT
 from .bind import (BoundQuery, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, B_LIT, B_NULL, B_ADD, B_SUB, B_MUL, B_IDIV, B_IMOD,
@@ -51,8 +52,17 @@ struct PlannerOptions(Copyable, Movable):
     var build_side: Int                      # BUILD_AUTO, BUILD_LEFT (the rows joined so far / the first table) or BUILD_RIGHT (the table joined in / the second)
     var join_budget: Int                     # the bytes of joined values a materialized join may take (0: the engine's default)
     var stay_within: Float64                 # the written order is kept when the best order's estimated cost is not this much cheaper
+    # F-167: a sort bigger than memory spills sorted runs to disk and merges them
+    var sort_budget: Int                     # the bytes of rows a sort holds in memory at once (0: SORT_BUDGET_DEFAULT); past it the runs go to disk
+    var sort_run_rows: Int                   # a test's override: rows per sorted run (> 0 forces the spilling sort, even when every row fits one run)
+    var spill_dir: String                    # the folder the runs are written in ("": the TMPDIR environment variable, else /tmp)
+    var sink: Optional[ResultSink]         # `sql_to_parquet`: where a spilled sort's merged rows go instead of a result table
 
     def __init__(out self):
+        self.sort_budget = 0
+        self.sort_run_rows = 0
+        self.spill_dir = String()
+        self.sink = None
         self.job = JobCtl()
         self.written_order = False
         self.join_order = List[Int]()

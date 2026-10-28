@@ -18,7 +18,7 @@ from .bind import Catalog, SqlSource, BoundQuery, bind_sql, SRC_TABLE, SRC_FRAME
 from .planner import (Planner, RulePlanner, PlannerOptions, PhysicalPlan, KeyLayout, Stats, ColStat, GROUP_AUTO, GROUP_DENSE, GROUP_HASHED, BUILD_AUTO, BUILD_LEFT, BUILD_RIGHT, JoinStats, JoinPlan, JoinStep, rule_join_order,
                       G_NONE, G_DENSE, G_HASHED)
 from .plan import LogicalPlan, PlanNode, build_plan
-from .sqlexec import sql, sql_with, SqlResult
+from .sqlexec import sql, sql_with, sql_to_parquet, sql_to_parquet_with, SqlResult
 from .blocks import range_aggregate, read_block, RangeResult, RangeAgg, MORSEL
 # F-175: background jobs (jobs.mojo holds the start functions)
 from .job import (Job, JobCtl, JobProgress, JobBody, JobDone, NoCallback, start_job, start_job_then, JOB_RUNNING, JOB_DONE, JOB_FAILED, JOB_CANCELLED, CANCELLED_MESSAGE,
