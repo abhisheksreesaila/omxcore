@@ -3,7 +3,7 @@
 # piece's device allocation fail as an out-of-memory would. The oracle is the CPU answer of the same query (every slot, count
 # and presence flag equal, not close). Skips cleanly with no GPU. Every test that sets a variable puts it back (`Env`
 # restores it when it goes out of scope, a failed test included). Modest allocations: GPU 0 is shared.
-from omxcore import (Table, SharedTable, Frame, Query, QueryResult, col, sum, count, min_of, max_of, INT, write_parquet,
+from omxcore import (Table, SharedTable, Frame, Query, QueryResult, col, sum, count, mean, min_of, max_of, INT, DECIMAL, TEXT, write_parquet,
                      scan_parquet, scan_csv, CsvOptions, ZSTD, CPU, GPU, AUTO, DeviceTable, gpu_available)
 from omxcore.gpu import gpu_budget_override, parse_size, GPU_BUDGET_ENV, GPU_FAIL_ENV
 from std.os import getenv, setenv, unsetenv
@@ -365,11 +365,114 @@ def test_a_partial_total_past_int64_is_settled_by_the_whole() raises:
     _ = b^
 
 
+def test_a_bad_budget_is_refused() raises:
+    var bad: List[String] = ["-5M", "inf", "nan", "9999999999999G", "0", "1e3", "M", "", "0:512M,1:junk", "0:512M,x:1M", "2M,junk"]
+    var e = Env(GPU_BUDGET_ENV, "")
+    for text in bad:
+        if text == "":
+            continue
+        e.set(text)
+        var msg = String("")
+        try:
+            _ = gpu_budget_override(0)
+        except err:
+            msg = String(err)
+        expect("MXFRAME_GPU_MEM_BUDGET" in msg and "not" in msg, "`" + text + "` is refused: `" + msg + "`")
+    _ = e^
+
+
+def test_a_nullable_column_and_a_smaller_group_after_a_bigger_one() raises:
+    """The device buffers only grow: a smaller group after a bigger one must copy its own n values and bitmap bytes, not the
+    buffer's length (a copy moves the whole buffer it is given)."""
+    var b = budget("64M")
+    for n in [2037, 1100, 2100]:
+        var t = make_table(n, UInt64(n))
+        write_parquet("f189_odd.parquet", t, "", ZSTD, 1000)           # groups of 1000, then what is left
+        var scan = scan_parquet("f189_odd.parquet")
+        var g = grouped(Query(scan)).compute(GPU)
+        expect(g.device == GPU and g.pieces == (n + 999) // 1000 and g.gpu_pieces == g.pieces, "rows " + String(n) + ": " + g.fallback_reason)
+        same(g, grouped(Query(t)).compute(CPU), "groups of 1000 then " + String(n % 1000))
+    _ = b^
+
+
+def make_wide(n: Int, seed: UInt64) raises -> SharedTable:
+    """region TEXT (5 words), carrier INT 0..3 (some null), revenue DECIMAL(2) (some null, some past int32)."""
+    var t = Table.empty()
+    var g = t.add_column("region", TEXT)
+    var c = t.add_column("carrier", INT)
+    var r = t.add_column("revenue", DECIMAL, scale=2)
+    var words: List[String] = ["West", "East", "North", "South", "Central"]
+    for w in words:
+        _ = t.add_word(g, w)
+    var rng = Rng(seed)
+    for i in range(n):
+        t.append(g, Int64(rng.int(0, 4)))
+        if i % 17 == 4:
+            t.append_null(c)
+        else:
+            t.append(c, Int64(rng.int(0, 3)))
+        if i % 11 == 2:
+            t.append_null(r)
+        else:
+            t.append(r, Int64(rng.int(-5_000_000_000, 5_000_000_000)))
+    return t^.share()
+
+
+def wide(var q: Query) raises -> Query:
+    return q^.group_by(col("region"), groups=5).agg(sum(col("revenue")), mean(col("revenue")), count(col("revenue")),
+                                                    min_of(col("region")), max_of(col("region")), max_of(col("carrier")))
+
+
+def test_decimal_and_text_columns_in_pieces() raises:
+    var b = budget("1M")
+    var t = make_wide(200_000, 11)
+    var dt = DeviceTable(t)
+    expect(not dt.is_resident(), "not resident")
+    var g = wide(Query(t).on_device(dt)).compute(GPU)
+    expect(g.device == GPU and g.pieces >= 5 and g.gpu_pieces == g.pieces, "pieces: " + String(g.pieces) + " `" + g.fallback_reason + "`")
+    same(g, wide(Query(t)).compute(CPU), "decimal / text pieces")
+    write_parquet("f189_wide.parquet", t, "", ZSTD, 100_000)           # 2 groups of 2.4 MB: each over the budget
+    var s = wide(Query(scan_parquet("f189_wide.parquet"))).compute(GPU)
+    expect(s.device == GPU, "scan: `" + s.fallback_reason + "`")
+    same(s, wide(Query(t)).compute(CPU), "decimal / text scan ranges")
+    dt.release()
+    _ = b^
+
+
+def test_a_csv_scan_with_empty_cells_in_pieces() raises:
+    var b = budget("1M")
+    var t = make_wide(60_000, 12)
+    var text = String("region,carrier,revenue\n")
+    for i in range(t.rows()):
+        text += t.text_of(0, Int(t.get(0, i))) + ","
+        if not t.is_null(1, i):
+            text += String(t.get(1, i))
+        text += ","
+        if not t.is_null(2, i):
+            var v = t.get(2, i)
+            var a = v if v >= 0 else -v
+            text += ("-" if v < 0 else "") + String(a // 100) + "." + ("0" if a % 100 < 10 else "") + String(a % 100)
+        text += "\n"
+    var f = open("f189_wide.csv", "w")
+    f.write(text)
+    f.close()
+    var scan = scan_csv("f189_wide.csv", CsvOptions(group_rows=40_000))
+    var g = wide(Query(scan)).compute(GPU)
+    expect(g.device == GPU, "csv: `" + g.fallback_reason + "`")
+    var cpu = wide(Query(scan)).compute(CPU)
+    same(g, cpu, "csv with empty cells")
+    _ = b^
+
+
 def main() raises:
     test_the_budget_is_read_from_the_environment()
     if not gpu_available():
         print("no GPU: skipped")
         return
+    test_a_bad_budget_is_refused()
+    test_a_nullable_column_and_a_smaller_group_after_a_bigger_one()
+    test_decimal_and_text_columns_in_pieces()
+    test_a_csv_scan_with_empty_cells_in_pieces()
     test_a_table_over_the_budget_runs_in_pieces()
     test_a_table_under_the_budget_stays_resident_in_one_launch()
     test_auto_answers_a_too_big_table_on_the_cpu_and_says_how_big()

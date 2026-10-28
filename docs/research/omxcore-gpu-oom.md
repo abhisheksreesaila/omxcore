@@ -24,8 +24,8 @@ buffers fill it).
 
 ## 2. What the engine did before F-189
 
-Measured with `mojo/tests/test_gpu_oom.mojo` (its `test_today_*` cases, a fake 1 MB GPU via the test knob that this
-ticket adds, tables of 7 to 26 MB):
+Measured with the `test_today_*` cases of `mojo/tests/test_gpu_oom.mojo` as committed in `de9648e` (replaced by the
+piece tests in the next commit; a fake 1 MB GPU via the test knob that this ticket adds, tables of 7 to 26 MB):
 
 - `DeviceTable(table)` uploaded every column whole, with no budget: `bytes()` was the whole table. On a real card
   smaller than the table the constructor raised the `Error` above part-way through, leaving the first columns

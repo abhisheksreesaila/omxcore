@@ -79,8 +79,10 @@ def _drop_last(s: String) -> String:
 
 
 def parse_size(text: String) raises -> Int:
-    """"512M" -> 536870912; "64KB", "2G", "1.5G", "4096" (K, M, G are powers of 1024)."""
+    """"512M" -> 536870912; "64KB", "2G", "1.5G", "4096" (K, M, G are powers of 1024). Anything else, zero, a negative or a
+    size past 2^62 raises."""
     var t = String(text.strip()).upper()
+    var bad = GPU_BUDGET_ENV + ": `" + text + "` is not a size (try 512M)"
     if t.endswith("B") and t.byte_length() > 1:
         t = _drop_last(t)
     var unit = 1
@@ -93,35 +95,42 @@ def parse_size(text: String) raises -> Int:
     if unit > 1:
         t = _drop_last(t)
     if t.byte_length() == 0:
-        raise Error(GPU_BUDGET_ENV + ": `" + text + "` is not a size (try 512M)")
+        raise Error(bad)
+    for ch in t.codepoints():                            # digits and one point only: no sign, "inf", "nan", exponent
+        if not (ch.is_ascii_digit() or ch == Codepoint.ord(".")):
+            raise Error(bad)
+    var v: Float64
     try:
-        return Int(Float64(t) * Float64(unit))
+        v = Float64(t) * Float64(unit)
     except:
-        raise Error(GPU_BUDGET_ENV + ": `" + text + "` is not a size (try 512M)")
+        raise Error(bad)
+    if not (v >= 1.0 and v < 4.6e18):
+        raise Error(bad)
+    return Int(v)
 
 
-def gpu_budget_override(device_id: Int = 0) -> Int:
-    """The fake size of GPU `device_id` from MXFRAME_GPU_MEM_BUDGET, -1 when none is set. A value that is not a size
-    raises where the budget is first used (`gpu_free_bytes`)."""
-    return _budget_override(device_id)
-
-
-def _budget_override(device_id: Int) -> Int:
+def gpu_budget_override(device_id: Int = 0) raises -> Int:
+    """The fake size of GPU `device_id` from MXFRAME_GPU_MEM_BUDGET, -1 when none is set for it. Every entry must be a
+    size or `id:size`: a malformed entry anywhere raises."""
     var raw = getenv(GPU_BUDGET_ENV, "")
     if raw.byte_length() == 0:
         return -1
     var dflt = -1
+    var mine = -1
     for part in raw.split(","):
         var at = part.find(":")
-        try:
-            if at >= 0:
-                if Int(String(part[byte=0:at]).strip()) == device_id:
-                    return parse_size(String(part[byte=at + 1:]))
-            else:
-                dflt = parse_size(String(part))
-        except:
-            return -2                                    # (unreadable: `gpu_free_bytes` says so)
-    return dflt
+        if at >= 0:
+            var id: Int
+            try:
+                id = Int(String(part[byte=0:at]).strip())
+            except:
+                raise Error(GPU_BUDGET_ENV + ": `" + String(part) + "` is not id:size (try 0:512M)")
+            var size = parse_size(String(part[byte=at + 1:]))
+            if id == device_id:
+                mine = size
+        else:
+            dflt = parse_size(String(part))
+    return mine if mine >= 0 else dflt
 
 
 def gpu_free_bytes(ctx: DeviceContext) raises -> Int:
@@ -133,9 +142,7 @@ def gpu_free_bytes(ctx: DeviceContext) raises -> Int:
             free = Int(ctx.get_memory_info()[0])
         except:
             pass
-        var o = _budget_override(Int(ctx.id()))
-        if o == -2:
-            raise Error(GPU_BUDGET_ENV + " is `" + getenv(GPU_BUDGET_ENV, "") + "`: a size like 512M, or 0:512M,1:2G")
+        var o = gpu_budget_override(Int(ctx.id()))
         return free if o < 0 else min(free, o)
     else:
         raise Error(NO_GPU_MESSAGE)
@@ -156,7 +163,7 @@ def gpu_capacity(ctx: DeviceContext) raises -> Int:
             total = Int(ctx.get_memory_info()[1])
         except:
             pass
-        var o = _budget_override(Int(ctx.id()))
+        var o = gpu_budget_override(Int(ctx.id()))
         return (total if o < 0 else min(total, o)) // 100 * GPU_USABLE_PERCENT
     else:
         raise Error(NO_GPU_MESSAGE)
@@ -489,16 +496,19 @@ def _stage_load(addr: Int, table: SharedTable, ext: List[Int] = List[Int](), row
                 m.data_cap[c] = n
             if n > 0:
                 if len(ext) > 0:
-                    m.ctx.enqueue_copy(dst_buf=m.data[c], src_ptr=UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=ext[c]))
+                    var dst = m.data[c].create_sub_buffer[DType.int64](0, n)           # (a copy moves the whole buffer it is given: only n elements)
+                    m.ctx.enqueue_copy(dst_buf=dst, src_ptr=UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=ext[c]))
                 else:
-                    m.ctx.enqueue_copy(dst_buf=m.data[c], src_ptr=table.values(c).unsafe_ptr())
+                    var dst = m.data[c].create_sub_buffer[DType.int64](0, n)
+                    m.ctx.enqueue_copy(dst_buf=dst, src_ptr=table.values(c).unsafe_ptr())
             m.data_addr.append(Int(m.data[c].unsafe_ptr()))
             var nbytes = len(table._table[].cols[c].validity)
             if nbytes > 0:
                 if m.valid_cap[c] < nbytes:
                     m.valid[c] = m.ctx.enqueue_create_buffer[DType.uint8](nbytes)
                     m.valid_cap[c] = nbytes
-                m.ctx.enqueue_copy(dst_buf=m.valid[c], src_ptr=table._table[].cols[c].validity.unsafe_ptr())
+                var vdst = m.valid[c].create_sub_buffer[DType.uint8](0, nbytes)
+                m.ctx.enqueue_copy(dst_buf=vdst, src_ptr=table._table[].cols[c].validity.unsafe_ptr())
                 m.valid_addr.append(Int(m.valid[c].unsafe_ptr()))
             else:
                 m.valid_addr.append(0)
