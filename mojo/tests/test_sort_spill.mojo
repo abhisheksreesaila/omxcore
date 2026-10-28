@@ -87,6 +87,7 @@ def queries() -> List[String]:
         "SELECT id, k1 + 1 AS z, txt FROM t WHERE id % 3 <> 0 ORDER BY z DESC, txt",
         "SELECT id FROM t ORDER BY txt, f DESC, id",
         "SELECT txt, k1 FROM t ORDER BY txt, k1",
+        "SELECT id, upper(txt) AS u FROM t ORDER BY u DESC NULLS FIRST, id",
         "SELECT id FROM t WHERE id < 0 ORDER BY id",
     ]
 
@@ -289,6 +290,18 @@ def test_join_and_group_by() raises:
     var res = sql_to_parquet(cat, jq, "join-out.parquet", options(1024), "", ZSTD, 1000)
     if res.rows_written != want.table.rows() or rows_of(read_parquet("join-out.parquet").table) != rows_of(want.table):
         fail("a sorted join written to a file differs")
+    var third = Table.empty()
+    var tid = third.add_column("tid", INT)
+    var w3 = third.add_column("w", INT)
+    for i in range(0, N, 3):
+        third.append(tid, Int64(i))
+        third.append(w3, Int64(i % 5))
+    cat.add_table("u", third^.share())
+    var j3 = "SELECT t.id, o.tag, u.w FROM t JOIN o ON t.id = o.oid JOIN u ON t.id = u.tid ORDER BY u.w DESC, o.tag, t.id"
+    var w3q = sql(cat, j3)
+    var g3 = sql_to_parquet(cat, j3, "join3-out.parquet", options(1024), "", ZSTD, 1000)
+    if g3.rows_written != w3q.table.rows() or rows_of(read_parquet("join3-out.parquet").table) != rows_of(w3q.table):
+        fail("a sorted 3-way join written to a file differs")
     var gq = "SELECT k1, count(*), sum(d) FROM t GROUP BY k1 ORDER BY 2 DESC, k1"
     var gres = sql_to_parquet(cat, gq, "group-out.parquet", options(1024))
     if rows_of(read_parquet("group-out.parquet").table) != rows_of(sql(cat, gq).table) or gres.rows_written != 14:

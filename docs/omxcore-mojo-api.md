@@ -330,7 +330,7 @@ f.permutation(c, descending=False) -> List[Int]   # row order; the data never mo
 Stable, over any column including formulas and edited cells; nulls last in both directions, removed rows left out. Over a `Frame(scan)` it streams the column but holds O(rows) keys (§3).
 Text sorts alphabetically ignoring ASCII case, byte order breaking ties ("apple" before "Zebra"; pending the owner's
 review). A radix sort over Int64 keys: about 25-30 ms at 1M rows for text and narrow integers, 55-75 ms for full-range
-int64 (informal, F-138a). Next: multi-column sort.
+int64 (informal, F-138a). Multi-key sorts are SQL `ORDER BY` (F-152). A sort bigger than memory: `ORDER BY` with a sort budget, spilled runs on disk (F-167, below); `permutation` itself stays in memory (it returns 8 bytes a row).
 
 ## 6b. Ranges and blocks over an order (F-176)
 
@@ -579,6 +579,44 @@ arithmetic expression over INT / DECIMAL / DATE columns, a comparison or logical
 | `SELECT DISTINCT a, b` | the group-by of the select list (the binder rewrites it; EXPLAIN shows `Distinct keys=[a, b]`), so it takes the dense or hashed strategy with the reason; `DISTINCT` with aggregates or `GROUP BY` raises (use `GROUP BY`); its `ORDER BY` terms must be in the select list |
 
 **Row order on an edited frame.** A query with no `ORDER BY` lists a frame's rows as the frame holds them: a row the session changed stays where it was (the shared row is masked out and its new values come from the delta chunk, merged back by row number), an appended row comes last, a removed row is gone. Equal sort keys and a `LIMIT` follow the same order, so a preview after an edit does not reorder the sheet. The merge is linear (two ascending runs), not a sort; a `LIMIT` with no `ORDER BY` reads the changed rows first (they are few) and the shared rows until `n + offset` of them are in hand.
+
+### A sort bigger than memory (F-167, `sortspill.mojo`; app request #14)
+
+An `ORDER BY` over rows that do not fit a memory budget sorts runs that do, writes them to a temporary file and merges them. The answer is the sort in memory's, row for row (NULLS FIRST / LAST, DESC, the text order, NaN, ties in the source's order), for a Table, a Frame with edits, a Parquet scan and a CSV scan.
+
+```mojo
+var o = PlannerOptions()
+o.sort_budget = 512 << 20          # bytes of rows a sort holds at once (0: 2 GiB, SORT_BUDGET_DEFAULT); past it the runs go to disk
+o.spill_dir = "/var/cache/app"     # where (default: the TMPDIR environment variable, else /tmp)
+var r = sql(cat, "SELECT id, name, total FROM orders ORDER BY region, total DESC, id", o)     # the result table, when it fits
+var w = sql_to_parquet(cat, "SELECT * FROM big ORDER BY k, id", "sorted.parquet", o)         # a file bigger than memory sorted into a new file
+w.rows_written                      # the rows in the file; w.notes say whether the merge streamed ("output: N rows merged straight into ...")
+```
+
+| Part | What runs |
+|---|---|
+| Collect | the row query reads its chunks as before (a table in slices, a scan row group by row group). When the rows collected so far plus the next slice would pass the budget (`run_row_cap`: 9 bytes a column plus the sort's own working memory, 96 + 16 per key bytes a row, measured) they are sorted by `_order_rows` (the sort in memory) and written as a run; the last rows are a run too. |
+| Order | there is no second comparison. A run is sorted by the sort in memory; the k-way merge compares rows with `_SortCols.cmp`, the comparison the top-k heap uses, over the keys `_sort_keys` makes. Every row carries its number in the source (a frame's row number when it has edits) as the last key, so ties keep the source's order. A TEXT key is a dictionary code whose place depends on the words present: the runs keep codes, and once the last run is written the words that occurred are ranked once, so every run's blocks compare with the same ranks. |
+| Merge | one block of each run is in memory (`budget / (2 x runs)` rows, 64 to 65,536), a heap of the runs picks the next row; the rows come out in batches. `OFFSET` and `LIMIT` cut the merged order. |
+| Output | a table (when `sql` is asked: the result is held, as always), or `sql_to_parquet`: row groups of `row_group_rows` (default 1M; fewer when the budget cannot hold that many) go to the file as they are merged, atomically (a temporary file renamed into place; an error or a cancel leaves the old file). A sort that fits the budget is written from memory. |
+| Cleanup | the runs are one file, removed when the sort ends: on success, on an error, on a cancel (`JobCtl`, checked between slices and every 65,536 merged rows). |
+| `LIMIT` | an `ORDER BY` with a small `LIMIT` keeps the top-k heaps and never spills (§ row queries); a large `LIMIT` sorts in runs and stops merging after `LIMIT + OFFSET` rows. |
+
+`mx sql ... --sort-budget BYTES --spill-dir DIR --format parquet --out sorted.parquet --row-group-rows N` does the same from the command line. `PlannerOptions.sort_run_rows` is a test override (rows per run; any value above 0 makes the sort spill, even when one run holds every row).
+
+**Memory** (measured, `tests/test_sort_spill_memory.py`, a 3M-row file of 4 columns, 96 MB of values, row groups of 100,000 rows; peak resident set with file pages, a 25 MB runtime floor):
+
+| `ORDER BY txt DESC, k, id` over 3M rows | peak | |
+|---|---|---|
+| the sort in memory (today's, no budget) | 401 MB | 3.9x the values: the collected columns, the keys, the row order, the radix passes' two buffers |
+| spilled into a file, 16 MiB budget (59 runs) | 46 MB | |
+| spilled into a file, 64 MiB budget (10 runs) | 95 MB | |
+| spilled into a file, 256 MiB budget (3 runs) | 237 MB | |
+| 6M rows, 64 MiB budget | the same as 3M (within 15 MB) | twice the runs, the same peak |
+
+The peak is the budget plus the runtime plus a fixed extra outside it (the scan's row group being decoded, the merge's output group, the writer's pages: < 40 MB here), whatever the file's size. A CSV or Parquet file's row group is decoded whole, so a file with row groups of millions of wide rows needs that much beyond the budget.
+
+**Limits.** The budget counts the rows being sorted and the merge's blocks, not the dictionary of a TEXT column (a scan's words are in memory as ever: the ranks need them) and not the loaded row group. The merge keeps at least 64 rows of every run, so a budget so small that the runs outnumber it (millions of runs) is exceeded; the runs are not merged in passes yet. `Frame.permutation` returns a list of row numbers, 8 bytes a row, and stays in memory: use `sql_to_parquet` to sort a Frame over a file into a new one. Only `ORDER BY` over rows streams into the file; an aggregate's groups (and a `GROUP BY` with `ORDER BY`) are a table in memory. A join's rows spill like any rows. Disk space: 9 bytes a value per column, once.
 
 Informal timings (F-152; the same 12-core Ryzen 9 5900X under a load average of about 5 from other jobs, so rough; the F-150 test generator's table of 1,200,000 rows and 9 columns written to Parquet; omxcore is the in-process
 `sql()` time reported by `mx` (the file read apart), best of 3 fresh processes, the result a Table; DuckDB 1.5.1 on a table it loaded, best of 3, the result an Arrow table; every result is checked against DuckDB in `tests/test_mojo_rows.py`):
