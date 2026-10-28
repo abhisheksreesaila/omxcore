@@ -391,6 +391,8 @@ struct Cte(Copyable, Movable):
         self.col = col
 
 
+comptime NO_FROM_TABLE = "__one"     # the table of a SELECT with no FROM (one row, one column)
+
 comptime EXPLAIN_NONE = 0
 comptime EXPLAIN_PLAN = 1
 comptime EXPLAIN_ANALYZE = 2   # F-155: the query runs and the plan shows the actual rows and milliseconds of each operator
@@ -1032,19 +1034,24 @@ struct _Parser(Movable):
                 continue
             break
         if not self.is_kw("FROM"):
-            if self.tok().kind == T_EOF or self.is_sym(";"):
-                raise _tok_error(self.tok(), "SELECT without FROM is not supported yet (F-152)")
-            raise self.expected("FROM")
-        _ = self.advance()
-        var tr = self.table_ref()
-        self.st.table = tr[0]
-        self.st.table_is_file = tr[2]
-        self.st.table_line = tr[3]
-        self.st.table_col = tr[4]
-        self.st.table_alias = tr[1]
-        self.st.table_kid = self.ref_kid
-        self.st.table_cols = self.ref_cols.copy()
-        self.join_tail()
+            if self.tok().kind == T_EOF or self.is_sym(";") or self.is_sym(")") or self.is_kw("UNION") or self.is_kw("INTERSECT") or self.is_kw("EXCEPT") or \
+               self.is_kw("ORDER") or self.is_kw("LIMIT"):
+                self.st.table = NO_FROM_TABLE                       # F-159: SELECT of constants reads a one-row table the query runner provides
+                self.st.table_line = self.tok().line
+                self.st.table_col = self.tok().col
+            else:
+                raise self.expected("FROM")
+        else:
+            _ = self.advance()
+            var tr = self.table_ref()
+            self.st.table = tr[0]
+            self.st.table_is_file = tr[2]
+            self.st.table_line = tr[3]
+            self.st.table_col = tr[4]
+            self.st.table_alias = tr[1]
+            self.st.table_kid = self.ref_kid
+            self.st.table_cols = self.ref_cols.copy()
+            self.join_tail()
         if self.is_kw("WHERE"):
             _ = self.advance()
             self.st.where = self.expr()

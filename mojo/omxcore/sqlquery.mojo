@@ -16,7 +16,7 @@ Each statement then goes to the engine as the one-SELECT statement it was before
 from std.time import perf_counter_ns
 from .table import Table, SharedTable, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, F32_COLUMN
 from .sql import (SqlStatement, SqlQuery, SqlExpr, SelectItem, TableRef, WinSpec, Cte, SubQuery, OrderItem, parse_query, sql_error, lower_ascii, EXPLAIN_NONE, EXPLAIN_ANALYZE,
-                  SET_NONE, SET_UNION_ALL, SET_UNION, SET_INTERSECT, SET_EXCEPT, CTE_AUTO, CTE_MATERIALIZED, CTE_INLINED,
+                  SET_NONE, NO_FROM_TABLE, SET_UNION_ALL, SET_UNION, SET_INTERSECT, SET_EXCEPT, CTE_AUTO, CTE_MATERIALIZED, CTE_INLINED,
                   X_SCALAR_Q, X_IN_Q, X_EXISTS_Q, X_SUBIN, X_EXISTS, X_NOT, X_COL, X_INT, X_NULL, X_CAST, X_TRUE, X_FALSE, X_IN, X_BIN, X_CALL, X_ISBOOL, JK_INNER, JK_LEFT)
 from .bind import Catalog, _split_and_expr, _and_chain, _has_aggregate
 from .subq import (SIDE_OUTER, side_of, Scope, scope_of, Flat, flatten, flat_source, clone_shell, collect, is_subquery_node, add_node, column_node, equal_node, and_node,
@@ -520,6 +520,17 @@ def qualify_run[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: Sql
     return sql_with(catalog, text, planner, final_opts)
 
 
+def _numeric_column(catalog: Catalog, table: String, name: String) -> Bool:
+    var i = catalog.find(table)
+    if i < 0:
+        return False
+    var c = catalog.sources[i].table.index(name)
+    if c < 0:
+        return False
+    var k = catalog.sources[i].table.kind(c)
+    return k == INT or k == DECIMAL or k == FLOAT
+
+
 # ── subqueries ───────────────────────────────────────────────────────────────────────────────────────
 
 struct Step(Movable):
@@ -850,7 +861,7 @@ def _correlated_scalar[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut 
         items.append(len(st.exprs) - 2)
         items.append(len(st.exprs) - 1)
         st.exprs[n] = SqlExpr(X_CALL, String("COALESCE"), String(), 0, -1, -1, items^, False, line, col)
-    elif cmp and st.exprs[conj].text == "=":
+    elif cmp and st.exprs[conj].text == "=" and _numeric_column(catalog, d, "__v"):
         # `x = D.__v` between columns of two tables would be taken for a join key (and an INT against a FLOAT cannot be one): `__v + 0` is an expression, compared as SQL compares
         st.exprs.append(vnode^)
         st.exprs.append(SqlExpr(X_INT, String("0"), String(), -1, -1, -1, List[Int](), False, line, col))
@@ -1203,10 +1214,14 @@ def sql_with[P: Planner](mut catalog: Catalog, text: String, planner: P, options
     var plain = len(q.stmts) == 1
     if plain:
         ref st = q.stmts[0]
-        plain = len(st.ctes) == 0 and st.qualify < 0 and st.set_op == SET_NONE and not catalog.reads_a_view(st)
+        plain = len(st.ctes) == 0 and st.qualify < 0 and st.set_op == SET_NONE and not catalog.reads_a_view(st) and st.table != NO_FROM_TABLE
     if plain:
         return run_plain(catalog, q.stmts.pop(), text, planner, options)
     var work = catalog.copy()
+    var one = Table.empty()
+    var oc = one.add_column("__c", INT)
+    one.append(oc, 1)
+    work.add_table(NO_FROM_TABLE, one^.share())
     var root = len(q.stmts) - 1
     var run = QueryRun(q, text)
     var t0 = perf_counter_ns()

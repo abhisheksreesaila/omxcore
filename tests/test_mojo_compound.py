@@ -604,3 +604,31 @@ def test_an_int_equal_to_a_correlated_float_subquery(mx, data, f):
     q(mx, data, "memory", f"SELECT id FROM t WHERE v = (SELECT avg(w) FROM u WHERE u.k = t.k AND {f})")
     q(mx, data, "memory", f"SELECT id FROM t WHERE (SELECT avg(w) FROM u WHERE u.k = t.k AND {f}) = v * 1.0")
     q(mx, data, "memory", f"SELECT id FROM t WHERE d = (SELECT max(d) FROM t t2 WHERE t2.k = t.k AND {f.replace('id', 't2.id')})")
+
+
+# ── F-159 review 2: = against a correlated scalar of any kind; SELECT with no FROM ────────────────
+
+NON_NUMERIC_EQUALS = [
+    "SELECT id FROM t WHERE s = (SELECT min(s) FROM u WHERE u.k = t.k AND u.s = 'Zed' AND {f})",
+    "SELECT id FROM t WHERE (SELECT max(s) FROM u WHERE u.k = t.k AND u.s = 'west' AND {f}) = s",
+    "SELECT id FROM (SELECT id, k, v > 0 AS b FROM t ORDER BY id) x WHERE b = (SELECT max(w) > 3 FROM u WHERE u.k = x.k AND {f})",
+    "SELECT id FROM (SELECT id, k, DATE '2020-01-01' + CAST(id % 30 AS INTEGER) AS dt FROM t ORDER BY id) x WHERE dt = (SELECT max(DATE '2020-01-01' + CAST(w % 30 AS INTEGER)) FROM u WHERE u.k = x.k AND {f})",
+    "SELECT id FROM t WHERE d = (SELECT max(d) FROM t t2 WHERE t2.k = t.k AND {fq})",
+]
+
+
+@pytest.mark.parametrize("f", FILTERS)
+@pytest.mark.parametrize("sql", NON_NUMERIC_EQUALS)
+def test_text_bool_date_equal_to_a_correlated_scalar(mx, data, sql, f):
+    q(mx, data, "memory", sql.format(f=f, fq=f.replace("id", "t2.id")))
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT id FROM t WHERE v > (SELECT 3) AND id < 30",
+    "SELECT id, (SELECT 1) AS one FROM t WHERE id < 3",
+    "SELECT id FROM t WHERE k IN (SELECT 1 UNION SELECT 2)",
+    "SELECT id FROM t WHERE EXISTS (SELECT 1) AND id < 3",
+    "SELECT id FROM t WHERE id < (SELECT 2 + 3)",
+])
+def test_select_with_no_from(mx, data, sql):
+    q(mx, data, "memory", sql)
