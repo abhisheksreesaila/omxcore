@@ -2656,7 +2656,7 @@ def bind_statement(catalog: Catalog, var st: SqlStatement, text: String) raises 
         var ast = b.st.group_by[g]
         var gx = b.st.exprs[ast].copy()
         var target = ast
-        if gx.kind == X_INT and not b.distinct:
+        if gx.kind == X_INT and not gx.flag and not b.distinct:
             var n = Int(parse_number(gx.text).value)
             if n < 1 or n > len(b.st.items):
                 raise b.err(ast, "GROUP BY " + gx.text + " is out of range: the select list has " + String(len(b.st.items)) + " items")
@@ -2719,7 +2719,7 @@ def bind_statement(catalog: Catalog, var st: SqlStatement, text: String) raises 
     for oi in b.st.order_by:
         var ox = b.st.exprs[oi.expr].copy()
         var e = -1
-        if ox.kind == X_INT:
+        if ox.kind == X_INT and not ox.flag:
             var n = Int(parse_number(ox.text).value)
             if n < 1 or n > len(b.st.items):
                 raise b.err(oi.expr, "ORDER BY " + ox.text + " is out of range: the select list has " + String(len(b.st.items)) + " items")
@@ -2763,7 +2763,7 @@ def bind_rows(var b: _Binder) raises -> BoundQuery:
     for oi in b.st.order_by:
         var ox = b.st.exprs[oi.expr].copy()
         var e = -1
-        if ox.kind == X_INT:
+        if ox.kind == X_INT and not ox.flag:
             var n = Int(parse_number(ox.text).value)
             if n < 1 or n > len(b.st.items):
                 raise b.err(oi.expr, "ORDER BY " + ox.text + " is out of range: the select list has " + String(len(b.st.items)) + " items")

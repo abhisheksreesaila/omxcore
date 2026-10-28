@@ -480,7 +480,7 @@ def qualify_run[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: Sql
     for k in range(len(order)):
         var ex = st.exprs[order[k].expr].copy()
         var frag: String
-        if ex.kind == X_INT:
+        if ex.kind == X_INT and not ex.flag:
             frag = "#" + ex.text
         elif ex.kind == X_COL and ex.text2.byte_length() == 0 and (has_star or lower_ascii(ex.text) in known):
             frag = _quote(ex.text)
@@ -850,6 +850,11 @@ def _correlated_scalar[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut 
         items.append(len(st.exprs) - 2)
         items.append(len(st.exprs) - 1)
         st.exprs[n] = SqlExpr(X_CALL, String("COALESCE"), String(), 0, -1, -1, items^, False, line, col)
+    elif cmp and st.exprs[conj].text == "=":
+        # `x = D.__v` between columns of two tables would be taken for a join key (and an INT against a FLOAT cannot be one): `__v + 0` is an expression, compared as SQL compares
+        st.exprs.append(vnode^)
+        st.exprs.append(SqlExpr(X_INT, String("0"), String(), -1, -1, -1, List[Int](), False, line, col))
+        st.exprs[n] = SqlExpr(X_BIN, String("+"), String(), len(st.exprs) - 2, len(st.exprs) - 1, -1, List[Int](), False, line, col)
     else:
         st.exprs[n] = vnode^
     run.steps.append("correlated scalar subquery: " + d + " (" + _commas(rows) + " keys), a " + ("left join" if left else "join"))

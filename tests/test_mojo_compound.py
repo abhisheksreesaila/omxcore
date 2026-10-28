@@ -577,3 +577,30 @@ def test_duckdbs_own_tpch_text_equals_duckdb(mx, tpch, n):
     sql = Q15_WITH if n == 15 else tpch["con"].execute(f"select query from tpch_queries() where query_nr = {n}").fetchone()[0].strip().rstrip(";")
     res = tpch_q(mx, tpch, sql, ordered=True)
     assert len(res["rows"]) > 0
+
+
+# ── F-159 review: a substituted subquery is a value, never a position; INT = correlated FLOAT ────
+
+ORDER_BY_VALUE = [
+    "SELECT k, id FROM t WHERE id < 40 ORDER BY (SELECT min(w) FROM u), id",
+    "SELECT k, id FROM t WHERE id < 40 ORDER BY (SELECT min(uid) + 2 FROM u), id",
+    "SELECT k, id FROM t WHERE id < 40 ORDER BY (SELECT max(w) FROM u) DESC, id DESC",
+    "SELECT k, count(*) AS c FROM t GROUP BY k ORDER BY (SELECT 2 FROM u LIMIT 1), k",
+    "SELECT k, count(*) AS c FROM t GROUP BY k ORDER BY 2 DESC, k",
+    "WITH a AS (SELECT k, id FROM t WHERE id < 40) SELECT k, id FROM a ORDER BY (SELECT min(w) FROM u), id",
+    "SELECT k, id FROM t WHERE id < 40 ORDER BY 2, 1",
+    "SELECT k, id FROM t WHERE id < 40 QUALIFY row_number() OVER (ORDER BY id) < 30 ORDER BY (SELECT min(uid) + 2 FROM u), id",
+    "SELECT id FROM t WHERE id < 40 GROUP BY id, (SELECT min(uid) + 1 FROM u) ORDER BY id",
+]
+
+
+@pytest.mark.parametrize("sql", ORDER_BY_VALUE)
+def test_a_subquery_in_order_by_is_a_value_not_a_position(mx, data, sql):
+    q(mx, data, "memory", sql, ordered=True)
+
+
+@pytest.mark.parametrize("f", FILTERS)
+def test_an_int_equal_to_a_correlated_float_subquery(mx, data, f):
+    q(mx, data, "memory", f"SELECT id FROM t WHERE v = (SELECT avg(w) FROM u WHERE u.k = t.k AND {f})")
+    q(mx, data, "memory", f"SELECT id FROM t WHERE (SELECT avg(w) FROM u WHERE u.k = t.k AND {f}) = v * 1.0")
+    q(mx, data, "memory", f"SELECT id FROM t WHERE d = (SELECT max(d) FROM t t2 WHERE t2.k = t.k AND {f.replace('id', 't2.id')})")

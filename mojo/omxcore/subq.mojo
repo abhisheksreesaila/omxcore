@@ -261,7 +261,7 @@ def set_literal(mut st: SqlStatement, node: Int, t: Table, row: Int, c: Int) rai
         st.exprs.append(SqlExpr(kind, text, String(), -1, -1, -1, List[Int](), False, line, col))
         st.exprs[node] = SqlExpr(X_NEG, String(), String(), len(st.exprs) - 1, -1, -1, List[Int](), False, line, col)
     else:
-        st.exprs[node] = SqlExpr(kind, text, String(), -1, -1, -1, List[Int](), False, line, col)
+        st.exprs[node] = SqlExpr(kind, text, String(), -1, -1, -1, List[Int](), kind == X_INT, line, col)   # (flag on an INT: a substituted value, never an ORDER BY or GROUP BY position)
 
 
 def literal_node(mut st: SqlStatement, t: Table, row: Int, c: Int, line: Int, col: Int) raises -> Int:

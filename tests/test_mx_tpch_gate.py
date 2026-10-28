@@ -20,20 +20,8 @@ SF = 1
 
 # query -> the engine's error today. Keep the text exact (the xfail reason is what the F-159 / F-155 reviewer greps).
 GAPS = {
-    2: "a scalar subquery is not supported yet (F-159)",
-    7: "a subquery in FROM is not supported yet (F-159)",
-    8: "a subquery in FROM is not supported yet (F-159)",
-    9: "a subquery in FROM is not supported yet (F-159)",
-    11: "a scalar subquery is not supported yet (F-159)",
-    13: "a subquery in FROM is not supported yet (F-159)",
-    14: "a sum or an expression passed the int64 range (about 9.2e18), or an integer past 2^53 met a float64 (it is not exact as a double)",
-    15: "`WITH` (common table expressions) is not supported yet (F-159)",
-    16: "a subquery in a query that also joins tables is not supported yet (F-155)",
-    17: "a scalar subquery is not supported yet (F-159)",
-    18: "`GROUP` in a subquery is not supported yet (F-159)",
-    20: "a scalar subquery is not supported yet (F-159)",
-    21: "more than one subquery in WHERE is not supported yet (F-155)",
-    22: "a subquery in FROM is not supported yet (F-159)",
+    11: "a sum or an expression passed the int64 range (about 9.2e18)",       # F-192
+    14: "a sum or an expression passed the int64 range (about 9.2e18), or an integer past 2^53 met a float64 (it is not exact as a double)",   # F-190
 }
 
 
