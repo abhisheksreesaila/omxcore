@@ -75,8 +75,9 @@ F-056 built this in the Python front end; apps now call the Mojo engine, whose `
 - [x] results equal the CPU for every source kind (Table, Frame, Parquet scan, CSV scan) and on the Apple plan (`-D OMXCORE_APPLE_GPU_SHAPE`); NVIDIA PTX unchanged unless a kernel change is unavoidable (then re-pinned with a timing A/B); Mac link check green
 - Later (not this ticket): the second GPU as its own pool and worker, NVLink peer access, quiet-machine timings
 
-## F-190 DECIMAL / DECIMAL in SQL types as DuckDB does (TPC-H Q14) [todo] (found by the F-162 harness, 2026-10-28)
-- [ ] `sum(decimal) / sum(decimal)` (and any DECIMAL / DECIMAL) no longer raises `int64 range exceeded`: typed as DuckDB types it (DOUBLE), equal to DuckDB; Q14 equal through `mx sql`
+## F-190 A large DECIMAL read as a double rounds instead of raising (TPC-H Q14) [todo] (found by the F-162 harness, 2026-10-28)
+Root cause (F-162 review): `/` is already FLOAT (bind.mojo); `OP_I2F` (query.mojo) refuses a raw DECIMAL integer past 2^53 when it reads it as a double, so `100.00 * sum(l_extendedprice) / sum(...)` raises `int64 range exceeded` at SF1.
+- [ ] a DECIMAL past 2^53 converted to DOUBLE rounds to the nearest double as DuckDB does (exactness kept everywhere a DECIMAL stays a DECIMAL); Q14 and the magnitude probes equal DuckDB through `mx sql`; NVIDIA PTX unchanged unless unavoidable (OP_I2F may also exist in the GPU kernel: then the GPU keeps declining such programs or matches)
 
 ## F-191 SQL honours GPU and AUTO (`mx sql --device gpu|auto`, `sql_with` on a device) [todo] (found by the F-162 harness, 2026-10-28)
 The gate asks each device to beat DuckDB, but the SQL path runs everything on the CPU ("SQL runs on the CPU"); the builder's GPU / AUTO (with F-189's budget) is not reached from SQL.
