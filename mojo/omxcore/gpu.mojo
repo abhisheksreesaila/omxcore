@@ -96,9 +96,14 @@ def parse_size(text: String) raises -> Int:
         t = _drop_last(t)
     if t.byte_length() == 0:
         raise Error(bad)
+    var points = 0
     for ch in t.codepoints():                            # digits and one point only: no sign, "inf", "nan", exponent
-        if not (ch.is_ascii_digit() or ch == Codepoint.ord(".")):
+        if ch == Codepoint.ord("."):
+            points += 1
+        elif not ch.is_ascii_digit():
             raise Error(bad)
+    if points > 1 or t == ".":
+        raise Error(bad)
     var v: Float64
     try:
         v = Float64(t) * Float64(unit)

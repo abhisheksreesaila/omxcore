@@ -366,7 +366,7 @@ def test_a_partial_total_past_int64_is_settled_by_the_whole() raises:
 
 
 def test_a_bad_budget_is_refused() raises:
-    var bad: List[String] = ["-5M", "inf", "nan", "9999999999999G", "0", "1e3", "M", "", "0:512M,1:junk", "0:512M,x:1M", "2M,junk"]
+    var bad: List[String] = ["-5M", "inf", "nan", "9999999999999G", "0", "1e3", "M", "", "0:512M,1:junk", "0:512M,x:1M", "2M,junk", "1..5G", "1.2.3", "."]
     var e = Env(GPU_BUDGET_ENV, "")
     for text in bad:
         if text == "":
