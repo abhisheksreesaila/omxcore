@@ -66,6 +66,14 @@ Needs: F-055 · Spec: `docs/spec-auto-mode.md` Phase 4 · Agreed 2026-10-15 ("96
 - Note: 96 GB is also bigger than this box's 62 GB of RAM, so that case needs the CPU path to stream Parquet row groups and spill to disk too (a later ticket: the CPU rerun of a piece is exact but holds its inputs in RAM, so step 1 alone does not make 96 GB work here)
 - Note from F-055: every GPU kernel returns a status and raises `MemoryError` on out-of-memory, so this ticket can rely on that for OOM only; a real GPU fault (illegal address) kills the process and returns no status
 
+## F-189 omxcore (Mojo): data bigger than GPU memory never fails [doing] (F-056 for the Mojo engine; owner go 2026-10-27)
+F-056 built this in the Python front end; apps now call the Mojo engine, whose `DeviceTable` uploads every column whole with no budget.
+- [ ] proof first: a test with an artificially small GPU budget (a test-only override, as `MXFRAME_GPU_MEM_BUDGET` in F-056) shows what `DeviceTable` / `compute(GPU)` / `compute(AUTO)` / a GPU scan do today on a table bigger than it; written up in `docs/research/omxcore-gpu-oom.md`
+- [ ] a per-GPU budget (driver free memory, capped by the override) and a pre-check: AUTO answers on the CPU with a `fallback_reason` when the working set does not fit, `compute(GPU)` runs the query in pieces that fit (row ranges / row groups uploaded in turn, partials merged as the CPU merges them), never an out-of-memory crash
+- [ ] a GPU allocation failure mid-query reruns that piece (or the query) on the CPU with the same answer, and AUTO remembers the shape
+- [ ] results equal the CPU for every source kind (Table, Frame, Parquet scan, CSV scan) and on the Apple plan (`-D OMXCORE_APPLE_GPU_SHAPE`); NVIDIA PTX unchanged unless a kernel change is unavoidable (then re-pinned with a timing A/B); Mac link check green
+- Later (not this ticket): the second GPU as its own pool and worker, NVLink peer access, quiet-machine timings
+
 ## F-057 Morsel co-processing that wins [done]
 Needs: F-053, F-055 · Builds on F-006 (`coproc.py`, `coproc_fused.py`, the Router) · Agreed 2026-10-15
 - [ ] research first (added to `docs/spec-auto-mode.md`): morsel-driven parallelism (Leis 2014), HetExchange, "Pump Up the Volume" and later CPU+GPU co-processing work; what F-006 measured (PCIe x8: streaming host data loses to CPU, resident data splits win) decides which ideas are worth it on this hardware
