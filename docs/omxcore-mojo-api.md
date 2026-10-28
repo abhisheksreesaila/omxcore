@@ -640,7 +640,7 @@ entering, subtract the rows leaving), `min` / `max` a monotone deque, `first_val
 running total would lose digits to cancellation, and a tree is what DuckDB uses). The *outer* query is an ordinary row query over the result (`FROM __win`): the select list, `DISTINCT`, `ORDER BY` (which may use windows,
 aliases and ordinals), `LIMIT` and `OFFSET` run after the windows, as in SQL; without an ORDER BY the rows come in the inner query's order. **A scan materialises the columns the query needs** (the inner query reads them
 whole: a window over a file bigger than memory is F-167's streaming work); a Frame's edits are in the inner result. Notes: `window: 2 functions in 1 sort over 10 rows, ...` and the time of the step;
-`SqlResult.fallback_reason` is `window functions run on the CPU` (SQL always runs there). EXPLAIN prints a `Window functions (after the query below, on the CPU)` block, then the inner query's plan.
+`SqlResult.fallback_reason` is `window functions run on the CPU` (SQL always runs there). **Cancel (F-175):** the job's flag is checked between the sort passes, before each group and by every task between partitions, and `wait()` then reports a cancel with no result; one partition's own evaluation (and one sort pass) runs to its end first. EXPLAIN prints a `Window functions (after the query below, on the CPU)` block, then the inner query's plan.
 
 **The builder** has the same functions (`Window`, `WindowFn`, `Query.window`, `compute_windows`):
 

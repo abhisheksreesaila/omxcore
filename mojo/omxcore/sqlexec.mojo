@@ -1864,7 +1864,7 @@ def _run_windows[P: Planner](mut catalog: Catalog, var st: SqlStatement, text: S
     swap(rows, r.table)
     var notes = r.notes.copy()
     var t_w = perf_counter_ns()
-    finish_windows(wp, rows, opts.threads, notes)
+    finish_windows(wp, rows, opts.threads, opts.job, notes)
     notes.append("window: " + _ms(Float64(perf_counter_ns() - t_w) / 1e6) + " ms")
     var cat2 = Catalog()
     cat2.add_table(WIN_TABLE, rows^.share())

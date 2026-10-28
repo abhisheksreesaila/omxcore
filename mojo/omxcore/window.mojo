@@ -19,7 +19,8 @@ UNBOUNDED PRECEDING to CURRENT ROW, the whole partition without one). The rankin
 """
 from std.memory import ArcPointer
 from .table import Table, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, WordDict
-from .frame import _radix_order, text_ranks
+from .frame import _radix_order_job, text_ranks
+from .job import JobCtl
 from .holistic import float_key
 from .sqleval import float_bits, ld_div
 from .fan import ParTask, run_tasks
@@ -186,6 +187,7 @@ struct _Ctx(Movable):
     var pbounds: List[Int]           # the partitions' first positions, then n
     var task_at: List[Int]           # the partition each task starts at, then the partition count
     var fns: List[_FnRun]
+    var job: Int                     # the job's words (0: none): a task stops taking partitions once it is cancelled
     var err: List[Int]               # set to 1 by a task whose sum left the int64 range
 
     def __init__(out self):
@@ -197,6 +199,7 @@ struct _Ctx(Movable):
         self.pbounds = List[Int]()
         self.task_at = List[Int]()
         self.fns = List[_FnRun]()
+        self.job = 0
         self.err = List[Int](length=1, fill=0)
 
 
@@ -403,19 +406,19 @@ def _col_keys(t: Table, c: Int) -> List[Int64]:
     return keys^
 
 
-def _sort_pass(t: Table, c: Int, keys: List[Int64], desc: Bool, nulls_first: Bool, perm: List[Int]) -> List[Int]:
+def _sort_pass(t: Table, c: Int, keys: List[Int64], desc: Bool, nulls_first: Bool, perm: List[Int], job: JobCtl) raises -> List[Int]:
     """One stable pass over `perm` by column `c` (values, then the NULL flag so NULLS FIRST / LAST holds in either direction)."""
     var n = len(perm)
     var aligned = List[Int64](length=n, fill=0)
     for i in range(n):
         aligned[i] = keys[perm[i]]
-    var out = _radix_order(aligned, perm, desc)
+    var out = _radix_order_job(aligned, perm, desc, job)
     if t.cols[c].nulls > 0:
         var flags = List[Int64](length=n, fill=0)
         for i in range(n):
             var isn = t.cols[c].is_null(out[i])
             flags[i] = Int64((0 if isn else 1) if nulls_first else (1 if isn else 0))
-        out = _radix_order(flags, out, False)
+        out = _radix_order_job(flags, out, False, job)
     return out^
 
 
@@ -442,8 +445,10 @@ def _mark_changes(t: Table, c: Int, keys: List[Int64], perm: List[Int], mut flag
 
 # ── one group ────────────────────────────────────────────────────────────────────────────────────────
 
-def _prepare(t: Table, g: WinGroup, n: Int, threads: Int, mut outs: List[_Out]) raises:
+def _prepare(t: Table, g: WinGroup, n: Int, threads: Int, job: JobCtl, mut outs: List[_Out]) raises:
+    job.check()
     var ctx = _Ctx()
+    ctx.job = job.words
     ctx.n = n
     ctx.has_order = len(g.order) > 0
     # 1. the order
@@ -458,11 +463,11 @@ def _prepare(t: Table, g: WinGroup, n: Int, threads: Int, mut outs: List[_Out]) 
         perm[i] = i
     var k = len(g.order) - 1
     while k >= 0:
-        perm = _sort_pass(t, g.order[k].col, okeys[k], g.order[k].desc, g.order[k].nulls_first, perm)
+        perm = _sort_pass(t, g.order[k].col, okeys[k], g.order[k].desc, g.order[k].nulls_first, perm, job)
         k -= 1
     k = len(g.part) - 1
     while k >= 0:
-        perm = _sort_pass(t, g.part[k], pkeys[k], False, False, perm)
+        perm = _sort_pass(t, g.part[k], pkeys[k], False, False, perm, job)
         k -= 1
     # 2. partitions and peer runs: flag 2 where a partition starts, 1 where a run of peers does
     var flag = List[UInt8](length=n, fill=0)
@@ -542,6 +547,7 @@ def _prepare(t: Table, g: WinGroup, n: Int, threads: Int, mut outs: List[_Out]) 
     var ntasks = len(ctx.task_at) - 1
     var task = _WinTask(Int(UnsafePointer(to=ctx)))
     run_tasks(task, ntasks, threads)
+    job.check()                                                      # (a cancelled run left some partitions undone: no result)
     var failed = ctx.err[0]
     if failed != 0:
         raise Error(WINDOW_OVERFLOW)
@@ -555,7 +561,10 @@ struct _WinTask(ParTask):
         var cp = UnsafePointer[_Ctx, MutAnyOrigin](unsafe_from_address=self.ctx)
         var c0 = cp[].task_at[i]
         var c1 = cp[].task_at[i + 1]
+        var job = JobCtl(cp[].job)
         for pi in range(c0, c1):
+            if job.cancelled():
+                return
             var ps = cp[].pbounds[pi]
             var pe = cp[].pbounds[pi + 1]
             for f in range(len(cp[].fns)):
@@ -604,7 +613,7 @@ def _frame(c: _Ctx, fr: _FnRun, p: Int, ps: Int, pe: Int) -> Tuple[Int, Int]:
             l = c.peer_lo[p] if c.has_order else ps
         if fr.e_kind == FB_CUR:
             h = (c.peer_hi[p] if c.has_order else pe) - 1
-    l = max(l, ps)
+    l = min(max(l, ps), pe)                    # (a start past the partition's end is an empty frame at its end, not a row of the next partition)
     h = min(h, pe - 1)
     return (l, max(h + 1, l))
 
@@ -794,12 +803,12 @@ def _eval_agg(c: _Ctx, fr: _FnRun, ps: Int, pe: Int):
 
 # ── the entry ────────────────────────────────────────────────────────────────────────────────────────
 
-def apply_windows(mut t: Table, groups: List[WinGroup], threads: Int = 0) raises:
+def apply_windows(mut t: Table, groups: List[WinGroup], threads: Int = 0, job: JobCtl = JobCtl()) raises:
     """Adds one column per function of `groups` to `t` (named `WinFn.name`, in order), each aligned with the rows of `t`."""
     var n = t.rows()
     var outs = List[_Out]()
     for g in groups:
-        _prepare(t, g, n, threads, outs)
+        _prepare(t, g, n, threads, job, outs)
     for i in range(len(outs)):
         var ci = t.add_column(outs[i].name, ColumnKind(outs[i].kind), outs[i].scale)
         var nulls = 0

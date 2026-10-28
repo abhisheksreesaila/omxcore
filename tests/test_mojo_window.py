@@ -111,6 +111,13 @@ QUERIES = [
     ("rows-large-offsets", f"SELECT id, {over(P + ' ROWS BETWEEN 1000000 PRECEDING AND 1000000 FOLLOWING', 'sum(x)', 'min(x)')} FROM t"),
     ("rows-empty-frame", f"SELECT id, {over(P + ' ROWS BETWEEN 1 PRECEDING AND 2 PRECEDING', 'sum(x)', 'count(*)', 'min(x)')} FROM t"),
     ("rows-current-only", f"SELECT id, {over(P + ' ROWS BETWEEN CURRENT ROW AND CURRENT ROW', 'sum(x)', 'count(x)', 'min(d)')} FROM t"),
+    # frames that start past the partition's end or end before its start (the clamp must hold at both edges), for every frame aggregate
+    ("frame-far-following-int", f"SELECT id, {over(P + ' ROWS BETWEEN 2 FOLLOWING AND 3 FOLLOWING', 'sum(x)', 'avg(x)', 'count(x)', 'count(*)', 'min(x)', 'max(x)')} FROM t"),
+    ("frame-far-following-decimal-float", f"SELECT id, {over(P + ' ROWS BETWEEN 3 FOLLOWING AND 5 FOLLOWING', 'sum(d)', 'avg(e)', 'sum(x / 3.0)', 'avg(x / 7.0)', 'min(d)', 'max(x / 3.0)')} FROM t"),
+    ("frame-before-the-start", f"SELECT id, {over(P + ' ROWS BETWEEN 5 PRECEDING AND 3 PRECEDING', 'sum(x)', 'avg(d)', 'sum(x / 3.0)', 'count(*)', 'min(x)', 'max(d)')} FROM t"),
+    ("frame-offsets-past-the-partition", f"SELECT id, {over('PARTITION BY g ORDER BY ' + ORD + ' ROWS BETWEEN 1000000 FOLLOWING AND 2000000 FOLLOWING', 'sum(x)', 'sum(x / 3.0)', 'min(x)', 'first_value(x)', 'last_value(x)', 'nth_value(x, 1)')} FROM t"),
+    ("frame-far-following-many-partitions", f"SELECT id, {over('PARTITION BY g ORDER BY ' + ORD + ' ROWS BETWEEN 2 FOLLOWING AND UNBOUNDED FOLLOWING', 'sum(x)', 'sum(d)', 'sum(x / 3.0)', 'max(x)', 'count(x)')} FROM t"),
+    ("frame-unbounded-to-far-preceding", f"SELECT id, {over('PARTITION BY g ORDER BY ' + ORD + ' ROWS BETWEEN UNBOUNDED PRECEDING AND 4 PRECEDING', 'sum(x)', 'sum(x / 3.0)', 'min(x)', 'count(*)')} FROM t"),
     # range frames (peers)
     ("range-unbounded-both", f"SELECT id, {over(PX + ' RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING', 'sum(x)', 'count(*)')} FROM t"),
     ("range-current-to-end", f"SELECT id, {over(PX + ' RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING', 'sum(x)', 'min(d)', 'count(*)')} FROM t"),
@@ -323,3 +330,124 @@ def test_nan_infinities_signed_zeros_and_nulls_equal_duckdb(mx, specials, mode, 
         assert out["columns"][i]["kind"] == dk[0], f"{q[1]}: column {i}: {out['columns'][i]}, DuckDB has {dk}"
     got = typed_rows(out)
     compare(sorted(got, key=lambda r: r[0]), sorted(want, key=lambda r: r[0]), True, q[1])
+
+
+# ── a fuzz over window specs (the review's generator, fixed seeds) ───────────────────────────────────
+
+FUZZ_SEEDS = [1, 2, 3, 4, 5, 6, 7, 8]
+FUZZ_ROWS = 300
+FUZZ_QUERIES = 30
+
+
+def _fuzz_table(directory, seed):
+    import duckdb
+    path = directory / f"fuzz{seed}.parquet"
+    con = duckdb.connect()
+    con.execute("set threads=1")
+    con.execute(f"select setseed({seed / 100})")
+    con.execute(f"""create table t as select i::bigint id,
+     case when random()<0.15 then null else (random()*6)::int - 2 end as a,
+     case when random()<0.15 then null else (random()*4)::int end as b,
+     case when random()<0.15 then null else ['apple','Apple','bob','Bob','cat','dog','',' x'][1+(random()*7)::int] end as s,
+     case when random()<0.15 then null else ((random()*2000)::int-1000)::decimal(12,2)/7 end as m,
+     case when random()<0.15 then null else date '2020-01-01' + (random()*5)::int end as dt,
+     case when random()<0.1 then null when random()<0.1 then 'NaN'::double when random()<0.05 then 'inf'::double when random()<0.05 then '-inf'::double when random()<0.1 then -0.0::double else ((random()*8)::int)/2.0 end as f,
+     case when random()<0.15 then null else random()<0.5 end as bo,
+     case when random()<0.15 then null else ((random()*50)::int)::decimal(12,2) end as m2
+     from range({FUZZ_ROWS}) r(i)""")
+    con.execute(f"copy t to '{path}' (format parquet, row_group_size 37)")
+    return con, path
+
+
+def _fuzz_frame(rnd):
+    if rnd.random() < 0.3:
+        return ""
+    mode = rnd.choice(["ROWS", "ROWS", "RANGE"])
+
+    def bound(start):
+        if mode == "RANGE":
+            return rnd.choice(["UNBOUNDED PRECEDING", "CURRENT ROW"] if start else ["CURRENT ROW", "UNBOUNDED FOLLOWING"])
+        n = rnd.choice([0, 1, 2, 3, 5, 100000, 10**7])
+        return rnd.choice(["UNBOUNDED PRECEDING", "CURRENT ROW", f"{n} PRECEDING", f"{n} FOLLOWING"] if start
+                          else ["UNBOUNDED FOLLOWING", "CURRENT ROW", f"{n} PRECEDING", f"{n} FOLLOWING"])
+
+    def rank_(x, start):
+        if x.startswith("UNBOUNDED"):
+            return -10**9 if start else 10**9
+        if x == "CURRENT ROW":
+            return 0
+        n = int(x.split()[0])
+        return -n if "PRECEDING" in x else n
+
+    for _ in range(20):
+        s, e = bound(True), bound(False)
+        if rank_(s, True) <= rank_(e, False):
+            return f"{mode} BETWEEN {s} AND {e}"
+    return ""
+
+
+def _fuzz_fn(rnd):
+    argc = rnd.choice(["a", "b", "m", "f", "m2", "id", "s", "dt"])
+    numc = rnd.choice(["a", "b", "m", "f", "m2", "id"])
+    return rnd.choice([
+        "row_number()", "rank()", "dense_rank()", "percent_rank()", "cume_dist()", "ntile(%d)" % rnd.choice([1, 2, 3, 7, 100, 10**6]),
+        f"lag({argc})", f"lead({argc}, {rnd.choice([0, 1, 2, 5, 1000])})",
+        f"lag({numc}, {rnd.choice([1, 2])}, {rnd.choice(['0', '-1', '999'])})",
+        f"lead(s, 1, '{rnd.choice(['zz', 'Zed'])}')", "lag(dt, 1, DATE '1999-12-31')",
+        f"first_value({argc})", f"last_value({argc})", f"nth_value({argc}, {rnd.choice([1, 2, 3, 50])})",
+        f"sum({numc})", f"count({argc})", "count(*)", f"avg({numc})", f"min({argc.replace('s', 'dt')})", f"max({argc.replace('s', 'dt')})"])
+
+
+def _fuzz_query(rnd):
+    parts = rnd.sample(["a", "b", "s", "dt", "bo"], rnd.randint(0, 2))
+    order = []
+    for _ in range(rnd.randint(0, 2)):
+        order.append((rnd.choice(["a", "b", "s", "m", "dt", "f", "bo"]), rnd.choice(["", "ASC", "DESC"]), rnd.choice(["", "NULLS FIRST", "NULLS LAST"])))
+    fns = [_fuzz_fn(rnd) for _ in range(rnd.randint(1, 3))]
+    fr = _fuzz_frame(rnd)
+    spec_p = ("PARTITION BY " + ", ".join(parts)) if parts else ""
+    oc = ("ORDER BY " + ", ".join(f"{c} {d} {nl}".strip() for c, d, nl in order)) if order else ""
+
+    def safe(f):
+        n = f.split("(")[0]
+        return n in ("rank", "dense_rank", "percent_rank", "cume_dist") or (n in ("sum", "count", "avg", "min", "max") and (fr == "" or fr.startswith("RANGE")))
+    tb = not all(safe(f) for f in fns) or rnd.random() < 0.3
+    if tb:
+        oc = (oc + ", id") if oc else "ORDER BY id"
+
+    def duck_order(o):
+        out = []
+        for it in o[len("ORDER BY "):].split(", "):
+            if it.split()[0] == "s":                                   # text: the engine's order is lower(s), then s
+                rest = " ".join(it.split()[1:])
+                out.append(f"lower(s) {rest}".strip())
+                out.append("s " + " ".join(w for w in rest.split() if w in ("ASC", "DESC")))
+            else:
+                out.append(it)
+        return "ORDER BY " + ", ".join(x.strip() for x in out)
+    sel, dsel = [], []
+    for i, f in enumerate(fns):
+        agg = f.split("(")[0] in ("sum", "count", "avg", "min", "max", "first_value", "last_value", "nth_value")
+        fclause = (" " + fr) if (agg and oc) else ""
+        if fr.startswith("RANGE") and not oc:
+            fclause = ""
+        sel.append(f"{f} OVER ({spec_p} {oc}{fclause}) AS w{i}")
+        dsel.append(f"{f} OVER ({spec_p} {duck_order(oc) if oc else ''}{fclause}) AS w{i}")
+    return f"SELECT id, {', '.join(sel)} FROM t ORDER BY id", f"SELECT id, {', '.join(dsel)} FROM t ORDER BY id"
+
+
+@pytest.mark.parametrize("seed", FUZZ_SEEDS)
+def test_random_window_specs_equal_duckdb(mx, tmp_path, seed):
+    """Random PARTITION BY / ORDER BY (NULLS FIRST / LAST) / frames (offsets 0 .. 1e7) / functions / defaults over NaN, inf, -0.0, NULL, text, dates."""
+    import random
+    con, path = _fuzz_table(tmp_path, seed)
+    rnd = random.Random(seed)
+    for _ in range(FUZZ_QUERIES):
+        q, dq = _fuzz_query(rnd)
+        try:
+            cur = con.execute(dq)
+            want = cur.fetchall()
+        except Exception as ex:                                        # a spec DuckDB itself refuses
+            continue
+        out = run_mx(mx, ["sql", "--max-rows", "0", q], {"t": path})
+        compare(typed_rows(out), want, True, q)

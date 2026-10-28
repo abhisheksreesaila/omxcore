@@ -20,6 +20,7 @@ from .table import Table, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
 from .window import (WinFn, WinGroup, WinOrder, apply_windows, function_name, W_ROW_NUMBER, W_RANK, W_DENSE_RANK, W_PERCENT_RANK, W_CUME_DIST, W_NTILE, W_LAG,
                      W_LEAD, W_FIRST, W_LAST, W_NTH, W_SUM, W_COUNT, W_COUNT_STAR, W_AVG, W_MIN, W_MAX)
 from .sqleval import float_bits
+from .job import JobCtl
 
 comptime WIN_TABLE = "__win"
 comptime WINDOW_LIST = "row_number, rank, dense_rank, percent_rank, cume_dist, ntile, lag, lead, first_value, last_value, nth_value, sum, count, avg, min, max"
@@ -500,12 +501,12 @@ def _read_default(var d: _Default, mut f: WinFn, t: Table) raises:
     f.def_val = -v if d.neg else v
 
 
-def finish_windows(mut plan: WindowPlan, mut t: Table, threads: Int, mut notes: List[String]) raises:
+def finish_windows(mut plan: WindowPlan, mut t: Table, threads: Int, job: JobCtl, mut notes: List[String]) raises:
     """Adds the window columns to the inner result `t`."""
     for i in range(len(plan.defaults)):
         var d = plan.defaults[i].copy()
         _read_default(d^, plan.groups[plan.defaults[i].group].fns[plan.defaults[i].fn_at], t)
-    apply_windows(t, plan.groups, threads)
+    apply_windows(t, plan.groups, threads, job)
     var n_fns = 0
     for g in plan.groups:
         n_fns += len(g.fns)
