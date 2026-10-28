@@ -8,21 +8,29 @@ green. Anything newer on `main` may still be in review: don't vendor it.
 
 ## Current stable
 
-**`5053a44`** (2026-10-27): a save's memory follows a byte budget. Includes everything in 8017543, 2585dc9 and
-3d2455d.
+**`5e4cdb1`** (2026-10-28): window functions; a sort bigger than memory (SQL and the sheet's `permutation`); the GPU never
+fails on data bigger than its memory. Includes everything in 5053a44 and earlier.
 
 ```sh
 # build the package from a clean copy of the stable commit (never from a working checkout), on Linux as before
-git -C <omxcore> archive 5053a44 | tar -x -C <scratch>
+git -C <omxcore> archive 5e4cdb1 | tar -x -C <scratch>
 cd <scratch> && pixi run bash scripts/build_mojo_pkg.sh      # -> build/omxcore.mojoc (and build/mxframe.mojoc)
-cp build/omxcore.mojoc <app>/vendor/ && echo 5053a44 > <app>/vendor/OMXCORE_COMMIT
+cp build/omxcore.mojoc <app>/vendor/ && echo 5e4cdb1 > <app>/vendor/OMXCORE_COMMIT
 ```
 
 The Mac build commands are unchanged from 3d2455d (below). **No new libSystem symbols** (`scripts/check_mac_link.sh`
 OK). For parallel saves on the Mac, build the app with `-D MXFRAME_JOB_THREADS` (the pthread symbols listed under
 23edc59, nothing more); without it, saves run on one thread.
 
-## What changed since the previous stable (8017543), for apps
+## What changed since the previous stable (5053a44), for apps
+
+| Area | What you get | Ticket |
+|---|---|---|
+| Window functions | SQL `f(...) OVER (PARTITION BY … ORDER BY … [ROWS / RANGE frame])` in the select list and ORDER BY: `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag` / `lead` (offset, default), `first_value` / `last_value` / `nth_value`, and `sum` / `count` / `avg` / `min` / `max` over a frame (running totals: `ROWS UNBOUNDED PRECEDING`; moving averages: `ROWS BETWEEN 6 PRECEDING AND CURRENT ROW`). With WHERE and GROUP BY, on a Table, Frame, Parquet or CSV scan. Builder: `Window().partition_by(…).order_by(…).rows(a, b)`, `Agg.over(w)`, `Query.window(...)`, `compute_windows(q, device)`. Equal to DuckDB; exact INT / DECIMAL; CPU only (AUTO says so). Not yet: filtering on a window result (QUALIFY / a subquery), windows bigger than memory | F-168 |
+| Sort bigger than memory | `Frame.permutation(c, descending, job, budget=, spill_dir=)` and `permutation_job(..., budget=, spill_dir=)`: past the budget, sorted runs go to disk and merge into the same order as before (3M rows of a streamed file: 169 MB to 64 MB at a 16 MiB budget). Pass `budget` (e.g. a quarter of the memory the app allows itself; the default is a flat 2 GiB) and `spill_dir` (the app's temporary directory). SQL `ORDER BY` spills the same way (`PlannerOptions.sort_budget` / `spill_dir`), and `sql_to_parquet(cat, sql, path, options)` sorts straight into a Parquet file without holding the result. Spill files are unlinked as soon as they open | F-167 |
+| GPU memory | the GPU never fails on data bigger than it: a `DeviceTable` over the GPU's free memory holds no device copy (`is_resident()` False); `compute(GPU)` then runs row ranges that fit and merges them, `compute(AUTO)` answers on the CPU with a `fallback_reason` naming the sizes; a failed GPU allocation reruns that piece on the CPU (same answer), and AUTO remembers it until much more memory is free. `QueryResult.pieces` / `gpu_pieces`; `device` says CPU when any piece ran there. On the Mac this matters most on small-memory machines | F-189 |
+
+## What changed in 5053a44 (since 8017543), for apps
 
 | Area | What you get | Ticket |
 |---|---|---|
@@ -112,6 +120,7 @@ and a repro for a bug. Needs that are generic go into the engine; app-specific o
 ## History
 | Stable | Date | Highlights |
 |---|---|---|
+| `5e4cdb1` | 2026-10-28 | window functions; sort bigger than memory (SQL and `permutation`); the GPU never fails on data bigger than it |
 | `5053a44` | 2026-10-27 | a save's memory follows a byte budget (`budget=`) |
 | `8017543` | 2026-10-26 | parallel zstd saves, faster Mojo encoder, ~1 MB pages |
 | `2585dc9` | 2026-10-26 | stddev / variance, quantile bins, ISO week; streamed CSV; undo for formulas; compressed Parquet on the Mac |
