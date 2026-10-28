@@ -27,6 +27,7 @@ Why it looks like this:
 from std.memory import ArcPointer
 from std.memory.alloc import unsafe_alloc
 from std.sys import is_defined, CompilationTarget, has_apple_gpu_accelerator
+from std.os import getenv
 from max.gpu.host import DeviceContext, DeviceBuffer, HostBuffer
 from .table import SharedTable
 
@@ -59,6 +60,105 @@ def gpu_device() -> String:
             return String()
     else:
         return String()
+
+
+# ---- F-189: how much GPU memory a query may take ----------------------------------------------------------------------
+# `MXFRAME_GPU_MEM_BUDGET` fakes a smaller GPU (a test knob, as in the Python front end): "512M" for every GPU, or
+# "0:512M,1:2G" per device id. K / M / G are 1024-based, a trailing B is allowed ("64KB"), a bare number is bytes. The
+# real figure is what the MAX runtime reports as free on the context's device (`DeviceContext.get_memory_info`); the
+# budget is the smaller of the two, less GPU_HEADROOM_PERCENT kept back (HeavyDB's 90%), so a query's own buffers
+# and the driver's bookkeeping fit beside what omxcore holds.
+comptime GPU_BUDGET_ENV = "MXFRAME_GPU_MEM_BUDGET"
+comptime GPU_FAIL_ENV = "MXFRAME_GPU_FAIL_PIECE"
+comptime GPU_USABLE_PERCENT = 90
+comptime GPU_RETRY_FACTOR_PERCENT = 150          # a remembered out-of-memory shape gets another GPU try once this much more is free
+
+
+def _drop_last(s: String) -> String:
+    return String(s[byte=0 : s.byte_length() - 1])
+
+
+def parse_size(text: String) raises -> Int:
+    """"512M" -> 536870912; "64KB", "2G", "1.5G", "4096" (K, M, G are powers of 1024)."""
+    var t = String(text.strip()).upper()
+    if t.endswith("B") and t.byte_length() > 1:
+        t = _drop_last(t)
+    var unit = 1
+    if t.endswith("K"):
+        unit = 1 << 10
+    elif t.endswith("M"):
+        unit = 1 << 20
+    elif t.endswith("G"):
+        unit = 1 << 30
+    if unit > 1:
+        t = _drop_last(t)
+    if t.byte_length() == 0:
+        raise Error(GPU_BUDGET_ENV + ": `" + text + "` is not a size (try 512M)")
+    try:
+        return Int(Float64(t) * Float64(unit))
+    except:
+        raise Error(GPU_BUDGET_ENV + ": `" + text + "` is not a size (try 512M)")
+
+
+def gpu_budget_override(device_id: Int = 0) -> Int:
+    """The fake size of GPU `device_id` from MXFRAME_GPU_MEM_BUDGET, -1 when none is set. A value that is not a size
+    raises where the budget is first used (`gpu_free_bytes`)."""
+    return _budget_override(device_id)
+
+
+def _budget_override(device_id: Int) -> Int:
+    var raw = getenv(GPU_BUDGET_ENV, "")
+    if raw.byte_length() == 0:
+        return -1
+    var dflt = -1
+    for part in raw.split(","):
+        var at = part.find(":")
+        try:
+            if at >= 0:
+                if Int(String(part[byte=0:at]).strip()) == device_id:
+                    return parse_size(String(part[byte=at + 1:]))
+            else:
+                dflt = parse_size(String(part))
+        except:
+            return -2                                    # (unreadable: `gpu_free_bytes` says so)
+    return dflt
+
+
+def gpu_free_bytes(ctx: DeviceContext) raises -> Int:
+    """Free memory on the context's device, as the MAX runtime reports it, capped by the test override. A device whose
+    runtime does not report memory counts as unlimited."""
+    comptime if HAS_GPU:
+        var free = Int.MAX
+        try:
+            free = Int(ctx.get_memory_info()[0])
+        except:
+            pass
+        var o = _budget_override(Int(ctx.id()))
+        if o == -2:
+            raise Error(GPU_BUDGET_ENV + " is `" + getenv(GPU_BUDGET_ENV, "") + "`: a size like 512M, or 0:512M,1:2G")
+        return free if o < 0 else min(free, o)
+    else:
+        raise Error(NO_GPU_MESSAGE)
+
+
+def gpu_budget(ctx: DeviceContext) raises -> Int:
+    """What one query may hold on the device at once: GPU_USABLE_PERCENT of `gpu_free_bytes`."""
+    var free = gpu_free_bytes(ctx)
+    return free // 100 * GPU_USABLE_PERCENT
+
+
+def human_bytes(n: Int) -> String:
+    """12582912 -> "12.0 MB" for the messages that name a size."""
+    if n < 1024:
+        return String(n) + " B"
+    var units: List[String] = ["KB", "MB", "GB", "TB"]
+    var x = Float64(n)
+    var u = -1
+    while x >= 1024.0 and u < 3:
+        x /= 1024.0
+        u += 1
+    var tenths = Int(x * 10.0 + 0.5)
+    return String(tenths // 10) + "." + String(tenths % 10) + " " + units[u]
 
 
 struct _GpuMemory(Movable):
