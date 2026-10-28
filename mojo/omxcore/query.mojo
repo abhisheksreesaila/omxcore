@@ -40,7 +40,8 @@ from .kernels._fpenv import core_count, par_n
 from .kernels.pipeline_cpu import pipeline_keyed, pipeline_plain, E_OVERFLOW, IP, FP, LP, VEC
 from .kernels.pipeline_gpu import run_pipeline_gpu, _choose_mode, scratch_rows, int_word_program_ok, APPLE_GPU, HDR as GPU_HDR
 from max.gpu.host import DeviceContext, DeviceBuffer
-from .gpu import DeviceTable, HAS_GPU, NO_GPU_MESSAGE, gpu_available, _ScanContext, _scan_context, _stage_load, _stage_data, _stage_valid, _pinned_prepare
+from .gpu import (DeviceTable, HAS_GPU, NO_GPU_MESSAGE, gpu_available, _ScanContext, _scan_context, _stage_load, _stage_range, _stage_data, _stage_valid,
+                  _pinned_prepare, gpu_budget, gpu_capacity, gpu_free_bytes, human_bytes, gpu_fail_piece, INJECTED_OOM, GPU_RETRY_FACTOR_PERCENT)
 from .holistic import (HolStates, HolSpec, HolResult, window_blocks, heap_offer, float_key, A_DISTINCT, A_PCT, A_TOPK, A_MEDIAN,
                        A_VAR_POP, A_VAR_SAMP, A_STDDEV_POP, A_STDDEV_SAMP, A_QEDGE, is_spread, spread_needs)
 from .joincore import JoinKeys, JoinSide, normalize_keys, join_pairs, select_rows, gather_join, JOIN_BUDGET_BYTES
@@ -472,6 +473,7 @@ struct Query(Movable):
             for a in node.aggs:
                 holistic = holistic or a.kind >= A_DISTINCT
         var use_gpu = False
+        var pieced = False
         var fallback = String()
         if device == GPU:
             comptime if not HAS_GPU:
@@ -512,12 +514,50 @@ struct Query(Movable):
         var done = False
         if use_gpu:
             comptime if HAS_GPU:
-                var g = _run_gpu(self.device.value(), self.table, prog, self.overlay.mask, device == GPU, fallback)
-                job.advance(self.table.rows())
-                if g:
-                    r = g.take()
-                    r.device = GPU
+                # F-189: does the working set fit? A table over the budget has no device copy: AUTO answers on the CPU, GPU
+                # uploads row ranges that fit; a resident table's launch needs its buffers (AUTO: the CPU if they do not fit
+                # or an earlier query ran out of memory and not much more is free now; GPU: a readable error)
+                var dt = self.device.value()
+                var ctx = dt.context()
+                var usable = gpu_budget(ctx)
+                var masked = len(self.overlay.mask) > 0
+                var fixed = _gpu_fixed_bytes(ctx, prog, (self.table.rows() + 7) // 8 + 8 if masked else 0)
+                var used = _gpu_columns_used(self.table, prog)
+                var want = fixed + _range_bytes(self.table.rows(), _count_true(used[0]), _count_true(used[1]), False)
+                if not dt.is_resident():
+                    if device == AUTO:
+                        use_gpu = False
+                        fallback = ("the query needs " + human_bytes(want) + " on the GPU (" + String(self.table.rows()) + " rows), over its budget of " +
+                                    human_bytes(usable) + ": AUTO answers on the CPU, compute(GPU) runs it in pieces that fit")
+                    else:
+                        pieced = True
+                elif fixed > usable:
+                    var why = "the query's buffers need " + human_bytes(fixed) + " (" + String(prog.groups) + " groups), over the GPU budget of " + human_bytes(usable)
+                    if device == GPU and fixed > gpu_capacity(ctx):      # (not merely a GPU that other work fills right now: that one is the CPU's)
+                        raise Error("device GPU: " + why)
+                    use_gpu = False
+                    fallback = why^
+                elif device == AUTO and dt.oom_free() > 0 and gpu_free_bytes(ctx) * 100 < dt.oom_free() * GPU_RETRY_FACTOR_PERCENT:
+                    use_gpu = False
+                    fallback = ("an earlier query ran out of GPU memory with " + human_bytes(dt.oom_free()) + " free; AUTO stays on the CPU until " +
+                                human_bytes(dt.oom_free() // 100 * GPU_RETRY_FACTOR_PERCENT) + " is free (" + human_bytes(gpu_free_bytes(ctx)) + " now)")
+        if use_gpu:
+            comptime if HAS_GPU:
+                if pieced:
+                    r = _run_gpu_pieces(self.device.value(), self.table, prog, self.overlay.mask, fallback, job)
                     done = True
+                else:
+                    var g = _run_gpu(self.device.value(), self.table, prog, self.overlay.mask, device == GPU, fallback)
+                    job.advance(self.table.rows())
+                    if g:
+                        r = g.take()
+                        r.device = GPU
+                        r.pieces = 1
+                        r.gpu_pieces = 1
+                        self.device.value().forget_oom()
+                        done = True
+                    elif _is_oom(fallback):
+                        self.device.value().remember_oom(gpu_free_bytes(self.device.value().context()))
         if not done:
             var mask_addr = Int(self.overlay.mask.unsafe_ptr()) if len(self.overlay.mask) > 0 else 0
             if prog.mat:
@@ -544,7 +584,9 @@ struct QueryResult(Movable):
     var sums: List[Int]             # the first sum's values (the spec's `r.sums`), else empty
     var milliseconds: Float64
     var device: Int                 # CPU or GPU: where the kernel ran
-    var fallback_reason: String     # AUTO chose the GPU and the CPU answered instead: why (else "")
+    var fallback_reason: String     # AUTO chose the GPU and the CPU answered instead: why (else ""); GPU: why a piece ran on the CPU
+    var pieces: Int                 # F-189: the row ranges (a table) or row groups (a scan) a GPU query was cut into, 1 for one launch, 0 on the CPU
+    var gpu_pieces: Int             # ... and how many of them ran on the GPU (the rest ran on the CPU, `fallback_reason` says why)
     # count_distinct / percentile / top_k (holistic.mojo): per aggregate its index among the holistic ones, else -1
     var hol_of: List[Int]
     var hvals: List[List[Int]]      # per holistic aggregate: per group, the distinct count or the percentile value
@@ -557,6 +599,8 @@ struct QueryResult(Movable):
 
     def __init__(out self):
         self.device = CPU
+        self.pieces = 0
+        self.gpu_pieces = 0
         self.hol_of = List[Int]()
         self.hvals = List[List[Int]]()
         self.htop = List[List[Int]]()
@@ -1815,25 +1859,84 @@ struct _QueryBuffers(Movable):
         self.mask = ctx.enqueue_create_buffer[DType.uint8](max(mask_len, 1))
 
 
+comptime OOM_PREFIX = "the GPU could not "
+
+
+def _is_oom(why: String) -> Bool:
+    """`fallback` says an allocation failed (as opposed to the kernel declining the program or the size check)."""
+    return why.startswith(OOM_PREFIX)
+
+
+def _gpu_scratch_words(ctx: DeviceContext, p: Program, n_regs: Int, code_len: Int) -> Int:
+    """The per-block partial rows the launch's mode merges (`scratch_rows`), in float64 words: the one figure both the allocation
+    and the budget check use."""
+    var n_blocks = max(ctx.default_device_info.sm_count, 1)
+    var mode = _choose_mode(p.groups, p.n_slots, n_regs, code_len, 0, True)
+    return max(scratch_rows(mode, p.groups, p.n_slots, n_blocks) * (p.n_slots + 1) * p.groups, 1)
+
+
+def _gpu_fixed_bytes(ctx: DeviceContext, p: Program, mask_len: Int) -> Int:
+    """F-189: the device bytes one launch of `p` takes besides the columns: the sizes `_QueryBuffers` allocates."""
+    var ins = p.pred.copy()
+    ins.extend(p.body.copy())
+    ins.extend(p.aggs.copy())
+    var compact = _compact_registers(p.pred_reg, ins)
+    var code_len = GPU_HDR + len(ins)
+    var words = _gpu_scratch_words(ctx, p, compact[0], code_len)
+    return (4 * code_len + 8 * MAX_CONSTS + 8 * max(len(p.cols), 1) + 4 * max(len(p.dtypes), 1) + 8 * p.n_slots + 32
+            + 8 * p.n_slots * p.groups + 8 * p.groups + 8 * words + 8 + max(mask_len, 1))
+
+
+def _gpu_columns_used(t: SharedTable, p: Program) -> Tuple[List[Bool], List[Bool]]:
+    """Which table columns the program reads the values of, and which the validity bitmaps of."""
+    var data = List[Bool](length=t.columns(), fill=False)
+    var valid = List[Bool](length=t.columns(), fill=False)
+    for c in p.cols:
+        if c == -1_000_000 or c == -5_000_000 or c == -4_000_000:
+            continue
+        if c >= 0:
+            data[c] = True
+        else:
+            valid[-1 - c] = True
+    return (data^, valid^)
+
+
+def _range_bytes(rows: Int, nd: Int, nv: Int, masked: Bool) -> Int:
+    """Device bytes of `rows` rows of `nd` value columns, `nv` bitmaps and a mask (a bitmap slice carries 16 spare bytes)."""
+    return nd * 8 * rows + (nv + (1 if masked else 0)) * (rows // 8 + 16)
+
+
+def _mask_slice(mask: List[UInt8], r0: Int, rows: Int) -> List[UInt8]:
+    """Rows [r0, r0 + rows) of the frame mask from bit 0, with 8 spare bytes (always a mask: the program was lowered with one)."""
+    if len(mask) == 0:
+        return List[UInt8]()
+    var out = List[UInt8](length=(rows + 7) // 8 + 8, fill=0xFF)
+    var src = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(mask.unsafe_ptr()))
+    var dst = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(out.unsafe_ptr()))
+    _copy_bits(dst, 0, src, r0, rows)
+    return out^
+
+
 def _run_gpu(dt: DeviceTable, t: SharedTable, p: Program, mask: List[UInt8], strict: Bool, mut fallback: String) raises -> Optional[QueryResult]:
     var data = List[Int]()
     var valid = List[Int]()
     for c in range(t.columns()):
         data.append(dt.data_address(c))
         valid.append(dt.validity_address(c))
-    return _run_gpu_cols(dt.context(), data, valid, t.rows(), t, p, mask, strict, fallback)
+    return _run_gpu_cols(dt.context(), data, valid, t.rows(), t, p, mask, strict, fallback, 1)
 
 
 def _run_gpu_cols(ctx: DeviceContext, data_addr: List[Int], valid_addr: List[Int], n_rows: Int, t: SharedTable, p: Program,
-                  mask: List[UInt8], strict: Bool, mut fallback: String) raises -> Optional[QueryResult]:
+                  mask: List[UInt8], strict: Bool, mut fallback: String, piece: Int = 0) raises -> Optional[QueryResult]:
     """The lowered program on the device table (kernels/pipeline_gpu.mojo, keyed mode: the group id is register 0).
     Same answers as `_run_cpu`: exact int64 totals, the overflow flag raises the same error.
 
-    `strict` (device=GPU) raises on every failure. On AUTO only two things send the query to the CPU, and `fallback`
-    says which: the device cannot hold the query's buffers (an allocation failed), or the kernel declined the
+    Two things send the query to the CPU (None, and `fallback` says which): the device cannot hold the query's buffers
+    (an allocation failed: F-189, on `GPU` too, the caller reruns the piece on the CPU), or the kernel declined the
     program (needs more shared memory than a block has: -5; on an Apple GPU also more groups than its atomic-free
-    modes hold, -6, or an instruction its Int64 word does not run). A launch error, an illegal address or an int64
-    overflow is a bug or an answer: it always raises."""
+    modes hold, -6, or an instruction its Int64 word does not run), which `strict` (device=GPU) raises instead. A launch
+    error, an illegal address or an int64 overflow is a bug or an answer: it always raises. `piece` (> 0): the number
+    `MXFRAME_GPU_FAIL_PIECE` is compared with (a test knob that makes this allocation fail)."""
     var ins = p.pred.copy()
     ins.extend(p.body.copy())
     ins.extend(p.aggs.copy())
@@ -1861,15 +1964,14 @@ def _run_gpu_cols(ctx: DeviceContext, data_addr: List[Int], valid_addr: List[Int
     var n_blocks = max(ctx.default_device_info.sm_count, 1)
     # the per-block partial rows exist only in the modes that merge them (0, 3, 4, and 5 on an Apple GPU): one row of
     # (slots + 1) x groups per block the launch may use (`scratch_rows`). The atomic modes write the output directly.
-    var mode = _choose_mode(G, A, n_regs, len(code), 0, True)
-    var scratch_words = max(scratch_rows(mode, G, A, n_blocks) * (A + 1) * G, 1)
+    var scratch_words = _gpu_scratch_words(ctx, p, n_regs, len(code))
     var made = Optional[_QueryBuffers](None)
     try:
+        if piece > 0 and gpu_fail_piece() == piece:
+            raise Error(INJECTED_OOM)
         made = _QueryBuffers(ctx, len(code), max(len(p.cols), 1), max(len(p.dtypes), 1), A, G, scratch_words, len(mask))
     except e:
-        if strict:
-            raise e^
-        fallback = "the GPU could not allocate the query's buffers: " + String(e)
+        fallback = OOM_PREFIX + "allocate the query's buffers: " + String(e)
         return None
     var b = made.take()
     ref d_code = b.code
@@ -1941,6 +2043,132 @@ def _run_gpu_cols(ctx: DeviceContext, data_addr: List[Int], valid_addr: List[Int
     if ovf[0] != 0:
         raise Error(OVERFLOW_MESSAGE)
     return _make_result(p, out_vals, out_cnt)
+
+
+def _count_true(xs: List[Bool]) -> Int:
+    var n = 0
+    for x in xs:
+        if x:
+            n += 1
+    return n
+
+
+def _adopt_ext(t: SharedTable, ext: List[Int], rows: Int):
+    """A scan's decoded row group lives in the caller's pinned buffers (`ext`), not in `t`: a CPU run gets the values in `t`."""
+    for c in range(t._table[].columns()):
+        var v = List[Int64](unsafe_uninit_length=rows)
+        var src = UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=ext[c])
+        for i in range(rows):
+            v[i] = src[i]
+        t._table[].cols[c].values = v^
+
+
+def _gpu_ranges(addr: Int, ctx: DeviceContext, t: SharedTable, ext: List[Int], p: Program, mask: List[UInt8], rows: Int,
+                mut fallback: String, piece_base: Int, job: JobCtl) raises -> QueryResult:
+    """F-189: the program over rows [0, rows) of `t` (a whole table, or a scan's decoded row group whose values are in `ext`) in row
+    ranges that fit the GPU budget, uploaded and run one after the other on the device `addr` (a `_ScanContext`) is on. Each
+    range's partial is merged with `_merge_partial`, as the windows of the CPU's job runs and a scan's row groups are, so the
+    answer is the CPU's. A range the device cannot hold (an allocation failed) runs on the CPU, and `fallback` says why;
+    a partial total that passes int64 (where the whole may not) is settled by one CPU run of all the rows. The kernel
+    declining the program raises (`device=GPU`). `piece_base` >= 0: range n is piece `piece_base` + n for MXFRAME_GPU_FAIL_PIECE.
+    The range is a multiple of 64 rows, so a bitmap slice starts on a byte."""
+    var usable = gpu_budget(ctx)
+    var masked = len(mask) > 0
+    var used = _gpu_columns_used(t, p)
+    var nd = _count_true(used[0])
+    var nv = _count_true(used[1])
+    var fixed = _gpu_fixed_bytes(ctx, p, 0)
+    var per_row_bits = 64 * nd + nv + (1 if masked else 0)
+    var step = rows
+    var all_cpu = String()
+    if per_row_bits > 0:
+        var room = usable - fixed - (nv + (1 if masked else 0)) * 16
+        step = room * 8 // per_row_bits // 64 * 64 if room > 0 else 0
+        while step > 64 and fixed + _range_bytes(step, nd, nv, masked) > usable:
+            step -= 64
+        step = min(step, rows)
+        if step < 64 and rows > step:
+            var why = ("the GPU budget of " + human_bytes(usable) + " leaves no room for 64 rows of the " + String(nd) +
+                       " columns this query reads, after its " + human_bytes(fixed) + " of buffers")
+            if fixed + _range_bytes(64, nd, nv, masked) > gpu_capacity(ctx):
+                raise Error("device GPU: " + why)
+            all_cpu = why^                               # (the GPU is merely full right now: all the rows run on the CPU)
+            step = rows
+    var ops = _slot_ops(p)
+    var acc = _make_result(p, List[Float64](length=p.n_slots * p.groups, fill=0.0), List[Int64](length=p.groups, fill=0))
+    for sl in range(p.n_slots):
+        acc.slots[sl] = List[Int](length=p.groups, fill=slot_identity(ops[sl]))
+    var mask_addr = Int(mask.unsafe_ptr()) if masked else 0
+    var adopted = False
+    var n = 0
+    var gpu_n = 0
+    var r0 = 0
+    try:
+        while r0 < rows:
+            job.check()
+            var m = min(step, rows - r0)
+            n += 1
+            var why = String()
+            var got = Optional[QueryResult](None)
+            try:
+                if all_cpu.byte_length() > 0:
+                    raise Error(all_cpu)
+                if piece_base >= 0 and gpu_fail_piece() == piece_base + n:
+                    raise Error(INJECTED_OOM)
+                _stage_range(addr, t, used[0], used[1], r0, m, ext)
+            except e:
+                why = OOM_PREFIX + "hold a piece of " + String(m) + " rows: " + String(e)
+            if why.byte_length() == 0:
+                var data = List[Int]()
+                var valid = List[Int]()
+                for c in range(t.columns()):
+                    data.append(_stage_data(addr, c))
+                    valid.append(_stage_valid(addr, c))
+                var ms = _mask_slice(mask, r0, m)
+                got = _run_gpu_cols(ctx, data, valid, m, t, p, ms, True, why)
+                _ = ms^
+                _ = data^, valid^
+            if got:
+                _merge_partial(acc, got.value(), ops)
+                gpu_n += 1
+            else:
+                if fallback.byte_length() == 0:
+                    fallback = why^
+                if len(ext) > 0 and not adopted:
+                    _adopt_ext(t, ext, rows)
+                    adopted = True
+                _merge_partial(acc, _run_cpu(t, p, mask_addr, r0, r0 + m), ops)
+            job.advance(m)
+            r0 += m
+    except e:
+        if String(e) != OVERFLOW_MESSAGE:
+            raise e^
+        if len(ext) > 0 and not adopted:                 # (a partial total passed int64: all the rows in one CPU run decide)
+            _adopt_ext(t, ext, rows)
+        var whole = _run_cpu(t, p, mask_addr, 0, rows)
+        whole.fallback_reason = "a partial total passed the int64 range; the CPU settled the whole"
+        whole.pieces = n
+        return whole^
+    for i in range(len(acc.kinds)):
+        if acc.kinds[i] == A_SUM:
+            acc.sums = acc.slots[acc.slot_of[i]].copy()
+            break
+    acc.device = GPU if gpu_n == n else CPU
+    acc.pieces = n
+    acc.gpu_pieces = gpu_n
+    acc.fallback_reason = fallback.copy()
+    return acc^
+
+
+def _run_gpu_pieces(dt: DeviceTable, t: SharedTable, p: Program, mask: List[UInt8], mut fallback: String, job: JobCtl) raises -> QueryResult:
+    """`compute(GPU)` on a table over the GPU budget (no device copy): `_gpu_ranges` over all its rows on the DeviceTable's device."""
+    var ctx = dt.context()
+    var own = _ScanContext(ctx)
+    var r = _gpu_ranges(own.addr, ctx, t, List[Int](), p, mask, t.rows(), fallback, 0, job)
+    if r.gpu_pieces < r.pieces and _is_oom(fallback):
+        dt.remember_oom(gpu_free_bytes(ctx))
+    _ = own^                                                  # (the buffers live to here)
+    return r^
 
 
 # ── a frame's changed and appended rows, on the CPU ──────────────────────────────────────────────────
@@ -2270,46 +2498,60 @@ def _scan_morsels(scan: ParquetScan, nodes: List[PlanNode], used: List[Int], tod
 
 
 def _run_part_gpu(t: SharedTable, nodes: List[PlanNode], gm: List[UInt8], strict: Bool, ctx_addr: Int,
-                  mut fallback: String, rows: Int, ext: List[Int]) raises -> Optional[QueryResult]:
+                  mut fallback: String, rows: Int, ext: List[Int], piece: Int = 0) raises -> Optional[QueryResult]:
     """One decoded row group of a scan on the GPU: its used columns copied into the scan's device buffers (exact int64,
-    validity bitmaps beside them), the program run in keyed mode and the group's partial result copied back, so the device
+    validity bitmaps beside them), the program run in keyed mode and the group's partial copied back, so the device
     holds one row group of the columns the plan reads. `gm` (F-147): the frame mask slice of the group. None (with
-    `fallback` saying why) when the device could not hold the group or the kernel declined the program and `strict` is
-    off: the caller runs that group on the CPU. The partial has the layout of `_run_part`'s."""
+    `fallback` saying why) when the device could not hold the group, an allocation failed, or the kernel declined the program
+    and `strict` is off: the caller runs that group on the CPU. F-189: a group over the GPU budget runs in row ranges that fit
+    on `GPU` (`strict`: `_gpu_ranges`) and on the CPU on AUTO; an allocation failure is the CPU's on both. The partial has
+    the layout of `_run_part`'s; `.device` says whether it all ran on the GPU. `piece`: this group's number for MXFRAME_GPU_FAIL_PIECE."""
     comptime if HAS_GPU:
         var p = _lower(t, nodes, True, len(gm) > 0)
+        var ctx = _scan_context(ctx_addr)
+        var usable = gpu_budget(ctx)
+        var fixed = _gpu_fixed_bytes(ctx, p, len(gm))
+        var need = fixed + _range_bytes(rows, t.columns(), t.columns(), False)
+        if need > usable:
+            if not strict:
+                fallback = "a row group of " + String(rows) + " rows needs " + human_bytes(need) + " on the GPU, over its budget of " + human_bytes(usable)
+                return None
+            return _gpu_ranges(ctx_addr, ctx, t, ext, p, gm, rows, fallback, -1, JobCtl())
         try:
+            if piece > 0 and gpu_fail_piece() == piece:
+                raise Error(INJECTED_OOM)
             _stage_load(ctx_addr, t, ext, rows)
         except e:
-            if strict:
-                raise e^
-            fallback = "the GPU could not hold a row group of " + String(rows) + " rows: " + String(e)
+            fallback = OOM_PREFIX + "hold a row group of " + String(rows) + " rows: " + String(e)
             return None
         var data = List[Int]()
         var valid = List[Int]()
         for c in range(t.columns()):
             data.append(_stage_data(ctx_addr, c))
             valid.append(_stage_valid(ctx_addr, c))
-        return _run_gpu_cols(_scan_context(ctx_addr), data, valid, rows, t, p, gm, strict, fallback)
+        var g = _run_gpu_cols(ctx, data, valid, rows, t, p, gm, strict, fallback)
+        if g:
+            g.value().device = GPU
+        return g^
     else:
         return None
 
 
 def _run_part_dev(t: SharedTable, nodes: List[PlanNode], mut hs: HolStates, gm: List[UInt8], use_gpu: Bool, strict: Bool,
-                  ctx_addr: Int, mut fallback: String, mut gpu_groups: Int, rows: Int, ext: List[Int], threads: Int = 0) raises -> QueryResult:
-    """A scan's row group on the GPU when the scan runs there (the CPU when the group falls back), else on the CPU. `ext`:
-    the group's values are in these pinned buffers (`read_group_into`), not in `t`, which a CPU run then gets them in."""
-    if use_gpu:
-        var g = _run_part_gpu(t, nodes, gm, strict, ctx_addr, fallback, rows, ext)
+                  ctx_addr: Int, mut fallback: String, mut gpu_groups: Int, rows: Int, ext: List[Int], threads: Int = 0,
+                  piece: Int = 0) raises -> QueryResult:
+    """A scan's row group on the GPU when the scan runs there (the CPU when the group falls back, and for the groups after
+    one whose allocation failed), else on the CPU. `ext`: the group's values are in these pinned buffers
+    (`read_group_into`), not in `t`, which a CPU run then gets them in."""
+    if use_gpu and not _is_oom(fallback):
+        var g = _run_part_gpu(t, nodes, gm, strict, ctx_addr, fallback, rows, ext, piece)
         if g:
-            gpu_groups += 1
+            if g.value().device == GPU:
+                gpu_groups += 1
             return g.take()
-        for c in range(t._table[].columns()):                # the CPU takes the group: its values go into the table
-            var v = List[Int64](unsafe_uninit_length=rows)
-            var src = UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=ext[c])
-            for i in range(rows):
-                v[i] = src[i]
-            t._table[].cols[c].values = v^
+        _adopt_ext(t, ext, rows)                            # the CPU takes the group: its values go into the table
+    elif use_gpu:
+        _adopt_ext(t, ext, rows)
     return _run_part(t, nodes, hs, Int(gm.unsafe_ptr()) if len(gm) > 0 else 0, threads)
 
 
@@ -2433,6 +2675,26 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int, orig: L
             use_gpu = True
     var gown = _ScanContext(use_gpu)                          # frees the device context on every way out of this function
     var gctx = gown.addr
+    if use_gpu and device == AUTO:
+        # F-189: AUTO keeps a file on the CPU when one row group of the columns it reads does not fit the GPU budget (GPU would cut
+        # the group into row ranges), or an earlier query on this file ran out of GPU memory and not much more is free now
+        comptime if HAS_GPU:
+            var ctx = _scan_context(gctx)
+            var usable = gpu_budget(ctx)
+            var biggest = 0
+            for g in range(scan.row_groups()):
+                biggest = max(biggest, scan.group_rows(g))
+            var need = _gpu_fixed_bytes(ctx, shape, (biggest + 7) // 8 + 8 if len(o.mask) > 0 else 0) + _range_bytes(biggest, len(used), len(used), False)
+            var free = gpu_free_bytes(ctx)
+            if need > usable:
+                why = "a row group of " + String(biggest) + " rows needs " + human_bytes(need) + " on the GPU, over its budget of " + human_bytes(usable) + ": AUTO answers on the CPU"
+            elif scan.gpu_oom_free() > 0 and free * 100 < scan.gpu_oom_free() * GPU_RETRY_FACTOR_PERCENT:
+                why = ("an earlier query ran out of GPU memory with " + human_bytes(scan.gpu_oom_free()) + " free; AUTO stays on the CPU until " +
+                       human_bytes(scan.gpu_oom_free() // 100 * GPU_RETRY_FACTOR_PERCENT) + " is free (" + human_bytes(free) + " now)")
+            if why.byte_length() > 0:
+                use_gpu = False
+                gown = _ScanContext(False)
+                gctx = 0
     var gpu_groups = 0
     var ops = _slot_ops(shape)                                  # how each kernel slot merges
     var acc = QueryResult()
@@ -2510,6 +2772,7 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int, orig: L
         if use_gpu and ix + 1 < len(todo):       # the next group decodes into the other set of pinned buffers
             ext_nxt = _pinned_prepare(gctx, (ix + 1) % 2, len(used), scan.group_rows(todo[ix + 1]))
         var rows_cur = scan.group_rows(todo[ix])
+        var piece_no = ix + 1                    # (MXFRAME_GPU_FAIL_PIECE counts the groups that run, from 1)
         if ix + 1 < len(todo):
             # group ix + 1 decodes while the kernel aggregates group ix (two groups in memory); a serial build runs the
             # two tasks one after the other. The partials are still merged below in row-group order.
@@ -2540,7 +2803,7 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int, orig: L
                             Pointer[List[UInt8], MutUntrackedOrigin](unsafe_from_address=gmp)[], use_gpu, device == GPU, gctx,
                             Pointer[String, MutUntrackedOrigin](unsafe_from_address=whyp)[],
                             Pointer[Int, MutUntrackedOrigin](unsafe_from_address=ggp)[], rows_cur,
-                            Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=extc)[], threads)
+                            Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=extc)[], threads, piece_no)
                     except e:
                         Pointer[String, MutUntrackedOrigin](unsafe_from_address=e0p)[] = String(e)
                 else:
@@ -2561,7 +2824,7 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int, orig: L
                 raise Error(e0)
             pending = e1^                            # the next group's decode error waits until this group is merged
         else:
-            r = _run_part_dev(part, nodes, hs, gm, use_gpu, device == GPU, gctx, why, gpu_groups, rows_cur, ext_cur, threads)
+            r = _run_part_dev(part, nodes, hs, gm, use_gpu, device == GPU, gctx, why, gpu_groups, rows_cur, ext_cur, threads, piece_no)
         _ = part^
         _ = gm^
         cur = nxt^
@@ -2603,6 +2866,14 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int, orig: L
         if out.kinds[i] == A_SUM:
             out.sums = out.slots[out.slot_of[i]].copy()
             break
+    if use_gpu:
+        comptime if HAS_GPU:
+            if _is_oom(why):                                      # F-189: remembered on the file, for AUTO's next query
+                scan.remember_gpu_oom(gpu_free_bytes(_scan_context(gctx)))
+            elif scan.gpu_oom_free() > 0 and gpu_groups == len(todo_all):
+                scan.forget_gpu_oom()
+        out.pieces = len(todo_all)
+        out.gpu_pieces = gpu_groups
     _ = gown^                                                 # (kept alive to here: the groups above use its address)
     out.device = GPU if use_gpu and gpu_groups == len(todo_all) else CPU
     out.fallback_reason = why^
