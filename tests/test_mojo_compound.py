@@ -116,7 +116,9 @@ def test_derived_table_without_an_alias(mx, data):
 
 def test_derived_table_is_shown_in_explain(mx, data):
     text = plan(mx, data, "SELECT * FROM (SELECT id, k FROM t) x WHERE k > 2")
-    assert "derived table x: evaluated in place (300 rows)" in text
+    assert "derived table x: inlined into the query that reads it" in text
+    text = plan(mx, data, "SELECT * FROM (SELECT k, count(*) c FROM t GROUP BY k) x WHERE c > 5")
+    assert "derived table x: evaluated in place (8 rows)" in text
 
 
 CTES = {
@@ -143,14 +145,17 @@ def test_cte_equals_duckdb(mx, data, name, f, mode):
 
 def test_a_cte_read_once_is_inlined_and_read_twice_materialized_once(mx, data):
     once = plan(mx, data, "WITH a AS (SELECT id, k FROM t) SELECT k FROM a WHERE id < 5")
-    assert "CTE a: inlined into its one read (300 rows)" in once
+    assert "CTE a: inlined into the query that reads it (its filter and columns merged, nothing materialized)" in once
+    assert "CTE a: materialized" not in once and "source: t (table), 300 rows" in once
+    not_merged = plan(mx, data, "WITH a AS (SELECT k, count(*) c FROM t GROUP BY k) SELECT k FROM a WHERE c > 5")
+    assert "CTE a: inlined into its one read (8 rows)" in not_merged
     twice = plan(mx, data, "WITH a AS (SELECT id, k FROM t) SELECT x.id FROM a x JOIN a y ON x.k = y.k")
     assert "CTE a: materialized once (2 reads, 300 rows)" in twice
     assert twice.count("CTE a:") == 1
     forced = plan(mx, data, "WITH a AS MATERIALIZED (SELECT id FROM t) SELECT id FROM a")
     assert "CTE a: materialized once (1 reads, 300 rows)" in forced
     unforced = plan(mx, data, "WITH a AS NOT MATERIALIZED (SELECT id FROM t) SELECT id FROM a")
-    assert "CTE a: inlined into its one read (300 rows)" in unforced
+    assert "CTE a: inlined into the query that reads it" in unforced
 
 
 def test_a_cte_name_shadows_a_table_and_a_cte_of_an_inner_query_shadows_it(mx, data):
@@ -193,6 +198,8 @@ SUBQUERIES = {
     "in-or": "SELECT id FROM t WHERE k IN (SELECT k FROM u WHERE {f}) OR id < 3",
     "in-group-by-having": "SELECT id FROM t WHERE k IN (SELECT k FROM u WHERE {f} GROUP BY k HAVING count(*) > 5)",
     "in-beside-a-join": "SELECT t.id, u.uid FROM t JOIN u ON t.k = u.k WHERE t.v IN (SELECT w FROM u WHERE {f})",
+    "in-expression-on-the-left": "SELECT id FROM t WHERE id + 0 IN (SELECT uid FROM u WHERE {f})",
+    "not-in-expression-on-the-left": "SELECT id FROM t WHERE id * 2 NOT IN (SELECT uid FROM u WHERE {f} AND uid IS NOT NULL)",
     "in-two-subqueries": "SELECT id FROM t WHERE k IN (SELECT k FROM u WHERE {f}) AND v NOT IN (SELECT w FROM u WHERE w IS NOT NULL AND {f})",
     "in-derived-inner": "SELECT id FROM t WHERE k IN (SELECT k FROM (SELECT k, count(*) c FROM u WHERE {f} GROUP BY k) x WHERE c > 2)",
     # EXISTS
@@ -449,3 +456,101 @@ def test_qualify_equals_duckdb(mx, data, name, f, mode):
 
 def test_qualify_over_a_csv_file(mx, data):
     q(mx, data, "csv", "SELECT id, k FROM t QUALIFY row_number() OVER (PARTITION BY k ORDER BY id) = 1")
+
+
+# ── a compound query written to a Parquet file: only the last statement's rows go to the file ────
+
+def test_a_compound_query_into_a_parquet_file_with_inner_sorts_that_spill(mx, data, tmp_path):
+    sql = ("WITH a AS (SELECT id, k, v FROM t WHERE id >= 0 ORDER BY v, id) "
+           "SELECT x.id, x.v FROM (SELECT id, v FROM a ORDER BY id DESC) x WHERE x.id IN (SELECT id FROM a WHERE k > 2) ORDER BY x.v NULLS LAST, x.id")
+    out = tmp_path / "out.parquet"
+    run_mx(mx, ["sql", "--format", "parquet", "--out", str(out), "--sort-budget", "1024", "--sort-run-rows", "40", "--spill-dir", str(tmp_path), sql],
+           {"t": data["paths"]["t"]})
+    got = duckdb.connect().execute(f"select * from read_parquet('{out}')").fetchall()
+    want = data["con"].execute(sql).fetchall()
+    assert got == want and len(got) > 50
+
+
+# ── more shapes ──────────────────────────────────────────────────────────────────────────────────
+
+MORE = {
+    "star-with-a-correlated-inequality": "SELECT * FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k AND u.w > t.v AND {f})",
+    "star-with-a-scalar": "SELECT * FROM t WHERE v < (SELECT avg(w) FROM u WHERE u.k = t.k AND {f}) AND id < 100",
+    "between-two-scalars": "SELECT id FROM t WHERE v BETWEEN (SELECT min(w) FROM u WHERE {f}) AND (SELECT max(w) FROM u WHERE {f})",
+    "derived-with-a-subquery-inside": "SELECT count(*) FROM (SELECT id FROM t WHERE k IN (SELECT k FROM u WHERE {f}) AND v > (SELECT avg(w) FROM u WHERE u.k = t.k)) x",
+    "subquery-over-a-cte": "WITH a AS (SELECT k, w FROM u WHERE {f}) SELECT id FROM t WHERE v > (SELECT avg(w) FROM a WHERE a.k = t.k) OR id < 0",
+    "correlated-through-a-cte-read-twice": "WITH a AS (SELECT k, w FROM u WHERE {f}) SELECT id FROM t WHERE EXISTS (SELECT 1 FROM a WHERE a.k = t.k) AND v >= (SELECT max(w) FROM a WHERE a.k = t.k)",
+    "having-with-a-scalar": "SELECT k, sum(v) FROM t GROUP BY k HAVING sum(v) > (SELECT sum(w) FROM u WHERE {f}) / 3",
+    "order-by-on-a-subquery-result": "SELECT id FROM t WHERE k IN (SELECT k FROM u WHERE {f}) ORDER BY v NULLS LAST, id LIMIT 5",
+    "two-tables-two-correlated-conditions": ("SELECT t.id, u.uid FROM t JOIN u ON t.k = u.k WHERE EXISTS (SELECT 1 FROM u u2 WHERE u2.k = t.k AND u2.w <> u.w) "
+                                              "AND t.v > (SELECT avg(w) FROM u u3 WHERE u3.k = u.k AND {f})"),
+}
+MORE_ORDERED = {"order-by-on-a-subquery-result"}
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("f", FILTERS)
+@pytest.mark.parametrize("name", list(MORE))
+def test_more_subquery_shapes_equal_duckdb(mx, data, name, f, mode):
+    q(mx, data, mode, MORE[name].format(f=f), ordered=name in MORE_ORDERED)
+
+
+def test_star_next_to_a_correlated_subquery_over_several_tables_raises_by_name(mx, data):
+    msg = error_of(mx, data, "SELECT * FROM t JOIN u ON t.k = u.k WHERE EXISTS (SELECT 1 FROM u u2 WHERE u2.k = t.k AND u2.w <> u.w)")
+    assert "`*` in a query with a correlated subquery over several tables is not supported yet" in msg
+
+
+def test_explain_analyze_of_a_compound_query(mx, data):
+    out = run_mx(mx, ["explain", "--analyze", "--format", "json", "--stream", "never", "WITH a AS (SELECT id, k FROM t) SELECT x.id FROM a x JOIN a y ON x.k = y.k"],
+                 {"t": data["paths"]["t"]})
+    text = "\n".join(out["plan"])
+    assert "CTE a: materialized once (2 reads, 300 rows)" in text and "result:" in text
+
+
+# ── inlining: a derived table or CTE that only filters and projects is merged into the query that reads it ───────
+
+def names_of(mx, data, sql):
+    files = {t: data["paths"][t] for t in tables_of(sql)}
+    return [c["name"] for c in run_mx(mx, ["sql", "--stream", "never", sql], files)["columns"]]
+
+
+# (the query, the same query with an ORDER BY inside the derived table, which keeps it from being merged: it is evaluated first, and names its columns by the engine's own rules)
+INLINED = [
+    ("SELECT a, b + 1, a * 2 AS c, sum(a) AS sa FROM (SELECT id AS a, v AS b FROM t WHERE id < 50) x GROUP BY a, b",
+     "SELECT a, b + 1, a * 2 AS c, sum(a) AS sa FROM (SELECT id AS a, v AS b FROM t WHERE id < 50 ORDER BY id) x GROUP BY a, b"),
+    ("SELECT x.a, upper(x.s), count(*) FROM (SELECT id AS a, s FROM t WHERE k = 2) x GROUP BY x.a, x.s",
+     "SELECT x.a, upper(x.s), count(*) FROM (SELECT id AS a, s FROM t WHERE k = 2 ORDER BY id) x GROUP BY x.a, x.s"),
+    ("SELECT a, sum(b) AS total, count(*) FROM (SELECT id AS a, v AS b FROM t WHERE id < 50) x GROUP BY a",
+     "SELECT a, sum(b) AS total, count(*) FROM (SELECT id AS a, v AS b FROM t WHERE id < 50 ORDER BY id) x GROUP BY a"),
+    ("SELECT * FROM (SELECT id, v * 2 AS dv FROM t WHERE id < 5) x", "SELECT * FROM (SELECT id, v * 2 AS dv FROM t WHERE id < 5 ORDER BY id) x"),
+    ("SELECT x.* FROM (SELECT id, v * 2 AS dv FROM t WHERE id < 5) x", "SELECT x.* FROM (SELECT id, v * 2 AS dv FROM t WHERE id < 5 ORDER BY id) x"),
+    ("WITH a AS (SELECT id AS i, k FROM t WHERE v > 0) SELECT i, k, i + k FROM a WHERE i < 30 ORDER BY i",
+     "WITH a AS (SELECT id AS i, k FROM t WHERE v > 0 ORDER BY id) SELECT i, k, i + k FROM a WHERE i < 30 ORDER BY i"),
+    ("SELECT dv, dv + 1 FROM (SELECT v * 2 AS dv FROM t) WHERE dv > 10 ORDER BY dv, 2 LIMIT 5",
+     "SELECT dv, dv + 1 FROM (SELECT v * 2 AS dv FROM t ORDER BY id) WHERE dv > 10 ORDER BY dv, 2 LIMIT 5"),
+]
+
+
+@pytest.mark.parametrize("sql,materialized", INLINED)
+def test_an_inlined_query_keeps_the_column_names_it_would_have_had(mx, data, sql, materialized):
+    assert "inlined into the query that reads it" in plan(mx, data, sql)
+    assert "inlined into the query that reads it" not in plan(mx, data, materialized)
+    assert names_of(mx, data, sql) == names_of(mx, data, materialized)
+    q(mx, data, "memory", sql, ordered="ORDER BY" in sql)
+
+
+def test_an_unaliased_aggregate_over_a_derived_column_is_not_merged_so_its_name_is_kept(mx, data):
+    sql = "SELECT sum(a), max(b) FROM (SELECT id AS a, v AS b FROM t) x"
+    assert "inlined into the query that reads it" not in plan(mx, data, sql)
+    assert names_of(mx, data, sql) == ["sum(a)", "max(b)"]
+
+
+def test_a_column_the_derived_table_does_not_have_is_an_error_not_the_source_column(mx, data):
+    assert "column `s` not found" in error_of(mx, data, "SELECT s FROM (SELECT id FROM t) x")
+    assert "column `s` not found" in error_of(mx, data, "WITH a AS (SELECT id FROM t) SELECT s FROM a")
+
+
+def test_an_inlined_scan_streams_with_the_filter_pushed_into_it(mx, data):
+    out = run_mx(mx, ["sql", "--stream", "always", "SELECT count(*) FROM (SELECT id, k FROM t WHERE id >= 200) x WHERE k = 3"], {"t": data["paths"]["t"]})
+    assert any(n.startswith("ran: scan t") for n in out["notes"]), out["notes"]
+    assert out["rows"] == [[sum(1 for i in range(200, 300) if i % 11 != 0 and i % 7 == 3)]]

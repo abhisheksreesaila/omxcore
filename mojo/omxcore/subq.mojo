@@ -522,6 +522,10 @@ def flatten(mut st: SqlStatement, sc: Scope, mut flat: Flat) raises:
     """Names every column the statement reads once, in a table of its own: the select items without an alias keep the name they would have had, every
     column reference loses its qualifier (and gets a `name_2` when two tables have a column of one name)."""
     flat.scope = sc.copy()
+    var skip = List[Bool](length=len(st.exprs), fill=False)                     # the references that mean a subquery's own table keep their names
+    for sub in st.subs:
+        for e in sub.inner:
+            skip[e] = True
     # the names the select items would show, before any reference changes
     var shown = List[String]()
     for it in st.items:
@@ -539,7 +543,7 @@ def flatten(mut st: SqlStatement, sc: Scope, mut flat: Flat) raises:
         else:
             shown[k] = st.render(it.expr)
     for e in range(len(st.exprs)):
-        if st.exprs[e].kind != X_COL:
+        if st.exprs[e].kind != X_COL or skip[e]:
             continue
         var f = find_entry(sc, st.exprs[e].text2, st.exprs[e].text)
         if f[0] < 0:
@@ -576,6 +580,7 @@ def flatten(mut st: SqlStatement, sc: Scope, mut flat: Flat) raises:
 def flat_source(st: SqlStatement, flat: Flat, plain: List[Int]) -> SqlStatement:
     """The statement that makes the flat table: the columns, over the FROM and join of `st` as it was before `flatten`, filtered by the conjuncts `plain`."""
     var t0 = clone_shell(st)
+    t0.wins = List[WinSpec]()
     var names = List[String]()
     var exprs = List[Int]()
     for j in range(len(flat.name)):

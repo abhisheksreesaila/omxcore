@@ -345,8 +345,12 @@ struct SubQuery(Copyable, Movable):
     var col: Int
     var sel: Int                # the selected expression, -1 for `*`
     var where: Int              # -1 for none
+    var inner: List[Int]        # F-159: the column references of `sel` and `where` that mean the subquery's own table (a rewrite of the outer statement's names leaves them alone)
+    var outer: List[Int]        # ... and the ones that mean the outer statement's (they follow its renames)
 
     def __init__(out self):
+        self.inner = List[Int]()
+        self.outer = List[Int]()
         self.table = String()
         self.alias = String()
         self.is_file = False
@@ -1831,7 +1835,7 @@ def parse_sql(text: String) raises -> SqlStatement:
 
 
 def query_files(q: SqlQuery) -> List[String]:
-    """The file names ('orders.parquet') the query reads in any FROM, once each, in the order they appear."""
+    """The file names ('orders.parquet') the query reads in any FROM, once each (the statements in the order of the query's store: a subquery before the statement that holds it)."""
     var out = List[String]()
     for i in range(len(q.stmts)):
         ref st = q.stmts[i]

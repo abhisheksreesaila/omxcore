@@ -85,6 +85,13 @@ window step (`window.mojo`: a stable radix sort, partitions on the thread pool, 
 Rules, refusals and timings: `docs/omxcore-mojo-api.md` (Window functions). Tests: `mojo/tests/test_window.mojo`, `mojo/tests/test_window_builder.mojo`, `tests/test_mojo_window.py` (100+ queries against DuckDB over a table,
 a streamed file, an edited Frame and an edited stream).
 
+## WITH, subqueries, UNION, QUALIFY, views (F-159)
+
+`WITH`, `FROM (SELECT ...)`, scalar / `IN` / `EXISTS` subqueries (correlated ones are decorrelated into a derived table and a join), `UNION [ALL]` / `INTERSECT` / `EXCEPT`, `QUALIFY` (so a window's result can be
+filtered) and `Catalog.view(name, sql)`. `sql.mojo` parses a query into a store of statements (`SqlQuery`), `sqlquery.mojo` runs the ones that are not one plain SELECT on a copy of the catalog (each step's result a source under
+an internal name) and hands every statement to the existing engine; `subq.mojo` takes correlated subqueries apart, `setops.mojo` puts two result tables together. Rules, refusals, costs: `docs/omxcore-mojo-api.md` (WITH, derived
+tables, subqueries...). Tests: `mojo/tests/test_sqlquery.mojo`, `tests/test_mojo_compound.py` (about 580 runs against DuckDB, TPC-H Q2, Q4, Q17, Q18, Q20, Q21, Q22).
+
 ## `mx`, the agent command line (F-151)
 
 `mojo/cli/mx.mojo` is `mx sql | explain | schema` over the SQL above: JSON in, JSON out, exit 1 for a query error and 2 for a usage error

@@ -15,11 +15,11 @@ Each statement then goes to the engine as the one-SELECT statement it was before
 """
 from std.time import perf_counter_ns
 from .table import Table, SharedTable, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, F32_COLUMN
-from .sql import (SqlStatement, SqlQuery, SqlExpr, SelectItem, TableRef, Cte, SubQuery, OrderItem, parse_query, sql_error, lower_ascii, EXPLAIN_NONE, EXPLAIN_ANALYZE,
+from .sql import (SqlStatement, SqlQuery, SqlExpr, SelectItem, TableRef, WinSpec, Cte, SubQuery, OrderItem, parse_query, sql_error, lower_ascii, EXPLAIN_NONE, EXPLAIN_ANALYZE,
                   SET_NONE, SET_UNION_ALL, SET_UNION, SET_INTERSECT, SET_EXCEPT, CTE_AUTO, CTE_MATERIALIZED, CTE_INLINED,
                   X_SCALAR_Q, X_IN_Q, X_EXISTS_Q, X_SUBIN, X_EXISTS, X_NOT, X_COL, X_INT, X_NULL, X_CAST, X_TRUE, X_FALSE, X_IN, X_BIN, X_CALL, X_ISBOOL, JK_INNER, JK_LEFT)
 from .bind import Catalog, _split_and_expr, _and_chain, _has_aggregate
-from .subq import (Scope, scope_of, Flat, flatten, flat_source, clone_shell, collect, is_subquery_node, add_node, column_node, equal_node, and_node,
+from .subq import (SIDE_OUTER, side_of, Scope, scope_of, Flat, flatten, flat_source, clone_shell, collect, is_subquery_node, add_node, column_node, equal_node, and_node,
                    copy_expr, set_literal, set_typed_null, literal_node, statement_is_correlated, analyze, build_exists_source, build_value_source, group_by_keys, key_name)
 from .setops import union_all
 from .planner import Planner, RulePlanner, PlannerOptions
@@ -284,10 +284,11 @@ def _count_uses_in(run: QueryRun, st: SqlStatement, name: String) -> Int:
 
 def _exec_body[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: SqlStatement, planner: P, opts: PlannerOptions,
                            explain: Int) raises -> SqlResult:
-    var t0 = perf_counter_ns()
+    var inner = opts.copy()                                    # (the sink of sql_to_parquet takes the last statement's rows only)
+    inner.sink = None
     if st.set_op != SET_NONE:
-        var left = exec_statement(run, catalog, st.set_left, planner, opts)
-        var right = exec_statement(run, catalog, st.set_right, planner, opts)
+        var left = exec_statement(run, catalog, st.set_left, planner, inner)
+        var right = exec_statement(run, catalog, st.set_right, planner, inner)
         var lt = left.take_table()
         var rt = right.take_table()
         var names = List[String]()
@@ -301,7 +302,7 @@ def _exec_body[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: SqlS
         var plain_union = op == SET_UNION_ALL and len(st.order_by) == 0 and st.limit < 0 and st.offset == 0
         var nrows = combined.rows()
         if op != SET_UNION_ALL:
-            combined = distinct_rows(run, catalog, combined^, names, op, rt.rows(), planner, opts)
+            combined = distinct_rows(run, catalog, combined^, names, op, rt.rows(), planner, inner)
         run.steps.append(_set_name(op) + ": " + _commas(nrows) + " rows in, " + _commas(combined.rows()) + " out")
         if plain_union or (len(st.order_by) == 0 and st.limit < 0 and st.offset == 0):
             var out = SqlResult()
@@ -314,12 +315,13 @@ def _exec_body[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: SqlS
         st.table_alias = String()
         st.table_is_file = False
         st.items.append(SelectItem(-1, String(), False, line, col, True))
-    _resolve_slots(run, catalog, st, planner, opts)
-    var steps = lower_subqueries(run, catalog, st, planner, opts)
+    _ = try_inline(run, catalog, st, planner, inner)
+    _resolve_slots(run, catalog, st, planner, inner)
+    var steps = lower_subqueries(run, catalog, st, planner, inner)
     if len(steps) > 0:
-        return run_stages(run, catalog, st^, steps^, planner, opts, explain)
+        return run_stages(run, catalog, st^, steps^, planner, inner, opts, explain)
     if st.qualify >= 0:
-        return qualify_run(run, catalog, st^, planner, opts, explain)
+        return qualify_run(run, catalog, st^, planner, inner, opts, explain)
     var r = run_plain_explained(run, catalog, st^, planner, opts, explain)
     return r^
 
@@ -440,7 +442,7 @@ def distinct_rows[P: Planner](mut run: QueryRun, mut catalog: Catalog, var combi
 
 
 def qualify_run[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: SqlStatement, planner: P, opts: PlannerOptions,
-                            explain: Int) raises -> SqlResult:
+                            final_opts: PlannerOptions, explain: Int) raises -> SqlResult:
     """`QUALIFY cond`: the select list and the condition are computed with their window functions, the rows whose condition is true stay, and DISTINCT, ORDER BY,
     LIMIT and OFFSET run over what stays (a query over the first one's table, like any filter on a window result)."""
     var q = st.qualify
@@ -516,7 +518,7 @@ def qualify_run[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: Sql
         text += " LIMIT " + String(limit)
     if offset > 0:
         text += " OFFSET " + String(offset)
-    return sql_with(catalog, text, planner, opts)
+    return sql_with(catalog, text, planner, final_opts)
 
 
 # ── subqueries ───────────────────────────────────────────────────────────────────────────────────────
@@ -588,7 +590,7 @@ def _substitute[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st: Sql
         return
     if t.rows() > MAX_IN_LIST:
         raise sql_error(line, col, "IN (SELECT ...) here returned " + _commas(t.rows()) + " rows, more than the " + _commas(MAX_IN_LIST) +
-                        " a list in a value position takes (as a condition of WHERE next to nothing else it is a semi join)")
+                        " a list takes (a column on the left of IN, in a condition of WHERE, makes it a semi join)")
     var items = List[Int]()
     for r in range(t.rows()):
         items.append(literal_node(st, t, r, 0, line, col))
@@ -629,9 +631,11 @@ def _is_simple(k: SqlStatement) -> Bool:
     return True
 
 
-def _native_sub(mut st: SqlStatement, k: SqlStatement, n: Int, with_item: Bool) -> Int:
-    """The subquery as F-154 reads it: its table, its selected expression (IN) and its WHERE, copied into the statement's pool."""
+def _native_sub(mut st: SqlStatement, k: SqlStatement, n: Int, with_item: Bool, inner: Scope, outer: Scope) -> Int:
+    """The subquery as F-154 reads it: its table, its selected expression (IN) and its WHERE, copied into the statement's pool. The references that mean the
+    subquery's table and the ones that mean the outer statement's are told apart (`SubQuery.inner`, `.outer`)."""
     var sub = SubQuery()
+    var first = len(st.exprs)
     sub.table = k.table
     sub.alias = k.table_alias
     sub.line = st.exprs[n].line
@@ -640,6 +644,12 @@ def _native_sub(mut st: SqlStatement, k: SqlStatement, n: Int, with_item: Bool) 
         sub.sel = copy_expr(k, k.items[0].expr, st)
     if k.where >= 0:
         sub.where = copy_expr(k, k.where, st)
+    for e in range(first, len(st.exprs)):
+        if st.exprs[e].kind == X_COL:
+            if side_of(st.exprs[e], inner, outer) == SIDE_OUTER:
+                sub.outer.append(e)
+            else:
+                sub.inner.append(e)
     st.subs.append(sub^)
     return len(st.subs) - 1
 
@@ -650,7 +660,7 @@ def _native_in[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st: SqlS
     var line = st.exprs[n].line
     var col = st.exprs[n].col
     if _is_simple(run.stmts[kid]) and not run.stmts[kid].items[0].star:
-        var at = _native_sub(st, run.stmts[kid], n, True)
+        var at = _native_sub(st, run.stmts[kid], n, True, scope_of(run.stmts[kid], catalog), Scope())
         st.exprs[n].kind = X_SUBIN
         st.exprs[n].items = List[Int]()
         st.exprs[n].items.append(at)
@@ -688,7 +698,7 @@ def _correlated_exists[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut 
             if run.stmts[kid].exprs[ke].kind != X_COL:
                 bare = False
         if cor0.theta_in < 0 and bare:                                          # equalities between columns only: F-154's semi (anti) join takes the subquery as it is
-            var at = _native_sub(st, run.stmts[kid], n, False)
+            var at = _native_sub(st, run.stmts[kid], n, False, inner0, sc)
             st.exprs[n].kind = X_EXISTS
             st.exprs[n].items = List[Int]()
             st.exprs[n].items.append(at)
@@ -887,8 +897,8 @@ def lower_subqueries[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st
             if correlated[j]:
                 raise sql_error(st.exprs[n].line, st.exprs[n].col, "a correlated subquery outside WHERE is not supported yet")
             _substitute(run, catalog, st, n, planner, opts)
-        elif not correlated[j] and not (form_node[ci] == n and st.exprs[n].kind == X_IN_Q):
-            _substitute(run, catalog, st, n, planner, opts)
+        elif not correlated[j] and not (form_node[ci] == n and st.exprs[n].kind == X_IN_Q and st.exprs[st.exprs[n].a].kind == X_COL):
+            _substitute(run, catalog, st, n, planner, opts)         # (an IN whose left side is no column cannot be a semi join: its values become a list)
     var plain = List[Int]()
     for ci in range(len(conj)):
         var rest = List[Int]()
@@ -933,7 +943,7 @@ def _shown(table: String, alias: String) -> String:
 
 
 def run_stages[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: SqlStatement, var steps: List[Step], planner: P, opts: PlannerOptions,
-                           explain: Int) raises -> SqlResult:
+                           final_opts: PlannerOptions, explain: Int) raises -> SqlResult:
     """The statement with correlated subqueries, one step at a time over the outer rows: with several tables the outer rows are first made one table; each step is a
     query over the table the step before made (joined with its D when it has one); the last step joins the statement's own query."""
     var plain = List[Int]()
@@ -949,6 +959,9 @@ def run_stages[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: SqlS
         var rows0 = r0.table.rows()
         var name0 = register_result(run, catalog, r0, "__t")
         run.steps.append("outer tables read by a subquery: " + name0 + " (" + _commas(rows0) + " rows)")
+        for si in range(len(st.subs)):                                          # a subquery's outer references name the flat table (its own columns may share a name)
+            for e in st.subs[si].outer:
+                st.exprs[e].text2 = name0
         st.table = name0
         st.table_alias = String()
         st.table_is_file = False
@@ -969,7 +982,7 @@ def run_stages[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: SqlS
     var stages = len(steps) - (1 if merge_last else 0)
     for i in range(stages):
         var stage = clone_shell(st)
-        stage.subs = st.subs.copy()
+        stage.wins = List[WinSpec]()
         var shown = _shown(st.table, st.table_alias)
         stage.items.append(SelectItem(-1, shown if (steps[i].d.byte_length() > 0) else String(), False, st.table_line, st.table_col, True))
         stage.table_alias = st.table_alias
@@ -1004,7 +1017,181 @@ def run_stages[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: SqlS
             st.join_kind = JK_LEFT if steps[last].left else JK_INNER
             st.join_on = steps[last].join_on
     st.where = _and_chain(st, rest)
-    return run_plain_explained(run, catalog, st^, planner, opts, explain)
+    return run_plain_explained(run, catalog, st^, planner, final_opts, explain)
+
+
+# ── inlining ─────────────────────────────────────────────────────────────────────────────────────────
+
+def _inlinable(k: SqlStatement) -> Bool:
+    """A derived table or CTE that is only a filter and a projection of one source: `SELECT cols | expressions FROM t [WHERE p]`."""
+    if k.set_op != SET_NONE or len(k.ctes) > 0 or k.has_right or len(k.extra) > 0 or k.table_kid >= 0 or k.join_on >= 0:
+        return False
+    if len(k.group_by) > 0 or k.having >= 0 or k.distinct or len(k.order_by) > 0 or k.limit >= 0 or k.offset > 0 or len(k.wins) > 0 or k.qualify >= 0:
+        return False
+    for i in range(len(k.exprs)):
+        if is_subquery_node(k.exprs[i].kind):
+            return False
+    for it in k.items:
+        if it.star:
+            if len(k.items) != 1 or it.alias.byte_length() > 0:
+                return False
+        elif _has_aggregate(k, it.expr):
+            return False
+    if k.where >= 0 and _has_aggregate(k, k.where):
+        return False
+    return True
+
+
+def _out_name(k: SqlStatement, i: Int) -> String:
+    """The name the select item `i` of a query shows (the binder's rule: the alias, a column's own name, else the expression as written)."""
+    ref it = k.items[i]
+    if it.has_alias:
+        return it.alias
+    if k.exprs[it.expr].kind == X_COL:
+        return k.exprs[it.expr].text
+    return k.render(it.expr)
+
+
+def try_inline[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st: SqlStatement, planner: P, opts: PlannerOptions) raises -> Bool:
+    """A statement over one derived table (or a CTE read once) that is just a filter and a projection of a source reads that source: the filter joins the statement's
+    WHERE and the statement's references to the derived table's columns become the expressions behind them. Nothing is materialized, and a Parquet scan under it is
+    filtered as it streams. Returns whether it did (the statement is untouched when it did not)."""
+    if st.set_op != SET_NONE or st.has_right or len(st.extra) > 0 or len(st.subs) > 0:
+        return False
+    for i in range(len(st.exprs)):
+        if is_subquery_node(st.exprs[i].kind):                  # (a subquery may read the derived table's columns through its own pool)
+            return False
+    var kid = -1
+    var ci = -1
+    var shown = st.table_alias
+    if st.table_kid >= 0:
+        kid = st.table_kid
+    elif not st.table_is_file:
+        ci = run.find_cte(st.table)
+        if ci < 0:
+            return False
+        if run.ctes[ci].uses != 1 or run.ctes[ci].hint == CTE_MATERIALIZED or len(run.ctes[ci].columns) > 0:
+            return False
+        kid = run.ctes[ci].kid
+        if shown.byte_length() == 0:
+            shown = run.ctes[ci].name
+    if kid < 0:
+        return False
+    var inner_taken = run.take(kid)                     # a derived table of the derived table folds into it first
+    var hide_to = run.ctes[ci].group_end if ci >= 0 else 0
+    for h in range(ci if ci >= 0 else 0, hide_to):      # (a CTE's own body does not see its name, nor the names after it)
+        run.ctes[h].hidden += 1
+    try:
+        _ = try_inline(run, catalog, inner_taken, planner, opts)
+    except e:
+        for h in range(ci if ci >= 0 else 0, hide_to):
+            run.ctes[h].hidden -= 1
+        run.stmts[kid] = inner_taken^
+        raise e^
+    for h in range(ci if ci >= 0 else 0, hide_to):
+        run.ctes[h].hidden -= 1
+    run.stmts[kid] = inner_taken^
+    ref k = run.stmts[kid]
+    if not _inlinable(k) or k.table_is_file:
+        return False
+    if k.table_kid >= 0 or run.find_cte(k.table) >= 0 or catalog.view_index(k.table) >= 0:
+        return False
+    var star_kid = len(k.items) == 1 and k.items[0].star
+    var key = lower_ascii(shown)
+    for it in st.items:
+        if it.star and not star_kid and it.alias.byte_length() > 0 and lower_ascii(it.alias) != key:
+            return False
+    # which column references mean the derived table's columns (and which expression each is)
+    var names = List[String]()
+    var real = List[String]()
+    var exprs = List[Int]()
+    if not star_kid:
+        for i in range(len(k.items)):
+            real.append(_out_name(k, i))
+            names.append(lower_ascii(real[i]))
+            exprs.append(k.items[i].expr)
+    var own_aliases = List[String]()
+    for it in st.items:
+        if it.has_alias:
+            own_aliases.append(lower_ascii(it.alias))
+    var before = len(st.exprs)
+    var pick = List[Int](length=before, fill=-1)
+    for n in range(before):
+        if st.exprs[n].kind != X_COL:
+            continue
+        var q = lower_ascii(st.exprs[n].text2)
+        var nm = lower_ascii(st.exprs[n].text)
+        if q.byte_length() > 0 and q != key:
+            return False
+        if star_kid:
+            continue
+        var at = -1
+        for j in range(len(names)):
+            if names[j] == nm:
+                at = j
+        if at < 0:
+            if q.byte_length() == 0 and nm in own_aliases:
+                continue
+            return False
+        pick[n] = at
+    # an item without an alias that reads the derived table's columns is named after what it reads (an aggregate's name is the engine's own and cannot be kept)
+    for i in range(len(st.items)):
+        if st.items[i].star or st.items[i].has_alias or st.exprs[st.items[i].expr].kind == X_COL:
+            continue
+        var under = List[Int]()
+        collect(st, st.items[i].expr, under)
+        var touched = False
+        for u in under:
+            if u < before and st.exprs[u].kind == X_COL and (pick[u] >= 0 or (star_kid and st.exprs[u].text2.byte_length() > 0)):
+                touched = True
+        if touched and _has_aggregate(st, st.items[i].expr):
+            return False
+    # nothing can fail from here on
+    for i in range(len(st.items)):
+        if st.items[i].star and star_kid:
+            st.items[i].alias = k.table_alias                   # `x.*` is the source's `*`
+        elif st.items[i].star or st.items[i].has_alias:
+            pass
+        elif st.exprs[st.items[i].expr].kind == X_COL:
+            if not star_kid and pick[st.items[i].expr] >= 0:
+                st.items[i].alias = real[pick[st.items[i].expr]]    # the column keeps the name the derived table gave it
+                st.items[i].has_alias = True
+        elif not _has_aggregate(st, st.items[i].expr):
+            st.items[i].alias = st.render(st.items[i].expr)         # an expression keeps the name it had over the derived table
+            st.items[i].has_alias = True
+    var kcopy = k.where
+    for n in range(before):
+        if st.exprs[n].kind != X_COL:
+            continue
+        if star_kid:
+            st.exprs[n].text2 = k.table_alias
+        elif pick[n] >= 0:
+            var root = copy_expr(k, exprs[pick[n]], st)
+            st.exprs[n] = st.exprs[root].copy()
+    if not star_kid:                                             # `*` over a projection is the projection's columns
+        var items = List[SelectItem]()
+        for i in range(len(st.items)):
+            if st.items[i].star:
+                for j in range(len(real)):
+                    items.append(SelectItem(copy_expr(k, exprs[j], st), real[j], True, st.items[i].line, st.items[i].col))
+            else:
+                items.append(st.items[i].copy())
+        st.items = items^
+    var kw = -1
+    if kcopy >= 0:
+        kw = copy_expr(k, kcopy, st)
+    st.where = and_node(st, kw, st.where)
+    var table = k.table
+    var talias = k.table_alias
+    st.table = table
+    st.table_alias = talias
+    st.table_is_file = False
+    st.table_kid = -1
+    if ci >= 0:
+        run.steps.append("CTE " + run.ctes[ci].name + ": inlined into the query that reads it (its filter and columns merged, nothing materialized)")
+    else:
+        run.steps.append("derived table " + (shown if shown.byte_length() > 0 else String("")) + ": inlined into the query that reads it (its filter and columns merged, nothing materialized)")
+    return True
 
 
 def sql_with[P: Planner](mut catalog: Catalog, text: String, planner: P, options: PlannerOptions = PlannerOptions()) raises -> SqlResult:

@@ -84,6 +84,16 @@ def run() raises:
         var wn = sql(cat, "SELECT k, sum(v) OVER (PARTITION BY k ORDER BY v ROWS BETWEEN 1 PRECEDING AND CURRENT ROW), rank() OVER (ORDER BY v), lag(v, 1, 0) OVER (ORDER BY v), "
                           "avg(v) OVER (), min(v) OVER (PARTITION BY k), percent_rank() OVER (ORDER BY v) FROM " + name)
         print(wn.table.rows())
+        # F-159: WITH, derived tables, subqueries (scalar, IN, EXISTS; correlated ones), UNION / INTERSECT / EXCEPT, QUALIFY and a catalog view
+        cat.view("probe_view", "SELECT k, sum(v) AS s FROM t GROUP BY k")
+        var cq1 = sql(cat, "WITH a AS (SELECT k, v FROM " + name + " WHERE v > 0) SELECT x.k, count(*) FROM (SELECT k FROM a) x JOIN a ON x.k = a.k "
+                           "WHERE x.k IN (SELECT k FROM probe_view) AND a.v > (SELECT avg(v) FROM a) GROUP BY x.k")
+        var cq2 = sql(cat, "SELECT k, v FROM " + name + " o WHERE EXISTS (SELECT 1 FROM t WHERE t.k = o.k AND t.v <> o.v) AND v >= (SELECT min(v) FROM t WHERE t.k = o.k)")
+        var cq3 = sql(cat, "SELECT k FROM " + name + " UNION SELECT k FROM t INTERSECT SELECT k FROM t EXCEPT SELECT k FROM t WHERE k = 99")
+        var cq4 = sql(cat, "SELECT k, v FROM " + name + " QUALIFY row_number() OVER (PARTITION BY k ORDER BY v) = 1 ORDER BY k")
+        var cq5 = sql(cat, "SELECT k, v FROM (SELECT k, v, rank() OVER (ORDER BY v DESC) AS r FROM " + name + ") WHERE r <= 2")
+        var cq6 = sql_to_parquet(cat, "WITH a AS (SELECT k, v FROM " + name + ") SELECT k, v FROM a ORDER BY v", "probe-compound.parquet", spillo)
+        print(cq1.table.rows(), cq2.table.rows(), cq3.table.rows(), cq4.table.rows(), cq5.table.rows(), cq6.rows_written)
     print(Query(shared).join(shared, ["v"], ["v"]).agg(count()).compute(AUTO).counts[0])
     var wspec = Window().partition_by(col("k")).order_by(col("v"))
     print(compute_windows(Query(shared).where(col("v") > 0).window(row_number().over(wspec.copy()), sum(col("v")).over(wspec.copy())), AUTO).table.rows())     # F-168 builder

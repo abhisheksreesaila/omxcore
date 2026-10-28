@@ -1,6 +1,6 @@
 # F-150: the SQL lexer and parser. A parse that works gives back the text of the statement as the tree renders it;
 # one that does not raises the whole message (position included).
-from omxcore.sql import parse_sql, SqlStatement
+from omxcore.sql import parse_sql, parse_query, SqlStatement
 
 
 
@@ -84,8 +84,16 @@ def main() raises:
     fails("select a from t join u", "SQL error at line 1, column 23: expected ON or USING after JOIN, found the end of the statement")
     fails("select distinct on (a) a from t", "SQL error at line 1, column 8: `SELECT DISTINCT ON` is not supported yet")
     fails("select a, t.* + 1 from t", "SQL error at line 1, column 15: expected FROM, found `+`")
-    fails("select a from (select 1) x", "SQL error at line 1, column 15: a subquery in FROM is not supported yet (F-159)")
-    fails("with x as (select 1) select * from x", "SQL error at line 1, column 1: `WITH` (common table expressions) is not supported yet (F-159)")
+    # F-159: a query of several statements parses with parse_query (the statements, the one the text ends with last); parse_sql takes one plain statement
+    fails("select a from (select b from t) x", "SQL error at line 1, column 1: this query has a WITH clause, a subquery or a UNION: parse_query reads those")
+    fails("with x as (select b from t) select * from x", "SQL error at line 1, column 1: this query has a WITH clause, a subquery or a UNION: parse_query reads those")
+    check_eq(String(len(parse_query("select a from (select b from t) x").stmts)), "2", "a derived table")
+    check_eq(String(len(parse_query("with x as (select b from t), y as (select c from u) select * from x join y on x.b = y.c").stmts)), "3", "two CTEs")
+    check_eq(String(len(parse_query("select a from t where a in (select b from u) and exists (select 1 from v) and a > (select max(c) from w)").stmts)), "4", "three subqueries")
+    check_eq(String(len(parse_query("select a from t union all select b from u intersect select c from v").stmts)), "5", "set operations")
+    fails("select a from t union", "SQL error at line 1, column 22: expected SELECT, found the end of the statement")
+    fails("with recursive x as (select b from t) select * from x", "SQL error at line 1, column 6: `WITH RECURSIVE` is not supported yet")
+    fails("select a from t, lateral (select 1 from u) x", "SQL error at line 1, column 18: `LATERAL` is not supported yet")
     fails("select a from t where b glob 'x*'", "SQL error at line 1, column 25: `GLOB` is not supported yet")
     fails("select timestamp '2024-01-01 10:00:00' from t", "SQL error at line 1, column 8: `TIMESTAMP` literals is not supported yet (omxcore has no timestamp kind)")
     fails("select a from t where b like 'x%' escape", "SQL error at line 1, column 41: expected an expression, found the end of the statement")

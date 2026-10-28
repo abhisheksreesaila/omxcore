@@ -445,7 +445,7 @@ var h = sql(cat, "SELECT ...", o)
 
 | Part | Supported |
 |---|---|
-| Statement | `[EXPLAIN] SELECT ... FROM table [AS alias]` (table names and columns match without regard to case; `;` and `--` / `/* */` comments allowed) |
+| Statement | `[EXPLAIN] [WITH ...] SELECT ... FROM table [AS alias]`; a derived table `FROM (SELECT ...) alias`, subqueries, `UNION` / `INTERSECT` / `EXCEPT` and `QUALIFY` (F-159, below); table names and columns match without regard to case; `;` and `--` / `/* */` comments allowed |
 | Select list | expressions with aliases; group keys, aggregates, and expressions over them (`sum(a) / count(*)`, `max(d) - min(d)`, `g + 1`); a number, date or string constant; `CASE`, `COALESCE`, `CAST`, text and date functions (see Expressions below); with no aggregate and no `GROUP BY` the query returns rows (below): `*`, `t.*`, columns and expressions; `SELECT DISTINCT`; window functions `f(...) OVER (PARTITION BY ... ORDER BY ... [frame])` (F-168, below) |
 | `WHERE` | `= <> != < <= > >=`, `BETWEEN`, `IN (literals)` of any length, `LIKE` / `ILIKE`, `IS [NOT] NULL`, `IS [NOT] DISTINCT FROM`, `AND OR NOT`, a BOOL column; text, DATE (`DATE '2024-01-31'` or a string next to a DATE column) and decimal literals (aligned to the column's scale); `+ - *`, `//`, `%` on INT and DECIMAL (scales aligned as DuckDB does) and `date + n`, `date - date` |
 | `GROUP BY` | columns, expressions, ordinals (`GROUP BY 1`), select aliases; none at all (one group) |
@@ -678,10 +678,10 @@ Results equal DuckDB's, row for row (checked by `tests/test_mojo_window.py`: 100
 partition's edges, and may be empty: sums, `min`, `max` are NULL and counts 0). `RANGE` takes `UNBOUNDED` and `CURRENT ROW` bounds (peers included). With no frame the default is
 `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` (a running total that includes every peer), and the whole partition when there is no ORDER BY. The ranking functions, `ntile`, `lag` and `lead` ignore the frame.
 Frames DuckDB's parser refuses (`2 FOLLOWING AND 1 PRECEDING`, `CURRENT ROW AND 1 PRECEDING`, ...) are refused with its words.
-**Refused by name** (a positioned `SQL error`): a window function in WHERE, GROUP BY, HAVING or ON (and QUALIFY, which does not parse); `RANGE` with an offset; `GROUPS` frames; `EXCLUDE`; `IGNORE NULLS` / `RESPECT NULLS`;
+**Refused by name** (a positioned `SQL error`): a window function in WHERE, GROUP BY, HAVING or ON (filter on a window with a derived table or QUALIFY, below); `RANGE` with an offset; `GROUPS` frames; `EXCLUDE`; `IGNORE NULLS` / `RESPECT NULLS`;
 a named window (`OVER w`, `WINDOW w AS`); `FILTER`; `DISTINCT` inside the call; a window function that is not in the list above (`median(x) OVER`, `stddev(x) OVER`, ...); a window inside a window's arguments or inside an aggregate;
-`sum` / `avg` of TEXT, DATE or BOOL; `*` or `t.*` beside a window over a join (name the columns); `EXPLAIN ANALYZE` of a window query (`EXPLAIN` works). A window's result cannot be filtered in the same query
-(QUALIFY and a subquery in FROM do not exist yet, F-159).
+`sum` / `avg` of TEXT, DATE or BOOL; `*` or `t.*` beside a window over a join (name the columns); `EXPLAIN ANALYZE` of a window query (`EXPLAIN` works). A window's result is filtered by a derived table
+(`SELECT * FROM (SELECT ..., rank() OVER (...) AS r FROM t) WHERE r <= 3`) or by `QUALIFY` (F-159, next section).
 
 **How it runs.** `winsql.mojo` splits the statement: the *inner* query is the original without its windows, selecting every window-free part the select list, the windows' arguments, PARTITION BY and ORDER BY read (each a column of
 the result, computed once in the kernel); it runs as any query. `window.mojo` adds one column per function to that result: the rows are put in (partition, order) order by the same stable radix passes as ORDER BY (a shared
@@ -712,6 +712,50 @@ Informal timings (F-168; the 12-core Ryzen 9 5900X, 5 million rows, 1,000 partit
 result an Arrow table): `rank() OVER (PARTITION BY g ORDER BY x)` 0.74 s (DuckDB 0.34 s), `row_number() OVER (ORDER BY x, id)` 0.68 s (0.26 s), `sum(x) OVER (PARTITION BY g ORDER BY id)` 0.62 s (0.98 s), a
 6-row moving average 0.64 s (0.41 s), `x - lag(x) OVER (...)` 0.67 s (0.27 s). The window step is about 0.3 s of that for the sort (single-threaded radix passes, the same as ORDER BY) and the rest in the
 partitions' tasks; DuckDB is faster where the sort dominates (it sorts in parallel). Not tuned for speed beyond using the thread pool for the partitions: a parallel sort is the next step.
+
+### WITH, derived tables, subqueries, set operations, QUALIFY and views (F-159, `sqlquery.mojo`, `subq.mojo`, `setops.mojo`)
+
+```mojo
+var r = sql(cat, "WITH big AS (SELECT region, qty FROM orders WHERE qty > 4) "
+                 "SELECT region, qty FROM big WHERE qty > (SELECT avg(qty) FROM orders o WHERE o.region = big.region) "
+                 "UNION ALL SELECT region, 0 FROM orders WHERE NOT EXISTS (SELECT 1 FROM big WHERE big.region = orders.region)")
+cat.view("big_orders", "SELECT region, qty FROM orders WHERE qty >= 5")   # a named view: any query reads it in FROM, like a CTE (a view reads the views added before it)
+var f = sql(cat, "SELECT region, qty FROM orders QUALIFY row_number() OVER (PARTITION BY region ORDER BY qty DESC) = 1")
+```
+
+Everything runs from Mojo with no Python, over a table, a Frame (its edits), a Parquet scan and a CSV scan; `mx sql` opens the files named in `FROM` anywhere in the query. Results equal DuckDB's, row for row,
+per form x an inner query that returns rows and one that returns none x NULLs in the compared and correlated columns (`tests/test_mojo_compound.py`: about 580 runs, and the TPC-H Q2, Q4, Q17, Q18, Q20, Q21 and Q22
+shapes on dbgen SF 0.1; `mojo/tests/test_sqlquery.mojo` over a table, a frame and a streamed file).
+
+| Form | What it does |
+|---|---|
+| `WITH a AS (query) [, b AS (...)] query` | a name read once is **inlined**: when it only filters and projects one source its filter and columns are merged into the query that reads it (a Parquet scan under it streams, filtered; nothing is materialized), else the query runs at its use and nothing is kept; read more than once it is **materialized once** (it runs at the first read, every read uses that table). `AS MATERIALIZED` forces the second, `AS NOT MATERIALIZED` asks for the first (read twice it is still run once). A name sees the names before it and shadows a table; a name nothing reads never runs; `WITH a(x, y) AS (...)` renames the columns. The plan says which: `step: CTE a: materialized once (2 reads, 300 rows)` / `inlined into its one read (...)` (also in `EXPLAIN`) |
+| `FROM (query) [AS] alias` | a derived table: when it only filters and projects one source it is merged into the statement as a CTE read once is (`step: derived table x: inlined into the query that reads it`; the statement's columns keep the names they would have had, and a column the derived table does not have is still an error; an unaliased aggregate over its columns, a join or a subquery in the statement keep it from merging); otherwise it runs first (`step: derived table x: evaluated in place (N rows)`) and the statement reads its table under `alias`. Any query: aggregates, window functions, joins, set operations, other subqueries. Several, in a join, nested |
+| scalar subquery `(SELECT ...)` as a value | uncorrelated: runs once, the value takes its place (an empty result is a NULL of the column's type, more than one row raises `the scalar subquery returned N rows: a scalar subquery must return at most one row`); anywhere in the statement (select list, WHERE, HAVING, ON). Correlated: a comparison in WHERE with an **aggregate** subquery (`v > (SELECT avg(w) FROM u WHERE u.k = t.k)`, Q2, Q17, Q20) |
+| `x [NOT] IN (SELECT c ...)` | uncorrelated: next to nothing else a semi (anti, null-aware) join (F-154) when the subquery is one table with a WHERE, else the subquery runs and the join reads its table; in an OR, a select list or HAVING, or with an expression (no column) on its left, a list of its values (at most 10,000; more raises by name). Correlated `IN`: a semi join on the correlation and the value (not `NOT IN`: raises) |
+| `[NOT] EXISTS (SELECT ...)` | uncorrelated: TRUE or FALSE. Correlated through equalities between the subquery's tables and outer columns (any inner expression, one or more keys): a semi / anti join. Plus **one** inequality (`<`, `<=`, `>`, `>=`, `<>`): the inner side's min and max per key decide it (Q21) |
+| `a UNION [ALL] b`, `INTERSECT`, `EXCEPT` | operands matched by position, named by the first; INT with DECIMAL is a DECIMAL, DECIMALs the larger scale, a number with a FLOAT a FLOAT (a TEXT column keeps the first operand's dictionary and adds the second's new words, once per word); `UNION`, `INTERSECT`, `EXCEPT` compare rows with NULL equal to NULL, by the engine's own GROUP BY; INTERSECT binds tighter than UNION and EXCEPT, left to right, parentheses group; `ORDER BY`, `LIMIT` and `OFFSET` after the last operand apply to the whole |
+| `QUALIFY cond` | after `HAVING`: the select list and the condition are computed with their windows, the rows whose condition is true stay, then `DISTINCT`, `ORDER BY` (a column, an ordinal or any expression), `LIMIT` and `OFFSET`; an alias of the select list may be used in the condition |
+| `Catalog.view(name, query)` | a named view (see the example); its query runs at each read, as a CTE inlined into its read does. A name that is a source raises |
+
+**How a compound query runs.** `parse_query` makes a `SqlQuery`: one `SqlStatement` per SELECT, each with its own expressions, a subquery or derived table held by index (`sql.mojo`; `parse_sql` is still one plain statement).
+A query of one plain statement goes straight to the engine as before. Any other runs in `sqlquery.mojo` on a **copy of the catalog** (the sources are shared handles; the caller's catalog never gains a name) that collects the
+intermediate results as sources under internal names (`__d3`, `__c1`, `__t2`): the statements a statement reads run first, and every statement then reaches the engine as the plain SELECT it was
+before F-159, so the joins, hashed and dense groups, DISTINCT, the sort (F-167's spilling one included), window functions and the semi / anti joins of F-154 are the existing paths, with no second copy of any. `PlannerOptions`
+(device, threads, budgets, the job's cancel flag) apply to every step; only the last statement writes to the `sql_to_parquet` file.
+**Correlated subqueries** (`subq.mojo`) are decorrelated into a derived table `D` of the inner side, one row per correlation key, and a join:
+`D = SELECT inner_key AS __k0, ..., agg(..) AS __v FROM <the subquery's tables> WHERE <its own conditions> GROUP BY inner_key` for a scalar subquery (joined to the outer rows, the subquery's place reads `__v`; a `COUNT` is
+`coalesce(__v, 0)` through a LEFT join, so a key with no rows counts 0, and a NULL key counts 0 too);
+`D = SELECT inner_key, min(b), max(b) ... GROUP BY inner_key` for `EXISTS (... AND r.b <> s.y)` (kept when `__lo <> s.y OR __hi <> s.y`; `NOT EXISTS` is the LEFT join and `IS NOT TRUE`, so an outer row with no partner and one with a
+NULL both stay). When the outer statement has several tables, or more than one subquery needs a step, the outer rows are first made one table (the columns the rest of the statement reads, under their own names, the conjuncts
+that need no subquery applied), and each condition is one query over the table the step before made, the last merged with the statement's own select list, GROUP BY and ORDER BY. The correlated
+condition's inner side may be any expression of the subquery's tables, its outer side one column. **Refused by name**: a correlated `NOT IN`; a correlated subquery outside WHERE, under OR or NOT, or in an expression other than
+a comparison / its own condition; a correlated scalar subquery that is not an aggregate (it could return several rows per outer row) or has `COUNT` inside an expression; a correlated subquery with GROUP BY, HAVING, LIMIT,
+OFFSET or window functions, an outer column in its select list or a join condition, more than one inequality, or a condition mixing inner and outer columns in any form but `inner expr = outer column`; more than one
+correlated subquery in one condition; `*` in a query with a correlated subquery over several tables (name the columns); `WITH RECURSIVE`; `LATERAL`; `INTERSECT ALL` / `EXCEPT ALL`; `UNION BY NAME`; column names after a table
+alias (`FROM (...) x(a, b)`; name them in the subquery). Notes: the `step:` lines above, `subquery EXISTS: __d4 (444 keys with their min and max), a left join`, `UNION: 340 rows in, 8 out`.
+`EXPLAIN` of a compound query **runs the steps before the last statement** (their columns are what the last one is planned from) and shows them, then the last statement's plan; `EXPLAIN ANALYZE` adds its actuals.
+**Costs**: every step's result is a materialized table (a derived table or CTE of N rows costs N rows of memory until the query ends); `D` is built from the whole inner side (no semi-join reduction by the outer keys).
 
 ### The `mx` command line (F-151, for agents)
 
@@ -771,11 +815,11 @@ right table. Subqueries are these joins: `x IN (SELECT c FROM t [WHERE p])` and 
 `x NOT IN (SELECT c FROM t [WHERE p])` is a null-aware anti join: it keeps no row when the list holds a NULL, keeps every row (a NULL key too) when the list is empty, and drops a row whose key
 is NULL otherwise. In a subquery's WHERE a bare name is the subquery table's column when it has one, else the outer table's; an equality between a column of each is the join key, the other
 conditions on the subquery's table filter it. Shapes that need a residual predicate during the match are refused by name: a non-equality condition across the tables, or a condition on the
-left table alone, in the ON of a LEFT or ANTI join (F-155); one subquery per WHERE, joined to the rest by AND (F-155); a subquery with GROUP BY, a join, a scalar subquery or an EXISTS with no
-correlated equality (F-159). A LEFT join on keys too wide to pack into one int64 is refused (F-155).
+left table alone, in the ON of a LEFT or ANTI join (F-155). A subquery that is not one table with a WHERE (GROUP BY, a join, a scalar or an uncorrelated EXISTS), several subqueries, a subquery in an OR and a subquery
+beside a join are F-159's (section above): they run as steps around these joins. A LEFT join on keys too wide to pack into one int64 is refused (F-155).
 
 **Three or more tables (F-155)**: `FROM a, b, c WHERE ...` and `a JOIN b ON .. JOIN c ON ..` (inner joins; `USING` and the other kinds raise by name: a LEFT, SEMI or ANTI join with a third
-table is F-159). The WHERE and the ON conditions are one set of conjuncts: an equality between columns of two tables is an edge of the join graph (the tables must be connected by them: no
+table is still refused: the subquery forms F-159 added do not need it). The WHERE and the ON conditions are one set of conjuncts: an equality between columns of two tables is an edge of the join graph (the tables must be connected by them: no
 cross product), a condition on one table filters that table first, a condition that reads several (an OR across tables, an inequality) is checked as soon as every table it reads is joined. The
 common factors of an OR come out first: `(A AND x) OR (A AND y)` is `A AND (x OR y)` (TPC-H Q19: the shared `p_partkey = l_partkey` becomes the join key). Names resolve as for two tables
 (an alias per use of a table; the same table twice needs two aliases).
