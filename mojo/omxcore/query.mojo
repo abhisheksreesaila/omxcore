@@ -910,17 +910,10 @@ struct _Slot(Copyable, Movable):
 
 def _to_float(mut p: Program, mut a: _Slot) raises:
     """Reads an int register as a float64, in place: float(v) / 10^scale, as DuckDB casts an INT or DECIMAL to DOUBLE. A value past
-    +-2^53 is not exact as a double: the kernel flags it and the query raises."""
+    +-2^53 is converted the way DuckDB does it (F-190): the kernel's OP_I2F with 1 + decimal places in its last field does the whole cast."""
     if a.fl:
         return
-    p.emit(OP_I2F, a.reg, a.reg)
-    if a.scale > 0:
-        var f = Float64(1.0)
-        for _ in range(a.scale):
-            f *= 10.0
-        var k = p.reg()
-        p.emit(OP_LOAD_CONST, k, p.const(Int64(f.to_bits())))
-        p.emit(OP_DIV, a.reg, a.reg, k)
+    p.emit(OP_I2F, a.reg, a.reg, 0, 1 + max(a.scale, 0))
     a.fl = True
     a.scale = -1
     p.has_float = True
@@ -1851,11 +1844,9 @@ comptime FOOTER_LIE = "footer statistics wrong: "              # the prefix `run
 
 
 def overflow_message(has_float: Bool, conv: String = "") -> String:
-    """The kernel's overflow flag: an int64 total or result past its range, and, when the program holds float64 values, an integer past
-    2^53 meeting one (it is not exact as a double); F-156: and a CAST that met a value it cannot convert (`conv` names them)."""
+    """The kernel's overflow flag: an int64 total or result past its range (an integer past 2^53 read as a double rounds, F-190: it no
+    longer raises, so `has_float` changes nothing); F-156: and a CAST that met a value it cannot convert (`conv` names them)."""
     var base = OVERFLOW_MESSAGE
-    if has_float:
-        base = "a sum or an expression passed the int64 range (about 9.2e18), or an integer past 2^53 met a float64 (it is not exact as a double)"
     if conv.startswith(FOOTER_LIE):
         return conv
     if conv.byte_length() > 0:
