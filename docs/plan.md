@@ -75,6 +75,20 @@ F-056 built this in the Python front end; apps now call the Mojo engine, whose `
 - [x] results equal the CPU for every source kind (Table, Frame, Parquet scan, CSV scan) and on the Apple plan (`-D OMXCORE_APPLE_GPU_SHAPE`); NVIDIA PTX unchanged unless a kernel change is unavoidable (then re-pinned with a timing A/B); Mac link check green
 - Later (not this ticket): the second GPU as its own pool and worker, NVLink peer access, quiet-machine timings
 
+## F-190 A large DECIMAL read as a double rounds instead of raising (TPC-H Q14) [todo] (found by the F-162 harness, 2026-10-28)
+Root cause (F-162 review): `/` is already FLOAT (bind.mojo); `OP_I2F` (query.mojo) refuses a raw DECIMAL integer past 2^53 when it reads it as a double, so `100.00 * sum(l_extendedprice) / sum(...)` raises `int64 range exceeded` at SF1.
+- [ ] a DECIMAL past 2^53 converted to DOUBLE rounds to the nearest double as DuckDB does (exactness kept everywhere a DECIMAL stays a DECIMAL); Q14 and the magnitude probes equal DuckDB through `mx sql`; NVIDIA PTX unchanged unless unavoidable (OP_I2F may also exist in the GPU kernel: then the GPU keeps declining such programs or matches)
+
+## F-191 SQL honours GPU and AUTO (`mx sql --device gpu|auto`, `sql_with` on a device) [todo] (found by the F-162 harness, 2026-10-28)
+The gate asks each device to beat DuckDB, but the SQL path runs everything on the CPU ("SQL runs on the CPU"); the builder's GPU / AUTO (with F-189's budget) is not reached from SQL.
+- [ ] the aggregate stages the GPU kernel can run (the builder's GPU programs: integer / DECIMAL filters and aggregates, AUTO's size rule, F-189's pieces) run on the GPU from SQL; everything else stays on the CPU with a `fallback_reason`; results equal the CPU; NVIDIA PTX unchanged
+
+## F-192 DECIMAL sums past int64 as DuckDB (128-bit totals; TPC-H Q11) [todo] (found by F-159, 2026-10-28)
+- [ ] `sum(decimal * decimal)` (Q11's `sum(ps_supplycost * ps_availqty)`) and other DECIMAL sums whose total passes int64 give DuckDB's answer (DuckDB sums DECIMAL into HUGEINT) instead of raising; the result type follows DuckDB's DECIMAL width rules; exact everywhere; GPU keeps declining or matches (PTX unchanged)
+
+## F-193 A typed NULL constant keeps its own kind beside other constants (wrong column kind) [todo] (found by F-159, 2026-10-28)
+- [ ] `SELECT CAST(NULL AS DATE) AS m, CAST(NULL AS BIGINT) AS q` returns q as BIGINT (today DATE: a wrong answer); every constant select item keeps its type whatever else is in the list (exec.mojo); fuzz constant lists of every kind vs DuckDB
+
 ## F-057 Morsel co-processing that wins [done]
 Needs: F-053, F-055 · Builds on F-006 (`coproc.py`, `coproc_fused.py`, the Router) · Agreed 2026-10-15
 - [ ] research first (added to `docs/spec-auto-mode.md`): morsel-driven parallelism (Leis 2014), HetExchange, "Pump Up the Volume" and later CPU+GPU co-processing work; what F-006 measured (PCIe x8: streaming host data loses to CPU, resident data splits win) decides which ideas are worth it on this hardware
@@ -100,12 +114,13 @@ Needs: F-055, F-056, F-057 · Quiet machine only · Report: `docs/bench/f058-rep
 - [x] engine-only TPC-H SF1 + SF10 (stored and shuffled) and the random suite, for `cpu`, `gpu` (cold) and `auto`, against DuckDB and Polars, every result checked against DuckDB (2026-10-17): all 388 MXFrame results equal DuckDB. SF10 cpu 2.67 s / auto 2.75 / DuckDB 4.83 / Polars 11.58; SF1 445 / 482 / 618 / 1,307 ms; random auto vs DuckDB 0.99x (SF1), 1.35x (SF1 shuffled), 1.38x (SF10). The first pass found auto at 11.7 s (F-128) and two small-query regressions (F-130); spill at 512 MB measured and sped up (F-129). `gpu` was measured cold only (0/22 wins against cpu); warm, resident GPU runs are F-057's open item
 - [ ] each device beats DuckDB on at least 90% of queries: NOT met. auto beats DuckDB on 10/22 TPC-H at SF10 (8/22 shuffled, 8/22 SF1), 49-78% of random queries; faster in total at every scale. Misses (report table): multi-stage queries Q17, Q11, Q22, Q20 (2.1-2.3x: several computes with Python between them) and the lineitem x orders family Q12, Q3, Q18 (1.2-1.6x); Q6, Q10, Q16, Q8, Q15 close
 - [ ] when it passes: the rings below can start
+- Owner 2026-10-28: "finish the DuckDB gate first, make it fast first". The 2026-10-17 run measured the Python front end; the gate is re-measured on the Mojo engine (`mx sql`, F-162) once F-159 makes the multi-stage queries (Q2, Q11, Q17, Q20, Q21, Q22) single SQL statements. Order: F-159 → F-162 (all 22 equal DuckDB through `mx sql`) → a quiet-night scoreboard of omxcore vs DuckDB (owner's go for the quiet night) → speed work on whatever loses (F-161 join speed, F-167 parallel / radix sort, a parallel window sort).
 
 ## Rings (after the core gate, not before)
 Proposed 2026-10-15, not yet briefed; each goes through `clarify` when its turn comes.
 - Mojo front end for MXFrame: a Mojo plan builder over `mx_execute`, so MX App / DataLens can use MXFrame where there is no Python (iPhone). Depends on F-033, F-034, F-021 (every query native, native Parquet).
 - Tables loaded once per process, shared read-only across sessions (MX App's `App.init_shared`, fh-saas dashboards).
-- Embedding columns and filtered top-k vector search (CPU, then GPU), built on the `mx_filter_topk` pattern.
+- Embedding columns and filtered top-k vector search (CPU, then GPU), built on the `mx_filter_topk` pattern. Owner 2026-10-28: a passing thought, parked until the gate passes; when it comes: first user omxplorer ("find rows like this one"), the app brings the vectors (no model in the core).
 - Vision kernels, LLM operators, an MCP server: parked.
 
 ## Wave 1: foundations (parallel)
@@ -1636,6 +1651,7 @@ Needs: F-155 · Size: L · engine-first; F-058's losses are joins
 - [ ] informal timings on dbgen SF1 / SF10 (Q3, Q12, Q18 shapes, the random suite's join shape) through `mx` vs DuckDB, A/B against F-155
 
 ## F-162 M8 gate: TPC-H 22 and the random suite through `mx sql` equal DuckDB [todo]
+- Harness built 2026-10-28 (review PASS): `tests/test_mx_tpch_gate.py` (22 queries through `mx sql`, a gap xfails only with its exact engine error), `tests/test_mx_random_gate.py` (80 seeds), `scripts/gate_scoreboard.py` (quiet-night timing, `--stream never`, median of 3 fresh processes, failures count as losses), `docs/bench/f162-coverage.md`. On main: 8/22 equal DuckDB, 80/80 random; the 14 gaps are F-159 shapes, Q16 / Q21 (subquery beside a join, two subqueries), Q14 (F-190). `mx sql --device gpu|auto` runs the CPU (F-191).
 Needs: F-157, F-159, F-161 · Size: M
 - [ ] the 22 TPC-H queries as DuckDB writes them on dbgen SF1 (DECIMAL / DATE) and the repo's SF1 Parquet (FLOAT), equal to DuckDB; the random suite through `mx` equal to DuckDB; EXPLAINs and timings recorded, not gated (benchmarks paused)
 - [ ] omxplorer runs a SQL cell, EXPLAIN, a two-table join and a cached Explore pipeline on the package (its own goal checks)
