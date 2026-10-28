@@ -1,9 +1,9 @@
 # F-159: queries made of several statements from Mojo with no Python: WITH, derived tables, catalog views, subqueries (scalar, IN, EXISTS, correlated),
 # UNION / INTERSECT / EXCEPT, QUALIFY, filtering on a window result. The expected rows are DuckDB's (generated once on the same ten rows). Every query runs over a table,
-# over a Frame whose last edit removed an appended row, and over a streamed Parquet file, and the three answers are the same; tests/test_mojo_compound.py compares
+# over a Frame whose last edit removed an appended row, over a streamed Parquet file and over a streamed CSV file, and the four answers are the same; tests/test_mojo_compound.py compares
 # many more queries with DuckDB on generated data and on TPC-H.
 from omxcore import (Table, SharedTable, Frame, Catalog, PlannerOptions, sql, sql_to_parquet, SqlResult, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, write_parquet,
-                     scan_parquet, ZSTD, parse_query, query_files)
+                     scan_parquet, scan_csv, CsvOptions, ZSTD, parse_query, query_files)
 
 
 def fail(msg: String) raises:
@@ -88,7 +88,7 @@ def orders() raises -> SharedTable:
 
 
 def catalog_of(source: Int) raises -> Catalog:
-    """0: a table, 1: a Frame whose last edit removed an appended row, 2: a streamed Parquet file (2 row groups). The view big_orders reads it."""
+    """0: a table, 1: a Frame whose last edit removed an appended row, 2: a streamed Parquet file (2 row groups), 3: a streamed CSV file. The view big_orders reads it."""
     var cat = Catalog()
     if source == 0:
         cat.add_table("orders", orders())
@@ -97,9 +97,20 @@ def catalog_of(source: Int) raises -> Catalog:
         _ = f.append(["East", "99", "1.00", "2020-01-01"])
         f.remove(10)
         cat.add_frame("orders", f)
-    else:
+    elif source == 2:
         write_parquet("sqlquery-test-orders.parquet", orders(), "", ZSTD, 8)
         cat.add_scan("orders", scan_parquet("sqlquery-test-orders.parquet"))
+    else:
+        var text = String("region,qty,price,day\n")
+        var regions: List[String] = ["West", "east", "West", "North", "east", "West", "", "North", "east", "West"]
+        var qtys: List[String] = ["3", "1", "5", "4", "7", "2", "6", "", "9", "-2"]
+        var prices: List[String] = ["12.50", "4.00", "20.25", "9.99", "30.00", "-1.50", "7.00", "0.00", "123.45", "5.00"]
+        for i in range(10):
+            text += regions[i] + "," + qtys[i] + "," + prices[i] + ",2019-04-14\n"
+        var out = open("sqlquery-test-orders.csv", "w")
+        out.write(text)
+        out.close()
+        cat.add_scan("orders", scan_csv("sqlquery-test-orders.csv", CsvOptions(group_rows=4)))
     cat.view("big_orders", "SELECT region, qty FROM orders WHERE qty >= 5")
     return cat^
 
@@ -133,7 +144,7 @@ def main() raises:
     add(queries, wants, "SELECT region, (SELECT max(qty) FROM orders WHERE qty < 0) AS m FROM orders WHERE qty = 1", "east -2\n")
     add(queries, wants, "SELECT qty FROM orders WHERE qty > (SELECT max(qty) FROM orders WHERE qty > 100) ORDER BY qty", "")
 
-    for source in range(3):
+    for source in range(4):
         var cat = catalog_of(source)
         for i in range(len(queries)):
             var r = sql(cat, queries[i])

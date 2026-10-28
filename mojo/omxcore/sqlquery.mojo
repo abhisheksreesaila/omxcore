@@ -235,7 +235,6 @@ def exec_statement[P: Planner](mut run: QueryRun, mut catalog: Catalog, idx: Int
         for j in range(i + 1, len(run.ctes)):
             n += _count_uses(run, run.ctes[j].kid, run.ctes[i].name)
         run.ctes[i].uses = n
-    var steps_before = len(run.steps)
     var explain = st.explain
     st.explain = EXPLAIN_NONE
     var r: SqlResult
@@ -479,7 +478,7 @@ def qualify_run[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: Sql
     var hidden = 1
     for k in range(len(order)):
         var ex = st.exprs[order[k].expr].copy()
-        var frag = String()
+        var frag: String
         if ex.kind == X_INT:
             frag = "#" + ex.text
         elif ex.kind == X_COL and ex.text2.byte_length() == 0 and (has_star or lower_ascii(ex.text) in known):
@@ -498,7 +497,6 @@ def qualify_run[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: Sql
     var text = String("SELECT ") + ("DISTINCT " if distinct else "")
     for c in range(nvis):
         text += ("" if c == 0 else ", ") + _quote(t.name(c))
-    var nq = t.name(nvis + 0) if False else String("__q")
     var vis_names = List[String]()
     for c in range(nvis):
         vis_names.append(t.name(c))
@@ -876,7 +874,6 @@ def lower_subqueries[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st
         collect(st, conj[ci], under)
         for u in under:
             owner[u] = ci
-    var step_of = List[Int](length=len(conj), fill=-1)       # the conjunct becomes a step (its index in `steps`) or is dropped (-2: handled natively, kept)
     var correlated = List[Bool]()
     for n in nodes:
         correlated.append(_is_correlated(run, catalog, sc, st.exprs[n].items[0], planner, opts))

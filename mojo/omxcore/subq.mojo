@@ -230,7 +230,7 @@ def set_literal(mut st: SqlStatement, node: Int, t: Table, row: Int, c: Int) rai
     var k = t.kind(c)
     var v = t.get(c, row)
     var kind = X_INT
-    var text = String()
+    var text: String
     var neg = False
     if k == INT:
         neg = v < 0
@@ -403,8 +403,8 @@ def analyze(k: SqlStatement, inner: Scope, outer: Scope, allow_theta: Bool, what
             raise sql_error(x.line, x.col, "this condition of a correlated " + what + " reads an outer column in a form that is not supported: an equality between an expression of the subquery and an outer column is (`inner.k = outer.k`)")
         var a_outs = outer_refs(k, x.a, inner, outer)
         var b_outs = outer_refs(k, x.b, inner, outer)
-        var inner_side = -1
-        var outer_col = -1
+        var inner_side: Int
+        var outer_col: Int
         if len(a_outs) == 0 and len(b_outs) == 1 and k.exprs[x.b].kind == X_COL:
             inner_side = x.a
             outer_col = x.b

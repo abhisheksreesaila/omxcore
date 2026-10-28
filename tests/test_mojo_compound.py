@@ -269,6 +269,7 @@ def test_a_scalar_subquery_with_two_columns_raises(mx, data):
     ("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.w + t.v = 3)", "must compare an expression of the subquery's tables with one outer column"),
     ("SELECT id FROM t WHERE EXISTS (SELECT k FROM u WHERE u.k = t.k GROUP BY k)", "with GROUP BY or HAVING is not supported yet"),
     ("SELECT id FROM t WHERE 3 = (SELECT count(*) + sum(1) FROM u WHERE u.k = t.k)", "COUNT inside an expression"),
+    ("SELECT id FROM t WHERE v < (SELECT max(w) / 0.0 FROM u)", "which has no SQL literal"),
 ])
 def test_unsupported_subquery_forms_raise_by_name(mx, data, sql, message):
     assert message in error_of(mx, data, sql)
