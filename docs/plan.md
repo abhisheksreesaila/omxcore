@@ -75,6 +75,13 @@ F-056 built this in the Python front end; apps now call the Mojo engine, whose `
 - [x] results equal the CPU for every source kind (Table, Frame, Parquet scan, CSV scan) and on the Apple plan (`-D OMXCORE_APPLE_GPU_SHAPE`); NVIDIA PTX unchanged unless a kernel change is unavoidable (then re-pinned with a timing A/B); Mac link check green
 - Later (not this ticket): the second GPU as its own pool and worker, NVLink peer access, quiet-machine timings
 
+## F-190 DECIMAL / DECIMAL in SQL types as DuckDB does (TPC-H Q14) [todo] (found by the F-162 harness, 2026-10-28)
+- [ ] `sum(decimal) / sum(decimal)` (and any DECIMAL / DECIMAL) no longer raises `int64 range exceeded`: typed as DuckDB types it (DOUBLE), equal to DuckDB; Q14 equal through `mx sql`
+
+## F-191 SQL honours GPU and AUTO (`mx sql --device gpu|auto`, `sql_with` on a device) [todo] (found by the F-162 harness, 2026-10-28)
+The gate asks each device to beat DuckDB, but the SQL path runs everything on the CPU ("SQL runs on the CPU"); the builder's GPU / AUTO (with F-189's budget) is not reached from SQL.
+- [ ] the aggregate stages the GPU kernel can run (the builder's GPU programs: integer / DECIMAL filters and aggregates, AUTO's size rule, F-189's pieces) run on the GPU from SQL; everything else stays on the CPU with a `fallback_reason`; results equal the CPU; NVIDIA PTX unchanged
+
 ## F-057 Morsel co-processing that wins [done]
 Needs: F-053, F-055 · Builds on F-006 (`coproc.py`, `coproc_fused.py`, the Router) · Agreed 2026-10-15
 - [ ] research first (added to `docs/spec-auto-mode.md`): morsel-driven parallelism (Leis 2014), HetExchange, "Pump Up the Volume" and later CPU+GPU co-processing work; what F-006 measured (PCIe x8: streaming host data loses to CPU, resident data splits win) decides which ideas are worth it on this hardware
