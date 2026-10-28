@@ -24,8 +24,8 @@ from .kernels.pipeline_cpu import IP, LP, FP, BP, VEC, E_OVERFLOW, _no_front, _n
 from .kernels.hashagg_cpu import hash_aggregate
 from .holistic import (HolStates, HolSpec, HolResult, A_DISTINCT, A_PCT, A_MEDIAN, A_QEDGE, A_VAR_POP, A_VAR_SAMP, A_STDDEV_POP, A_STDDEV_SAMP, window_blocks,
                            float_key)
-from .sql import sql_error, EXPLAIN_NONE, EXPLAIN_ANALYZE
-from .bind import (copy_query, Catalog, SqlSource, BoundQuery, SortKey, bind_sql, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, F_COUNT_STAR,
+from .sql import sql_error, parse_sql, SqlStatement, EXPLAIN_NONE, EXPLAIN_ANALYZE
+from .bind import (copy_query, Catalog, SqlSource, BoundQuery, SortKey, bind_sql, bind_statement, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, F_COUNT_STAR,
                    F_COUNT, F_SUM, F_MIN, F_MAX, F_AVG, F_COUNT_DISTINCT, F_MEDIAN, F_STDDEV_SAMP, F_STDDEV_POP, F_VAR_SAMP, F_VAR_POP, F_QEDGE, B_QBIN, B_LIT, B_AGG,
                    BExpr, AggSpec, KeySpec, pow10_checked)
 from .plan import LogicalPlan, build_plan, executable
@@ -35,6 +35,7 @@ from .join import (needed_columns, side_query, joined_query, virtual_schema, all
 from .joincore import JoinKeys, JoinSide, column_ndv, normalize_keys, unmatchable_not_null, join_pairs, select_rows, gather_join, JoinPairs, JOIN_BUDGET_BYTES
 from .kernels.hashjoin_cpu import hj_build, JoinMap, PM_SEMI, PM_ANTI, PM_ANTI_NA, PM_NONE
 from .kargs import KernelRun
+from .winsql import plan_windows, finish_windows, WIN_TABLE
 from .jfront import FusedJoin, StageData, front_spec, jf_front
 from std.memory import ArcPointer
 from .rows import RowStage, prepare_rows, execute_rows, _Item
@@ -1821,8 +1822,67 @@ def _explain_analyze[P: Planner](mut catalog: Catalog, q0: BoundQuery, planner: 
 
 def sql_with[P: Planner](mut catalog: Catalog, text: String, planner: P, options: PlannerOptions = PlannerOptions()) raises -> SqlResult:
     """`sql` with the physical planner of your choice (anything that implements `Planner`)."""
-    var q = bind_sql(catalog, text)
+    var st = parse_sql(text)
+    if len(st.wins) > 0:
+        return _run_windows(catalog, st^, text, planner, options)
+    var q = bind_statement(catalog, st^, text)
     return run_sql(catalog, q, planner, options)
+
+
+def _run_windows[P: Planner](mut catalog: Catalog, var st: SqlStatement, text: String, planner: P, opts: PlannerOptions) raises -> SqlResult:
+    """A query with window functions (F-168, winsql.mojo): the query without them runs as usual, the window columns are added to its rows, and the
+    select list, DISTINCT, ORDER BY and LIMIT run over that result. Window functions run on the CPU, whatever the device asked for."""
+    var t0 = perf_counter_ns()
+    var explain = st.explain
+    if explain == EXPLAIN_ANALYZE:
+        raise sql_error(st.items[0].line, st.items[0].col, "EXPLAIN ANALYZE of a query with window functions is not supported yet (EXPLAIN is)")
+    var wp = plan_windows(st^, catalog)
+    var inner = SqlStatement(String())
+    swap(inner, wp.inner)
+    var iq = bind_statement(catalog, inner^, text)
+    iq.explain = explain
+    var r = run_sql(catalog, iq, planner, opts)
+    if explain != EXPLAIN_NONE:                                          # the window step first, then the inner query's plan
+        var lines = List[String]()
+        lines.append("Window functions (after the query below, on the CPU)")
+        for g in wp.groups:
+            var sorts = String("  sort by ")
+            for p in g.part:
+                sorts += "partition column " + String(p) + ", "
+            sorts += String(len(g.order)) + " order key" + ("" if len(g.order) == 1 else "s")
+            lines.append(sorts)
+        for dsc in wp.descriptions:
+            lines.append("  " + dsc)
+        lines.append("Query")
+        var shown = Table.empty()
+        var c = shown.add_column("plan", TEXT)
+        for l in lines:
+            shown.append_text(c, l)
+        for k in range(r.table.rows()):
+            shown.append_text(c, "  " + r.table.text_of(0, Int(r.table.get(0, k))))
+        r.table = shown^
+        r.explain = ""
+        for k in range(r.table.rows()):
+            r.explain += r.table.text_of(0, Int(r.table.get(0, k))) + "\n"
+        return r^
+    var rows = Table.empty()
+    swap(rows, r.table)
+    var notes = r.notes.copy()
+    var t_w = perf_counter_ns()
+    finish_windows(wp, rows, opts.threads, opts.job, notes)
+    notes.append("window: " + _ms(Float64(perf_counter_ns() - t_w) / 1e6) + " ms")
+    var cat2 = Catalog()
+    cat2.add_table(WIN_TABLE, rows^.share())
+    var outer = SqlStatement(String())
+    swap(outer, wp.outer)
+    var oq = bind_statement(cat2, outer^, text)
+    var out = run_sql(cat2, oq, planner, opts)
+    for nt in out.notes:
+        notes.append(nt)
+    out.notes = notes^
+    out.fallback_reason = "window functions run on the CPU"
+    out.ms = Float64(perf_counter_ns() - t0) / 1e6
+    return out^
 
 
 def sql(mut catalog: Catalog, text: String, options: PlannerOptions = PlannerOptions()) raises -> SqlResult:

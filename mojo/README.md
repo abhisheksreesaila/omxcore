@@ -77,6 +77,14 @@ core (a Frame over a file gathers on the calling thread through its chunk cache)
 `tests/test_mojo_range.py` (against DuckDB through `mojo/tools/range_probe.mojo`; the FLOAT sum's bits equal with one thread and many), `mojo/tools/range_bench.mojo` (the cost of edits). No app concept is in the module:
 it takes row numbers and a half-open range.
 
+## Window functions (F-168)
+
+`f(...) OVER (PARTITION BY ... ORDER BY ... [ROWS | RANGE frame])` in SQL (`row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag`, `lead`, `first_value`, `last_value`, `nth_value`, and `sum`,
+`count`, `avg`, `min`, `max` over a frame: running totals, moving averages) and the builder's `Window` / `Query.window` / `compute_windows`. `winsql.mojo` splits a statement into the query without its windows, the
+window step (`window.mojo`: a stable radix sort, partitions on the thread pool, running frames; the same answer for any thread count) and a row query over the result for the select list, ORDER BY and LIMIT.
+Rules, refusals and timings: `docs/omxcore-mojo-api.md` (Window functions). Tests: `mojo/tests/test_window.mojo`, `mojo/tests/test_window_builder.mojo`, `tests/test_mojo_window.py` (100+ queries against DuckDB over a table,
+a streamed file, an edited Frame and an edited stream).
+
 ## `mx`, the agent command line (F-151)
 
 `mojo/cli/mx.mojo` is `mx sql | explain | schema` over the SQL above: JSON in, JSON out, exit 1 for a query error and 2 for a usage error

@@ -6,7 +6,8 @@ from std.ffi import c_int
 from omxcore import (Table, SharedTable, Frame, INT, DECIMAL, TEXT, Query, col, sum, count, CPU, GPU, AUTO,
                      DeviceTable, gpu_available, read_csv, scan_csv, CsvOptions, write_parquet, read_parquet, scan_parquet, UNCOMPRESSED, ZSTD, SNAPPY,
                      count_distinct, median, percentile, top_k, stddev, var_pop, Catalog, PlannerOptions, GROUP_HASHED, sql, range_aggregate, read_block,
-                     compute_job, sql_job, read_csv_job, scan_csv_job, read_parquet_job, save_job, write_parquet_job, permutation_job, JOB_DONE, sql_to_parquet, JobCtl)
+                     compute_job, sql_job, read_csv_job, scan_csv_job, read_parquet_job, save_job, write_parquet_job, permutation_job, JOB_DONE, sql_to_parquet, JobCtl,
+                     Window, row_number, rank, compute_windows)
 
 
 def run() raises:
@@ -79,7 +80,13 @@ def run() raises:
         nofuse.fuse = False
         var j2 = sql(cat, "SELECT a.k, b.v FROM " + name + " a JOIN t b ON a.v = b.v WHERE a.k = 1 ORDER BY 2 LIMIT 3", nofuse)
         print(j1.table.rows(), j2.table.rows())
+        # F-168: window functions over each source (sorts, running frames, the partitions' tasks)
+        var wn = sql(cat, "SELECT k, sum(v) OVER (PARTITION BY k ORDER BY v ROWS BETWEEN 1 PRECEDING AND CURRENT ROW), rank() OVER (ORDER BY v), lag(v, 1, 0) OVER (ORDER BY v), "
+                          "avg(v) OVER (), min(v) OVER (PARTITION BY k), percent_rank() OVER (ORDER BY v) FROM " + name)
+        print(wn.table.rows())
     print(Query(shared).join(shared, ["v"], ["v"]).agg(count()).compute(AUTO).counts[0])
+    var wspec = Window().partition_by(col("k")).order_by(col("v"))
+    print(compute_windows(Query(shared).where(col("v") > 0).window(row_number().over(wspec.copy()), sum(col("v")).over(wspec.copy())), AUTO).table.rows())     # F-168 builder
     # F-176: range aggregates and block reads over a table, a frame with edits and a frame over a streamed file
     var rcols: List[Int] = [0, 1]
     var rorder = sf.permutation(1)

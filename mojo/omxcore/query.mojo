@@ -48,6 +48,7 @@ from .joincore import JoinKeys, JoinSide, normalize_keys, join_pairs, select_row
 from .kernels.hashjoin_cpu import hj_build, PM_SEMI, PM_ANTI
 from .frame import text_ranks
 from .job import JobCtl, STAGE_PLAN, STAGE_AGGREGATE, STAGE_FINISH      # F-175
+from .window import WindowFn, Window, W_SUM, W_COUNT, W_COUNT_STAR, W_AVG, W_MIN, W_MAX      # F-168
 
 # plan node kinds
 comptime P_SCAN = 0
@@ -128,6 +129,28 @@ struct Agg(Copyable, Movable):
         self.arg = arg^
         self.p = p
         self.k = k
+
+    def over(self, var w: Window) raises -> WindowFn:
+        """This aggregate over a window (F-168): `sum(col("v")).over(Window().partition_by(col("g")).order_by(col("day")))`. sum, count, mean, min_of and
+        max_of take a window; the others raise by name."""
+        var kind = -1
+        if self.kind == A_SUM:
+            kind = W_SUM
+        elif self.kind == A_COUNT:
+            kind = W_COUNT_STAR
+        elif self.kind == A_COUNT_OF:
+            kind = W_COUNT
+        elif self.kind == A_MEAN:
+            kind = W_AVG
+        elif self.kind == A_MIN:
+            kind = W_MIN
+        elif self.kind == A_MAX:
+            kind = W_MAX
+        if kind < 0:
+            raise Error("this aggregate is not supported as a window function (sum, count, mean, min_of and max_of are)")
+        var f = WindowFn(kind)
+        f.arg = self.arg.copy()
+        return f^.over(w^)
 
 
 def sum(e: Expr) -> Agg:
@@ -250,8 +273,10 @@ struct Query(Movable):
     var _window_rows: Int                # rows per window of a count_distinct / percentile / top_k query (0: as many as
                                          # fit WINDOW_BYTES); tests set it small to cut a table into several windows
     var _threads: Int                    # worker threads the CPU kernel starts (0: one a core); a float64 sum is the same for any number
+    var windows: List[WindowFn]          # F-168: window functions over the rows the plan keeps (`window`; `compute_windows` in winquery.mojo runs them)
 
     def __init__(out self, table: SharedTable):
+        self.windows = List[WindowFn]()
         self.table = table
         self.device = None
         self.scan = None
@@ -268,6 +293,7 @@ struct Query(Movable):
         """A plan over a Parquet file that may be bigger than memory: `compute` reads one row group at a time (only the
         columns the plan uses), runs the kernel on it on the CPU and merges the partial results, so the answer is
         `read_parquet` + the same query, exactly, and the peak memory is one row group plus the result."""
+        self.windows = List[WindowFn]()
         self.table = scan.schema
         self.device = None
         self._window_rows = 0
@@ -281,6 +307,7 @@ struct Query(Movable):
         self.overlay = Overlay(scan.schema)
 
     def __init__(out self, frame: Frame) raises:
+        self.windows = List[WindowFn]()
         self.table = frame.base
         self.device = None
         self._window_rows = 0
@@ -299,6 +326,13 @@ struct Query(Movable):
     def where(var self, predicate: Expr) -> Self:
         """Keep rows where `predicate` holds (several `where`s are ANDed)."""
         self.nodes.append(PlanNode(P_FILTER, self._top(), [predicate.copy()], List[Agg](), 0))
+        return self^
+
+    def window(var self, *fns: WindowFn) -> Self:
+        """Window functions over the rows the plan's `where`s keep (F-168): `Query(t).where(...).window(row_number().over(w), sum(col("v")).over(w))`;
+        `compute_windows(query)` (winquery.mojo) returns the source's columns and one more per function."""
+        for f in fns:
+            self.windows.append(f.copy())
         return self^
 
     def _aggregate(self) -> Int:

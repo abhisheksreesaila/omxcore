@@ -2403,7 +2403,11 @@ def _lift_subquery(mut st: SqlStatement, catalog: Catalog) raises:
 
 def bind_sql(catalog: Catalog, text: String) raises -> BoundQuery:
     """Parses and binds one statement against the catalog."""
-    var st = parse_sql(text)
+    return bind_statement(catalog, parse_sql(text), text)
+
+
+def bind_statement(catalog: Catalog, var st: SqlStatement, text: String) raises -> BoundQuery:
+    """Binds a parsed statement (`text` is what EXPLAIN and the error positions refer to)."""
     _lift_subquery(st, catalog)
     var src = catalog.find(st.table)
     if src < 0:
@@ -2520,7 +2524,7 @@ def bind_sql(catalog: Catalog, text: String) raises -> BoundQuery:
     b.q.limit = b.st.limit
     b.q.offset = b.st.offset
     for i in range(len(b.st.exprs)):                    # an unknown function is reported as that, before anything else
-        if b.st.exprs[i].kind == X_CALL and not _is_aggregate_name(b.st.exprs[i].text) and not _is_scalar_name(b.st.exprs[i].text):
+        if b.st.exprs[i].kind == X_CALL and b.st.exprs[i].c < 0 and not _is_aggregate_name(b.st.exprs[i].text) and not _is_scalar_name(b.st.exprs[i].text):
             raise b.unknown_function(i)
     # F-152: `*` and `t.*` become the source's columns (a frame's formula columns too)
     var items = List[SelectItem]()
