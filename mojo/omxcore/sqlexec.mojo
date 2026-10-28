@@ -260,7 +260,7 @@ def _run_hashed(t: SharedTable, sp: SqlProgram, mask_addr: Int, nkw: Int, thread
     else:
         rc = run.hashed(keyw, nkw, n_rows, threads, res_r)
     if rc == -7 or rc == E_OVERFLOW:
-        raise Error(overflow_message(sp.p.has_float, sp.p.conv_text()))
+        raise Error(overflow_message(sp.p.conv_text()))
     if rc != 0:
         raise Error("the hashed group-by kernel failed with code " + String(rc))
     return _hashed_result(run, res_r, sp.p.n_slots, nkw)
@@ -429,7 +429,7 @@ def _run_dense_fused(t: SharedTable, sp: SqlProgram, mask_addr: Int, threads: In
     else:
         rc = run.fused(_no_keys, front, fs.ws_bytes, False, 1, start, end, threads)
     if rc == E_OVERFLOW:
-        raise Error(overflow_message(p.has_float, p.conv_text()))
+        raise Error(overflow_message(p.conv_text()))
     if rc != 0:
         raise Error("the CPU kernel failed with code " + String(rc))
     return _make_result(p, run.out_vals, run.out_cnt)
@@ -610,7 +610,7 @@ def _run_hol_hashed(t: SharedTable, sp: SqlProgram, look: _GroupLookup, mask_add
         run.control(ctl)
         var rc = run.keyed(_hmat_hook, G, done, end, threads)
         if rc == E_OVERFLOW:
-            raise Error(overflow_message(p.has_float, p.conv_text()))
+            raise Error(overflow_message(p.conv_text()))
         if rc != 0:
             raise Error("the CPU kernel failed with code " + String(rc))
         for s in range(p.n_src):

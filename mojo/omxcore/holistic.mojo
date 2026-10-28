@@ -573,6 +573,12 @@ def spread_value(kind: Int, n: Int, m2: Float64) raises -> Float64:
 def _dbl(v: Int64, is_float: Bool, div: Float64) -> Float64:
     if is_float:
         return Float64(from_bits=UInt64(float_unkey(v)))
+    if v > 9007199254740992 or v < -9007199254740992:           # F-190: DuckDB's DECIMAL -> DOUBLE past 2^53 (bind.decimal_to_float, kernel _decimal_f64)
+        var pu = UInt64(div)
+        var m = UInt64(0) - UInt64(v) if v < 0 else UInt64(v)
+        var q = m // pu
+        var x = Float64(q) + Float64(m - q * pu) / div
+        return -x if v < 0 else x
     return Float64(v) / div
 
 

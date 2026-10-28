@@ -1516,7 +1516,7 @@ def _run_cpu(t: SharedTable, p: Program, mask_addr: Int, start: Int = 0, end: In
                             0, 1, start, stop, Int(out_vals.unsafe_ptr()), Int(out_cnt.unsafe_ptr()), threads, p.repro)
     _ = code^, consts^, set_bytes^, set_meta^, tbl^, dtypes^      # the kernel read them: keep them past the call
     if rc == E_OVERFLOW:
-        raise Error(overflow_message(p.has_float, p.conv_text()))
+        raise Error(overflow_message(p.conv_text()))
     if rc != 0:
         raise Error("the CPU kernel failed with code " + String(rc))
     var r = _make_result(p, out_vals, out_cnt)
@@ -1843,9 +1843,9 @@ comptime OVERFLOW_MESSAGE = "a sum or an expression passed the int64 range (abou
 comptime FOOTER_LIE = "footer statistics wrong: "              # the prefix `run_sql` reads to run a query again without a file's statistics
 
 
-def overflow_message(has_float: Bool, conv: String = "") -> String:
+def overflow_message(conv: String = "") -> String:
     """The kernel's overflow flag: an int64 total or result past its range (an integer past 2^53 read as a double rounds, F-190: it no
-    longer raises, so `has_float` changes nothing); F-156: and a CAST that met a value it cannot convert (`conv` names them)."""
+    longer raises,); F-156: and a CAST that met a value it cannot convert (`conv` names them)."""
     var base = OVERFLOW_MESSAGE
     if conv.startswith(FOOTER_LIE):
         return conv

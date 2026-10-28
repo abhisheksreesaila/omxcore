@@ -161,3 +161,18 @@ def test_tpch_q14_at_sf1_equals_duckdb(mx):
         con.execute(f"CREATE VIEW {name} AS SELECT * FROM read_parquet('{path}')")
     res = check(mx, q14, con, files)
     assert res["row_count"] == 1
+
+
+def test_aggregates_read_as_doubles_follow_the_same_rule(mx, tmp_path):
+    """Review: the shadow column of `sum(d) * 1.5e0` / `sum(d) / 3` (post.mojo) converted with the plain quotient: an ulp off for group sums past 2^53."""
+    rnd = random.Random(7)
+    rows = [(g, rnd.randrange(10**15, 4 * 10**16)) for g in range(300) for _ in range(12)]
+    cols = {"g": pa.array([g for g, _ in rows], pa.int64())}
+    for s in (0, 1, 2, 5, 9):
+        cols[f"d{s}"] = pa.array([Decimal(v).scaleb(-s) for _, v in rows], pa.decimal128(18, s))
+    path = tmp_path / "grp.parquet"
+    pq.write_table(pa.table(cols), path)
+    con = duckdb.connect()
+    con.execute(f"create table t as select * from read_parquet('{path}')")
+    for s in (0, 1, 2, 5, 9):
+        check(mx, f"SELECT g, sum(d{s}) * 1.5e0 AS a, sum(d{s}) / 3 AS b, avg(d{s}) * 1.0e0 AS c, max(d{s}) + 0.5e0 AS m FROM t GROUP BY g", con, {"t": path})
