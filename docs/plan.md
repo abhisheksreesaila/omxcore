@@ -1681,8 +1681,9 @@ Order: F-162 gate → F-166 scoreboard → F-161 / F-167 / F-168 gaps → F-165 
 - [x] (tonight) a sort bigger than the memory budget spills sorted runs to disk and merges them (Table, Frame, Parquet and CSV scans; ORDER BY in SQL and the builder), results equal to DuckDB, memory bounded by the budget; speed work (radix, gather) after a quiet-machine measurement
 - [ ] full multi-key sorts and million-row results (today ~2x DuckDB): parallel radix sort with merge, column gather without per-row work, streamed output
 
-## F-168 Window functions [doing, 2026-10-27] (app #17)
-- [ ] `OVER (PARTITION BY … ORDER BY …)`: row_number, rank, dense_rank, lag / lead, running and framed sums, first / last value; equal to DuckDB
+## F-168 Window functions [done 2026-10-28] (app #17)
+- Built: SQL `f(...) OVER (PARTITION BY … ORDER BY … [ROWS | RANGE frame])` in the select list and ORDER BY (`winsql.mojo` splits the statement, `window.mojo` evaluates: stable radix sort, partitions on the pool, running frames, a monotone deque for min / max): row_number, rank, dense_rank, percent_rank, cume_dist, ntile, lag / lead, first / last / nth_value, sum / count / avg / min / max over frames; with WHERE and GROUP BY; Table, Frame, Parquet and CSV scans (a scan materialises the columns), joins. Builder: `Window`, `WindowFn`, `Agg.over`, `Query.window`, `compute_windows`. Exact INT / DECIMAL (128-bit running totals), bits equal for 1 and 8 threads, cancel between partitions; CPU only (AUTO says so, GPU raises). Tests ~510 vs DuckDB plus a seeded random-spec fuzz. Review: round 1 NEEDS WORK (a frame starting 2+ rows past the partition end read the next partition), round 2 PASS (1,200 fuzzed queries equal DuckDB). Limits: no QUALIFY / filtering on a window result (needs F-159), no windows bigger than memory, sort single-threaded (slower than DuckDB on rank / lag, faster on running sums).
+- [x] `OVER (PARTITION BY … ORDER BY …)`: row_number, rank, dense_rank, lag / lead, running and framed sums, first / last value; equal to DuckDB
 
 ## F-169 MCP server for `mx` [todo]
 - [ ] a small MCP server over the `mx` command (sql, explain, schema) so agents use omxcore as a data tool; no Python inside the engine
