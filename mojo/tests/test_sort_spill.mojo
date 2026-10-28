@@ -270,6 +270,32 @@ def test_save_sorted_file() raises:
         fail("an in-memory sort written to a file")
 
 
+def test_join_and_group_by() raises:
+    """A sorted join and a sorted aggregate: the join's rows spill like any rows; an aggregate's groups are not a row query and sort in memory."""
+    var other = Table.empty()
+    var oid = other.add_column("oid", INT)
+    var tag = other.add_column("tag", TEXT)
+    for i in range(0, N, 2):
+        other.append(oid, Int64(i))
+        other.append_text(tag, "tag" + String(i % 7))
+    var cat = Catalog()
+    cat.add_table("t", make_table())
+    cat.add_table("o", other^.share())
+    var jq = "SELECT t.id, t.k1, o.tag FROM t JOIN o ON t.id = o.oid ORDER BY o.tag DESC, t.k1 NULLS FIRST, t.id"
+    var want = sql(cat, jq)
+    var got = sql(cat, jq, options(1024))
+    if rows_of(got.table) != rows_of(want.table):
+        fail("a sorted join differs when it spills")
+    var res = sql_to_parquet(cat, jq, "join-out.parquet", options(1024), "", ZSTD, 1000)
+    if res.rows_written != want.table.rows() or rows_of(read_parquet("join-out.parquet").table) != rows_of(want.table):
+        fail("a sorted join written to a file differs")
+    var gq = "SELECT k1, count(*), sum(d) FROM t GROUP BY k1 ORDER BY 2 DESC, k1"
+    var gres = sql_to_parquet(cat, gq, "group-out.parquet", options(1024))
+    if rows_of(read_parquet("group-out.parquet").table) != rows_of(sql(cat, gq).table) or gres.rows_written != 14:
+        fail("a sorted aggregate written to a file differs")
+    no_files_left()
+
+
 def test_error_removes_the_runs() raises:
     """An error after the runs are written (the output folder is a file) leaves no temporary file and no output."""
     var cat = Catalog()
@@ -327,6 +353,8 @@ def main() raises:
     print("ok   top-k")
     test_save_sorted_file()
     print("ok   sorted file")
+    test_join_and_group_by()
+    print("ok   join and group by")
     test_error_removes_the_runs()
     print("ok   error")
     test_cancel_removes_the_runs()

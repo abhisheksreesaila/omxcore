@@ -13,7 +13,7 @@ A TEXT key is a dictionary code, and a code's place is relative to the words pre
 written the words that occurred are ranked once (`_sort_keys` over them), so a merge compares ranks that mean the same in every run.
 
 Run file layout: run after run, each column by column: n values (Int64), then n NULL flags (bytes); the last column is `seq`. A block
-of a run is read with one `pread` per column. The file is removed when the sorter is dropped: on success, on an error, on a cancel.
+of a run is read with one seek and read per column. The file is removed when the sorter is dropped: on success, on an error, on a cancel.
 """
 from std.ffi import external_call
 from std.memory.alloc import unsafe_alloc
@@ -29,8 +29,9 @@ from .kernels.pipeline_cpu import VEC
 
 comptime SORT_BUDGET_DEFAULT = 2 << 30         # bytes of rows a sort holds in memory at once, when the caller sets no budget
 comptime ROW_COLLECT_BYTES = 9                 # a collected row costs this many bytes a column: its value and its NULL flag
-comptime SORT_WORK_BASE = 16                   # sorting a run: the row order and a copy of its keys, per row ...
-comptime SORT_WORK_PER_KEY = 72                # ... and per key: the key numbers, the radix passes' two buffers and their row orders
+comptime SORT_WORK_BASE = 96                   # sorting a run: the row order, one radix pass's buffers and the gathered column being written, per row ...
+
+comptime SORT_WORK_PER_KEY = 16                # ... and per key: its copy and the numbers made of it (measured: docs/omxcore-mojo-api.md, F-167)
 comptime MERGE_MIN_BLOCK = 64                  # rows of each run the merge keeps in memory, at the least
 comptime MERGE_MAX_BLOCK = 1 << 16
 comptime CANCEL_EVERY = 1 << 16                # merged rows between two cancel checks
@@ -65,24 +66,28 @@ def _spill_name(dir: String) -> String:
 
 
 def _write_all(fd: Int, addr: Int, count: Int, offset: Int, path: String) raises:
+    if external_call["lseek", Int](fd, offset, Int32(0)) < 0:          # (lseek + write, not pwrite: the Mac app's libSystem stub has the first two)
+        raise Error("couldn't write the sort's temporary file `" + path + "`")
     var done = 0
     while done < count:
-        var n = external_call["pwrite", Int](fd, addr + done, count - done, offset + done)
+        var n = external_call["write", Int](fd, UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=addr + done), count - done)
         if n <= 0:
             raise Error("couldn't write the sort's temporary file `" + path + "`: the disk may be full, or the folder not writable (PlannerOptions.spill_dir)")
         done += n
 
 
 def _read_all(fd: Int, addr: Int, count: Int, offset: Int, path: String) raises:
+    if external_call["lseek", Int](fd, offset, Int32(0)) < 0:
+        raise Error("couldn't read the sort's temporary file `" + path + "` back")
     var done = 0
     while done < count:
-        var n = external_call["pread", Int](fd, addr + done, count - done, offset + done)
+        var n = external_call["read", Int](fd, UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=addr + done), count - done)
         if n <= 0:
             raise Error("couldn't read the sort's temporary file `" + path + "` back (was it removed?)")
         done += n
 
 
-# (the lists are parameters here: the caller keeps them alive for the whole call, which a local's address handed to pwrite / pread would not)
+# (the lists are parameters here: the caller keeps them alive for the whole call, which a local's address handed to write / read would not)
 def _put64(fd: Int, v: List[Int64], offset: Int, path: String) raises:
     _write_all(fd, Int(v.unsafe_ptr()), len(v) * 8, offset, path)
 

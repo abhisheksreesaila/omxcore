@@ -579,11 +579,14 @@ def _finish_spilled(mut sp: SpillSort, q: BoundQuery, items: List[_Item], opts: 
         var w = ParquetWriter(sink.path, shape, optional, sink.compression)
         w.budget = min(WRITE_BUDGET, max(4 << 20, budget // 4))
         var total = 0
+        # a row group is built from a batch of merged rows (the batch, its output columns, the table, the pages): about 6 copies of 9 bytes a value,
+        # so the budget caps the rows of a group; the file's row groups are `row_group_rows` rows when the budget allows
+        var group = min(sink.row_group_rows, max(1024, (budget // (54 * max(len(pick), 1))) // 8 * 8))
         try:
             opts.job.stage(STAGE_WRITE)
             while True:
                 opts.job.check()
-                var batch = sp.merge_batch(sink.row_group_rows, dicts)
+                var batch = sp.merge_batch(group, dicts)
                 var n = len(batch[0].v)
                 if n == 0:
                     break
