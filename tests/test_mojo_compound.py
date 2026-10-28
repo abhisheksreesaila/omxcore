@@ -32,7 +32,7 @@ def data(tmp_path_factory):
         case when i % 17 = 0 then null else (['West', 'east', 'North', 'south', 'Apple'])[1 + (i % 5)] end as s,
         case when i % 19 = 0 then null else ((i * 7) % 1000 - 300) * 0.01 end::DECIMAL(10,2) as d
         from range({N_T}) r(i)""")
-    con.execute(f"""create table u as select i::BIGINT as uid,
+    con.execute(f"""create table u as select i::BIGINT as uid, i::BIGINT as id,
         case when i % 9 = 0 then null else (i % 5)::BIGINT end as k,
         case when i % 6 = 0 then null else ((i * 11) % 30)::BIGINT end as w,
         (['West', 'east', 'Zed'])[1 + (i % 3)] as s from range({N_U}) r(i)""")
@@ -171,3 +171,176 @@ def test_a_cte_that_is_never_read_does_not_run(mx, data):
 ])
 def test_unsupported_forms_raise_by_name(mx, data, sql, message):
     assert message in error_of(mx, data, sql)
+
+
+# ── step 2: subqueries ───────────────────────────────────────────────────────────────────────────
+
+SUBQUERIES = {
+    # scalar, uncorrelated (an empty inner is NULL)
+    "scalar-compare": "SELECT id FROM t WHERE v > (SELECT avg(w) FROM u WHERE {f})",
+    "scalar-equal-int": "SELECT id FROM t WHERE k = (SELECT min(k) FROM u WHERE {f})",
+    "scalar-in-select-list": "SELECT id, (SELECT max(w) FROM u WHERE {f}) AS m FROM t WHERE id < 5",
+    "scalar-text": "SELECT id FROM t WHERE lower(s) = (SELECT max(lower(s)) FROM u WHERE {f})",
+    "scalar-decimal": "SELECT id FROM t WHERE d > (SELECT max(d) FROM t WHERE {f} AND id < 100)",
+    "scalar-in-having": "SELECT k, count(*) FROM t GROUP BY k HAVING count(*) > (SELECT count(*) FROM u WHERE {f}) / 10",
+    "scalar-in-arithmetic": "SELECT id FROM t WHERE v * 2 < 3 * (SELECT sum(w) FROM u WHERE {f}) / 40",
+    "scalar-no-rows-is-null": "SELECT id, coalesce((SELECT max(w) FROM u WHERE {f} AND w < 0), -1) FROM t WHERE id < 3",
+    "scalar-over-a-derived-table": "SELECT id FROM t WHERE v = (SELECT max(w) FROM (SELECT w FROM u WHERE {f}) x)",
+    # IN, uncorrelated
+    "in": "SELECT id FROM t WHERE k IN (SELECT k FROM u WHERE {f})",
+    "not-in-with-nulls": "SELECT id FROM t WHERE k NOT IN (SELECT k FROM u WHERE {f})",
+    "not-in-without-nulls": "SELECT id FROM t WHERE k NOT IN (SELECT k FROM u WHERE {f} AND k IS NOT NULL)",
+    "in-or": "SELECT id FROM t WHERE k IN (SELECT k FROM u WHERE {f}) OR id < 3",
+    "in-group-by-having": "SELECT id FROM t WHERE k IN (SELECT k FROM u WHERE {f} GROUP BY k HAVING count(*) > 5)",
+    "in-beside-a-join": "SELECT t.id, u.uid FROM t JOIN u ON t.k = u.k WHERE t.v IN (SELECT w FROM u WHERE {f})",
+    "in-two-subqueries": "SELECT id FROM t WHERE k IN (SELECT k FROM u WHERE {f}) AND v NOT IN (SELECT w FROM u WHERE w IS NOT NULL AND {f})",
+    "in-derived-inner": "SELECT id FROM t WHERE k IN (SELECT k FROM (SELECT k, count(*) c FROM u WHERE {f} GROUP BY k) x WHERE c > 2)",
+    # EXISTS
+    "exists": "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE {f}) AND id < 5",
+    "not-exists": "SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE {f}) AND id < 5",
+    "exists-correlated": "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k AND {f})",
+    "not-exists-correlated": "SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.k = t.k AND {f})",
+    "exists-correlated-filter": "SELECT id FROM t WHERE EXISTS (SELECT * FROM u WHERE u.k = t.k AND u.w > 10 AND {f})",
+    "exists-correlated-expression": "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k + 1 = t.k AND {f})",
+    "exists-two-keys": "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k AND u.w = t.v AND {f})",
+    "exists-not-equal": "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k AND u.w <> t.v AND {f})",
+    "not-exists-not-equal": "SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.k = t.k AND u.w <> t.v AND {f})",
+    "exists-less": "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k AND u.w < t.v AND {f})",
+    "exists-greater-equal-flipped": "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE t.v >= u.w AND u.k = t.k AND {f})",
+    "not-exists-greater": "SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.k = t.k AND u.w > t.v AND {f})",
+    "exists-only-inequality": "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.w > t.v AND {f})",
+    "not-exists-only-inequality": "SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.w > t.v AND {f})",
+    "exists-and-not-exists": "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k AND u.w <> t.v AND {f}) AND NOT EXISTS (SELECT 1 FROM u WHERE u.k = t.k AND u.w > 20)",
+    "exists-beside-a-join": "SELECT a.id, b.uid FROM t a JOIN u b ON a.k = b.k WHERE EXISTS (SELECT 1 FROM t c WHERE c.k = a.k AND c.id <> a.id AND {f})",
+    "exists-with-alias-and-plain-filter": "SELECT o.id FROM t AS o WHERE o.v > 0 AND NOT EXISTS (SELECT 1 FROM u WHERE u.k = o.k AND {f}) AND o.id < 150",
+    "exists-inner-join": "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u JOIN t t2 ON u.k = t2.k WHERE u.k = t.k AND u.w > 5 AND {fq})",
+    "exists-outer-only-condition": "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE t.v > 3 AND {f})",
+    "in-correlated": "SELECT id FROM t WHERE v IN (SELECT w FROM u WHERE u.k = t.k AND {f})",
+    "in-correlated-two-keys": "SELECT id FROM t WHERE v IN (SELECT w FROM u WHERE u.k = t.k AND u.s = t.s AND {f})",
+    # scalar, correlated
+    "scalar-correlated-avg": "SELECT id FROM t WHERE v > (SELECT avg(w) FROM u WHERE u.k = t.k AND {f})",
+    "scalar-correlated-min": "SELECT id FROM t WHERE v = (SELECT min(w) FROM u WHERE u.k = t.k AND {f})",
+    "scalar-correlated-sum-flipped": "SELECT id FROM t WHERE (SELECT sum(w) FROM u WHERE u.k = t.k AND {f}) > v",
+    "scalar-correlated-count-zero": "SELECT id FROM t WHERE (SELECT count(*) FROM u WHERE u.k = t.k AND {f}) = 0",
+    "scalar-correlated-count-positive": "SELECT id FROM t WHERE 2 <= (SELECT count(w) FROM u WHERE u.k = t.k AND {f})",
+    "scalar-correlated-arithmetic": "SELECT id FROM t WHERE v * 2 < (SELECT 0.5 * avg(w) FROM u WHERE u.k = t.k AND {f})",
+    "scalar-correlated-two-keys": "SELECT id FROM t WHERE v < (SELECT max(w) FROM u WHERE u.k = t.k AND u.s = t.s AND {f})",
+    "scalar-correlated-isnull": "SELECT id FROM t WHERE (SELECT max(w) FROM u WHERE u.k = t.k AND {f}) IS NULL AND id < 30",
+    "scalar-correlated-beside-a-join": "SELECT a.id, b.uid FROM t a JOIN u b ON a.k = b.k WHERE a.v > (SELECT avg(w) FROM u WHERE u.k = a.k AND {f})",
+    "scalar-correlated-aggregate-outside": "SELECT k, count(*) FROM t WHERE v > (SELECT avg(w) FROM u WHERE u.k = t.k AND {f}) GROUP BY k",
+    "scalar-correlated-and-plain": "SELECT id FROM t WHERE id < 200 AND v >= (SELECT min(w) FROM u WHERE u.k = t.k AND {f}) AND s <> 'east'",
+    "scalar-correlated-text-key": "SELECT id FROM t WHERE d > (SELECT min(d) FROM t t2 WHERE t2.s = t.s AND {f})",
+}
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("f", FILTERS)
+@pytest.mark.parametrize("name", list(SUBQUERIES))
+def test_subquery_equals_duckdb(mx, data, name, f, mode):
+    q(mx, data, mode, SUBQUERIES[name].format(f=f, fq=f.replace("id", "u.id")))
+
+
+def test_a_subquery_over_a_csv_file(mx, data):
+    q(mx, data, "csv", "SELECT id FROM t WHERE k IN (SELECT k FROM u WHERE w > 10) AND EXISTS (SELECT 1 FROM u WHERE u.k = t.k)")
+
+
+def test_a_scalar_subquery_with_more_than_one_row_raises(mx, data):
+    msg = error_of(mx, data, "SELECT id FROM t WHERE v = (SELECT w FROM u)")
+    assert "the scalar subquery returned 40 rows: a scalar subquery must return at most one row" in msg
+
+
+def test_a_scalar_subquery_with_two_columns_raises(mx, data):
+    assert "must return one column, this one returns 2" in error_of(mx, data, "SELECT id FROM t WHERE v = (SELECT w, k FROM u LIMIT 1)")
+
+
+@pytest.mark.parametrize("sql,message", [
+    ("SELECT id FROM t WHERE v NOT IN (SELECT w FROM u WHERE u.k = t.k)", "a correlated NOT IN (SELECT ...) is not supported yet"),
+    ("SELECT id, (SELECT max(w) FROM u WHERE u.k = t.k) FROM t", "a correlated subquery outside WHERE is not supported yet"),
+    ("SELECT id FROM t WHERE id < 3 OR EXISTS (SELECT 1 FROM u WHERE u.k = t.k)", "is supported as a condition of its own"),
+    ("SELECT id FROM t WHERE v > (SELECT w FROM u WHERE u.k = t.k)", "a correlated scalar subquery must be an aggregate"),
+    ("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k AND u.w < t.v AND u.uid > t.id)", "more than one inequality"),
+    ("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.w + t.v = 3)", "must compare an expression of the subquery's tables with one outer column"),
+    ("SELECT id FROM t WHERE EXISTS (SELECT k FROM u WHERE u.k = t.k GROUP BY k)", "with GROUP BY or HAVING is not supported yet"),
+    ("SELECT id FROM t WHERE 3 = (SELECT count(*) + sum(1) FROM u WHERE u.k = t.k)", "COUNT inside an expression"),
+])
+def test_unsupported_subquery_forms_raise_by_name(mx, data, sql, message):
+    assert message in error_of(mx, data, sql)
+
+
+def test_the_plan_names_each_subquery_step(mx, data):
+    text = plan(mx, data, "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = t.k AND u.w <> t.v)")
+    assert "subquery EXISTS:" in text and "min and max" in text
+    text = plan(mx, data, "SELECT id FROM t WHERE k IN (SELECT k FROM u)")
+    assert "subquery IN:" in text and "a semi join" in text
+    text = plan(mx, data, "SELECT id FROM t WHERE v > (SELECT max(w) FROM u)")
+    assert "scalar subquery: 1 row, a constant" in text
+
+
+# ── the TPC-H shapes (dbgen SF 0.1) ──────────────────────────────────────────────────────────────
+
+@pytest.fixture(scope="session")
+def tpch(tmp_path_factory):
+    d = tmp_path_factory.mktemp("tpch_compound")
+    con = duckdb.connect()
+    con.execute("INSTALL tpch")
+    con.execute("LOAD tpch")
+    con.execute("CALL dbgen(sf=0.1)")
+    paths = {}
+    for (t,) in con.execute("show tables").fetchall():
+        paths[t] = d / f"{t}.parquet"
+        con.execute(f"copy {t} to '{paths[t]}' (format parquet, row_group_size 30000)")
+    return {"con": con, "paths": paths}
+
+
+def tpch_q(mx, tpch, sql, ordered=False, extra=()):
+    names = [t for t in ("customer", "orders", "lineitem", "supplier", "nation", "region", "part", "partsupp") if re.search(rf"\b{t}\b", sql)]
+    return check(mx, sql, tpch["con"], files={t: tpch["paths"][t] for t in names}, ordered=ordered, extra=list(extra))
+
+
+TPCH = {
+    "Q2": ("""SELECT s_acctbal, s_name, n_name, p_partkey, p_mfgr, s_address, s_phone, s_comment
+FROM part, supplier, partsupp, nation, region
+WHERE p_partkey = ps_partkey AND s_suppkey = ps_suppkey AND p_size = 15 AND p_type LIKE '%BRASS' AND s_nationkey = n_nationkey
+  AND n_regionkey = r_regionkey AND r_name = 'EUROPE'
+  AND ps_supplycost = (SELECT min(ps_supplycost) FROM partsupp, supplier, nation, region
+                       WHERE p_partkey = ps_partkey AND s_suppkey = ps_suppkey AND s_nationkey = n_nationkey AND n_regionkey = r_regionkey AND r_name = 'EUROPE')
+ORDER BY s_acctbal DESC, n_name, s_name, p_partkey LIMIT 100""", True),
+    "Q4": ("""SELECT o_orderpriority, count(*) AS order_count FROM orders
+WHERE o_orderdate >= DATE '1993-07-01' AND o_orderdate < DATE '1993-07-01' + INTERVAL '3' MONTH
+  AND EXISTS (SELECT * FROM lineitem WHERE l_orderkey = o_orderkey AND l_commitdate < l_receiptdate)
+GROUP BY o_orderpriority ORDER BY o_orderpriority""", True),
+    "Q17": ("""SELECT sum(l_extendedprice) / 7.0 AS avg_yearly FROM lineitem, part
+WHERE p_partkey = l_partkey AND p_brand = 'Brand#23' AND p_container = 'MED BOX'
+  AND l_quantity < (SELECT 0.2 * avg(l_quantity) FROM lineitem WHERE l_partkey = p_partkey)""", False),
+    "Q18": ("""SELECT c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice, sum(l_quantity) FROM customer, orders, lineitem
+WHERE o_orderkey IN (SELECT l_orderkey FROM lineitem GROUP BY l_orderkey HAVING sum(l_quantity) > 300)
+  AND c_custkey = o_custkey AND o_orderkey = l_orderkey
+GROUP BY c_name, c_custkey, o_orderkey, o_orderdate, o_totalprice ORDER BY o_totalprice DESC, o_orderdate LIMIT 100""", True),
+    "Q20": ("""SELECT s_name, s_address FROM supplier, nation
+WHERE s_suppkey IN (SELECT ps_suppkey FROM partsupp
+                    WHERE ps_partkey IN (SELECT p_partkey FROM part WHERE p_name LIKE 'forest%')
+                      AND ps_availqty > (SELECT 0.5 * sum(l_quantity) FROM lineitem
+                                         WHERE l_partkey = ps_partkey AND l_suppkey = ps_suppkey
+                                           AND l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1994-01-01' + INTERVAL '1' YEAR))
+  AND s_nationkey = n_nationkey AND n_name = 'CANADA' ORDER BY s_name""", True),
+    "Q21": ("""SELECT s_name, count(*) AS numwait FROM supplier, lineitem l1, orders, nation
+WHERE s_suppkey = l1.l_suppkey AND o_orderkey = l1.l_orderkey AND o_orderstatus = 'F' AND l1.l_receiptdate > l1.l_commitdate
+  AND EXISTS (SELECT * FROM lineitem l2 WHERE l2.l_orderkey = l1.l_orderkey AND l2.l_suppkey <> l1.l_suppkey)
+  AND NOT EXISTS (SELECT * FROM lineitem l3 WHERE l3.l_orderkey = l1.l_orderkey AND l3.l_suppkey <> l1.l_suppkey AND l3.l_receiptdate > l3.l_commitdate)
+  AND s_nationkey = n_nationkey AND n_name = 'SAUDI ARABIA'
+GROUP BY s_name ORDER BY numwait DESC, s_name LIMIT 100""", True),
+    "Q22": ("""SELECT cntrycode, count(*) AS numcust, sum(c_acctbal) AS totacctbal FROM (
+  SELECT substring(c_phone FROM 1 FOR 2) AS cntrycode, c_acctbal FROM customer
+  WHERE substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17')
+    AND c_acctbal > (SELECT avg(c_acctbal) FROM customer WHERE c_acctbal > 0.00 AND substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17'))
+    AND NOT EXISTS (SELECT * FROM orders WHERE o_custkey = c_custkey)) AS custsale
+GROUP BY cntrycode ORDER BY cntrycode""", True),
+}
+
+
+@pytest.mark.parametrize("stream", ["never", "always"])
+@pytest.mark.parametrize("name", list(TPCH))
+def test_tpch_shape_equals_duckdb(mx, tpch, name, stream):
+    sql, ordered = TPCH[name]
+    res = tpch_q(mx, tpch, sql, ordered=ordered, extra=("--stream", stream))
+    assert len(res["rows"]) > 0 or name in ("Q17",)
