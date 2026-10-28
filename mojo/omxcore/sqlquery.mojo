@@ -166,10 +166,11 @@ def register_result(mut run: QueryRun, mut catalog: Catalog, mut r: SqlResult, p
 
 
 def _resolve_slot[P: Planner](mut run: QueryRun, mut catalog: Catalog, name: String, is_file: Bool, kid: Int, alias: String, line: Int, col: Int,
-                              planner: P, opts: PlannerOptions) raises -> Tuple[String, String]:
+                              names: List[String], planner: P, opts: PlannerOptions) raises -> Tuple[String, String]:
     """A FROM entry: a derived table runs now; a CTE name runs (or reads the table it already made); anything else is left to the engine."""
     if kid >= 0:
         var r = exec_statement(run, catalog, kid, planner, opts)
+        _rename_columns(r.table, names, line, col)
         var rows = r.table.rows()
         var nm = register_result(run, catalog, r, "__d")
         run.steps.append("derived table " + (alias if alias.byte_length() > 0 else nm) + ": evaluated in place (" + _commas(rows) + " rows)")
@@ -329,19 +330,19 @@ def _resolve_slots[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st: 
     """The FROM entries of a statement that are derived tables, CTEs or views run (or are read) now and the statement names the tables they made."""
     if st.set_op != SET_NONE:
         return
-    var slot = _resolve_slot(run, catalog, st.table, st.table_is_file, st.table_kid, st.table_alias, st.table_line, st.table_col, planner, opts)
+    var slot = _resolve_slot(run, catalog, st.table, st.table_is_file, st.table_kid, st.table_alias, st.table_line, st.table_col, st.table_cols, planner, opts)
     st.table = slot[0]
     st.table_alias = slot[1]
     st.table_is_file = False
     st.table_kid = -1
     if st.has_right:
-        var rs = _resolve_slot(run, catalog, st.right_table, st.right_is_file, st.right_kid, st.right_alias, st.right_line, st.right_col, planner, opts)
+        var rs = _resolve_slot(run, catalog, st.right_table, st.right_is_file, st.right_kid, st.right_alias, st.right_line, st.right_col, st.right_cols, planner, opts)
         st.right_table = rs[0]
         st.right_alias = rs[1]
         st.right_is_file = False
         st.right_kid = -1
     for i in range(len(st.extra)):
-        var xs = _resolve_slot(run, catalog, st.extra[i].name, st.extra[i].is_file, st.extra[i].kid, st.extra[i].alias, st.extra[i].line, st.extra[i].col, planner, opts)
+        var xs = _resolve_slot(run, catalog, st.extra[i].name, st.extra[i].is_file, st.extra[i].kid, st.extra[i].alias, st.extra[i].line, st.extra[i].col, st.extra[i].cols, planner, opts)
         st.extra[i].name = xs[0]
         st.extra[i].alias = xs[1]
         st.extra[i].is_file = False
@@ -1053,7 +1054,7 @@ def try_inline[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st: SqlS
     """A statement over one derived table (or a CTE read once) that is just a filter and a projection of a source reads that source: the filter joins the statement's
     WHERE and the statement's references to the derived table's columns become the expressions behind them. Nothing is materialized, and a Parquet scan under it is
     filtered as it streams. Returns whether it did (the statement is untouched when it did not)."""
-    if st.set_op != SET_NONE or st.has_right or len(st.extra) > 0 or len(st.subs) > 0:
+    if st.set_op != SET_NONE or st.has_right or len(st.extra) > 0 or len(st.subs) > 0 or len(st.table_cols) > 0:
         return False
     for i in range(len(st.exprs)):
         if is_subquery_node(st.exprs[i].kind):                  # (a subquery may read the derived table's columns through its own pool)

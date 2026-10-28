@@ -326,8 +326,10 @@ struct TableRef(Copyable, Movable):
     var line: Int
     var col: Int
     var kid: Int                # F-159: a derived table `(SELECT ...) alias`: its statement in the query's store (-1 for a named table)
+    var cols: List[String]      # `alias (a, b)`: the derived table's column names
 
-    def __init__(out self, name: String, alias: String, is_file: Bool, line: Int, col: Int, kid: Int = -1):
+    def __init__(out self, name: String, alias: String, is_file: Bool, line: Int, col: Int, kid: Int = -1, var cols: List[String] = List[String]()):
+        self.cols = cols^
         self.name = name
         self.alias = alias
         self.is_file = is_file
@@ -435,8 +437,12 @@ struct SqlStatement(Movable):
     var set_left: Int
     var set_right: Int
     var qualify: Int            # QUALIFY condition, -1 for none
+    var table_cols: List[String]    # `(SELECT ...) alias (a, b)`: column names of the derived table in FROM (the right table's: `right_cols`)
+    var right_cols: List[String]
 
     def __init__(out self, text: String):
+        self.table_cols = List[String]()
+        self.right_cols = List[String]()
         self.ctes = List[Cte]()
         self.table_kid = -1
         self.right_kid = -1
@@ -653,6 +659,7 @@ struct _Parser(Movable):
     var level: Int                   # nesting of the recursive descent now
     var store: List[SqlStatement]    # F-159: the finished statements of a query (see SqlQuery); a nested query is parsed by a parser of its own that borrows it
     var ref_kid: Int                 # the statement of the derived table `table_ref` just read (-1 for a named table)
+    var ref_cols: List[String]       # ... and the column names after its alias
 
     def __init__(out self, var toks: List[Token], text: String):
         self.toks = toks^
@@ -662,6 +669,7 @@ struct _Parser(Movable):
         self.st = SqlStatement(text)
         self.store = List[SqlStatement]()
         self.ref_kid = -1
+        self.ref_cols = List[String]()
 
     def take(deinit self) -> SqlStatement:
         return self.st^
@@ -1035,6 +1043,7 @@ struct _Parser(Movable):
         self.st.table_col = tr[4]
         self.st.table_alias = tr[1]
         self.st.table_kid = self.ref_kid
+        self.st.table_cols = self.ref_cols.copy()
         self.join_tail()
         if self.is_kw("WHERE"):
             _ = self.advance()
@@ -1230,6 +1239,7 @@ struct _Parser(Movable):
         """One table in FROM: (name, alias, is a file name, line, column)."""
         var tt = self.tok()
         self.ref_kid = -1
+        self.ref_cols = List[String]()
         if self.is_sym("("):
             if not (self.is_kw("SELECT", 1) or self.is_kw("WITH", 1) or self.is_sym("(", 1)):
                 raise self.unsupported(tt, "a parenthesized table or join", "")
@@ -1247,7 +1257,20 @@ struct _Parser(Movable):
                 dalias = self.tok().text
                 _ = self.advance()
             if self.is_sym("("):
-                raise self.unsupported(self.tok(), "column names after a table alias", "name the columns in the subquery")
+                if dalias.byte_length() == 0:
+                    raise self.expected("a table alias before the column names")
+                _ = self.advance()
+                while True:
+                    var cn = self.tok()
+                    if cn.kind != T_IDENT and cn.kind != T_QIDENT:
+                        raise self.expected("a column name")
+                    self.ref_cols.append(cn.text)
+                    _ = self.advance()
+                    if self.is_sym(","):
+                        _ = self.advance()
+                        continue
+                    break
+                _ = self.expect_sym(")")
             self.ref_kid = k
             return (String(), dalias, False, tt.line, tt.col)
         if tt.kind == T_IDENT and tt.up == "LATERAL":
@@ -1298,7 +1321,7 @@ struct _Parser(Movable):
                 _ = self.advance()
                 var r = self.table_ref()
                 if self.st.has_right:
-                    self.st.extra.append(TableRef(r[0], r[1], r[2], r[3], r[4], self.ref_kid))
+                    self.st.extra.append(TableRef(r[0], r[1], r[2], r[3], r[4], self.ref_kid, self.ref_cols.copy()))
                 else:
                     self.set_right(r)
                     self.st.comma_join = True
@@ -1319,7 +1342,7 @@ struct _Parser(Movable):
             var r = self.table_ref()
             var more = self.st.has_right
             if more:
-                self.st.extra.append(TableRef(r[0], r[1], r[2], r[3], r[4], self.ref_kid))
+                self.st.extra.append(TableRef(r[0], r[1], r[2], r[3], r[4], self.ref_kid, self.ref_cols.copy()))
             else:
                 self.set_right(r)
             if self.is_kw("ON"):
@@ -1358,6 +1381,7 @@ struct _Parser(Movable):
         self.st.right_line = r[3]
         self.st.right_col = r[4]
         self.st.right_kid = self.ref_kid
+        self.st.right_cols = self.ref_cols.copy()
 
     # -- expressions, loosest first
     def expr(mut self) raises -> Int:

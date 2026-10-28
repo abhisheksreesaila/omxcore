@@ -110,6 +110,12 @@ def test_derived_table_over_a_csv_file(mx, data):
     q(mx, data, "csv", "SELECT k, count(*) FROM (SELECT * FROM t WHERE id > 20) x GROUP BY k")
 
 
+def test_derived_table_with_column_names(mx, data):
+    q(mx, data, "memory", "SELECT c_k, n FROM (SELECT k, count(*) FROM t GROUP BY k) AS c (c_k, n) WHERE n > 20")
+    q(mx, data, "memory", "SELECT n, count(*) FROM (SELECT k, count(v) FROM t GROUP BY k) c (kk, n) GROUP BY n")
+    q(mx, data, "memory", "SELECT a.x, b.y FROM (SELECT id, k FROM t) a (id2, x) JOIN (SELECT uid, k FROM u) b (uid2, y) ON a.x = b.y")
+
+
 def test_derived_table_without_an_alias(mx, data):
     q(mx, data, "memory", "SELECT * FROM (SELECT id FROM t WHERE id < 5)")
 
@@ -170,7 +176,8 @@ def test_a_cte_that_is_never_read_does_not_run(mx, data):
 @pytest.mark.parametrize("sql,message", [
     ("WITH RECURSIVE a AS (SELECT 1) SELECT * FROM a", "`WITH RECURSIVE` is not supported yet"),
     ("SELECT * FROM t, LATERAL (SELECT 1) x", "`LATERAL` is not supported yet"),
-    ("SELECT * FROM (SELECT id FROM t) x(a)", "column names after a table alias is not supported yet"),
+    ("SELECT * FROM (SELECT id FROM t) x(a, b)", "the column list names 2 columns, the query has 1"),
+    ("SELECT * FROM (SELECT id FROM t) (a)", "expected a table alias before the column names"),
     ("WITH a AS (SELECT id FROM t) SELECT * FROM b", "table `b` not found"),
     ("WITH a(x, y) AS (SELECT id FROM t) SELECT * FROM a", "the column list names 2 columns, the query has 1"),
 ])
@@ -555,3 +562,18 @@ def test_an_inlined_scan_streams_with_the_filter_pushed_into_it(mx, data):
     out = run_mx(mx, ["sql", "--stream", "always", "SELECT count(*) FROM (SELECT id, k FROM t WHERE id >= 200) x WHERE k = 3"], {"t": data["paths"]["t"]})
     assert any(n.startswith("ran: scan t") for n in out["notes"]), out["notes"]
     assert out["rows"] == [[sum(1 for i in range(200, 300) if i % 11 != 0 and i % 7 == 3)]]
+
+
+# ── DuckDB's own text of the TPC-H queries that need F-159 (Q11 sums DECIMAL x DECIMAL past int64: its own ticket; Q15 is written with WITH, DuckDB's text makes a view) ──
+
+Q15_WITH = """WITH revenue0 AS (SELECT l_suppkey AS supplier_no, sum(l_extendedprice * (1 - l_discount)) AS total_revenue FROM lineitem
+ WHERE l_shipdate >= DATE '1996-01-01' AND l_shipdate < DATE '1996-01-01' + INTERVAL '3' MONTH GROUP BY l_suppkey)
+SELECT s_suppkey, s_name, s_address, s_phone, total_revenue FROM supplier, revenue0 WHERE s_suppkey = supplier_no
+ AND total_revenue = (SELECT max(total_revenue) FROM revenue0) ORDER BY s_suppkey"""
+
+
+@pytest.mark.parametrize("n", [2, 4, 7, 8, 9, 13, 15, 16, 17, 18, 20, 21, 22])
+def test_duckdbs_own_tpch_text_equals_duckdb(mx, tpch, n):
+    sql = Q15_WITH if n == 15 else tpch["con"].execute(f"select query from tpch_queries() where query_nr = {n}").fetchone()[0].strip().rstrip(";")
+    res = tpch_q(mx, tpch, sql, ordered=True)
+    assert len(res["rows"]) > 0
