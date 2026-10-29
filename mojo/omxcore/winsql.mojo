@@ -387,7 +387,7 @@ def plan_windows(var st: SqlStatement, catalog: Catalog) raises -> WindowPlan:
                     table_cols.append(lower_ascii(catalog.sources[si].table.name(c)))
         for g in range(len(st.group_by)):
             ref gx = st.exprs[st.group_by[g]]
-            if gx.kind == X_INT and gx.text.byte_length() < 9:
+            if gx.kind == X_INT and not gx.flag and gx.text.byte_length() < 9:
                 var k = Int(gx.text)
                 if k >= 1 and k <= len(st.items):
                     st.group_by[g] = st.items[k - 1].expr
@@ -416,7 +416,7 @@ def plan_windows(var st: SqlStatement, catalog: Catalog) raises -> WindowPlan:
     # ORDER BY: ordinals and select aliases stay as written, anything else is an expression over the inner columns
     for o in orig_order:
         ref ox = rw.st.exprs[o.expr]
-        var keep = ox.kind == X_INT
+        var keep = ox.kind == X_INT and not ox.flag
         if ox.kind == X_COL and ox.text2.byte_length() == 0:
             for it in rw.out.items:
                 if lower_ascii(it.alias) == lower_ascii(ox.text):

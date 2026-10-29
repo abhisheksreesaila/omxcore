@@ -234,6 +234,10 @@ comptime X_DISTINCT = 21    # a IS DISTINCT FROM b; flag: IS NOT DISTINCT FROM
 comptime X_INTERVAL = 22    # INTERVAL n unit: a: the amount; text: the unit (DAY, WEEK, MONTH, YEAR) in upper case
 comptime X_ISBOOL = 23      # a IS [NOT] TRUE / FALSE: a: the operand; text: TRUE or FALSE; flag: NOT
 
+comptime X_SCALAR_Q = 24    # (SELECT ...) as a value (F-159): items[0]: the subquery's statement in the query's store
+comptime X_IN_Q = 25        # a IN (SELECT ...): a: the left side; items[0]: the subquery's statement; flag: NOT IN
+comptime X_EXISTS_Q = 26    # EXISTS (SELECT ...): items[0]: the subquery's statement; flag: NOT EXISTS
+
 comptime JK_INNER = 0       # the kinds of join (F-154); the semi and anti joins keep only the left table's rows and columns
 comptime JK_LEFT = 1
 comptime JK_SEMI = 2
@@ -321,13 +325,17 @@ struct TableRef(Copyable, Movable):
     var is_file: Bool
     var line: Int
     var col: Int
+    var kid: Int                # F-159: a derived table `(SELECT ...) alias`: its statement in the query's store (-1 for a named table)
+    var cols: List[String]      # `alias (a, b)`: the derived table's column names
 
-    def __init__(out self, name: String, alias: String, is_file: Bool, line: Int, col: Int):
+    def __init__(out self, name: String, alias: String, is_file: Bool, line: Int, col: Int, kid: Int = -1, var cols: List[String] = List[String]()):
+        self.cols = cols^
         self.name = name
         self.alias = alias
         self.is_file = is_file
         self.line = line
         self.col = col
+        self.kid = kid
 
 
 struct SubQuery(Copyable, Movable):
@@ -339,8 +347,12 @@ struct SubQuery(Copyable, Movable):
     var col: Int
     var sel: Int                # the selected expression, -1 for `*`
     var where: Int              # -1 for none
+    var inner: List[Int]        # F-159: the column references of `sel` and `where` that mean the subquery's own table (a rewrite of the outer statement's names leaves them alone)
+    var outer: List[Int]        # ... and the ones that mean the outer statement's (they follow its renames)
 
     def __init__(out self):
+        self.inner = List[Int]()
+        self.outer = List[Int]()
         self.table = String()
         self.alias = String()
         self.is_file = False
@@ -348,6 +360,35 @@ struct SubQuery(Copyable, Movable):
         self.col = 0
         self.sel = -1
         self.where = -1
+
+
+comptime SET_NONE = 0           # F-159: how a statement combines two others (its `set_left` and `set_right`)
+comptime SET_UNION_ALL = 1
+comptime SET_UNION = 2
+comptime SET_INTERSECT = 3
+comptime SET_EXCEPT = 4
+
+comptime CTE_AUTO = 0           # WITH name AS (...): inlined when read once, materialized once when read more
+comptime CTE_MATERIALIZED = 1   # WITH name AS MATERIALIZED (...)
+comptime CTE_INLINED = 2        # WITH name AS NOT MATERIALIZED (...)
+
+
+struct Cte(Copyable, Movable):
+    """`name [(columns)] AS [NOT] [MATERIALIZED] (query)` of a WITH clause (F-159)."""
+    var name: String
+    var columns: List[String]
+    var kid: Int
+    var hint: Int
+    var line: Int
+    var col: Int
+
+    def __init__(out self, name: String, kid: Int, hint: Int, line: Int, col: Int):
+        self.name = name
+        self.columns = List[String]()
+        self.kid = kid
+        self.hint = hint
+        self.line = line
+        self.col = col
 
 
 comptime EXPLAIN_NONE = 0
@@ -388,8 +429,29 @@ struct SqlStatement(Movable):
     var extra: List[TableRef]   # F-155: the third table of FROM and the ones after it (inner joins only)
     var from_subquery: Bool     # set by the binder when it turned a WHERE subquery into the right table of a semi / anti join
     var wins: List[WinSpec]     # F-168: the OVER clauses of the calls (an X_CALL with `c` >= 0 refers to one)
+    # F-159: other statements this one reads, by index in the query's store (`SqlQuery.stmts`); -1 for none
+    var ctes: List[Cte]         # WITH
+    var table_kid: Int          # FROM (SELECT ...) alias
+    var right_kid: Int
+    var set_op: Int             # SET_*: this statement is `set_left <op> set_right` (then it has no FROM; its ORDER BY and LIMIT apply to the result)
+    var set_left: Int
+    var set_right: Int
+    var qualify: Int            # QUALIFY condition, -1 for none
+    var no_from: Bool           # F-159: SELECT of constants with no FROM (the query runner gives the statement a one-row table of its own)
+    var table_cols: List[String]    # `(SELECT ...) alias (a, b)`: column names of the derived table in FROM (the right table's: `right_cols`)
+    var right_cols: List[String]
 
     def __init__(out self, text: String):
+        self.no_from = False
+        self.table_cols = List[String]()
+        self.right_cols = List[String]()
+        self.ctes = List[Cte]()
+        self.table_kid = -1
+        self.right_kid = -1
+        self.set_op = SET_NONE
+        self.set_left = -1
+        self.set_right = -1
+        self.qualify = -1
         self.wins = List[WinSpec]()
         self.distinct = False
         self.has_right = False
@@ -455,8 +517,12 @@ struct SqlStatement(Movable):
             return s + ")"
         if x.kind == X_SUBIN:
             return self.render_operand(x.a) + (" NOT IN (SELECT ...)" if x.flag else " IN (SELECT ...)")
-        if x.kind == X_EXISTS:
+        if x.kind == X_EXISTS or x.kind == X_EXISTS_Q:
             return "NOT EXISTS (SELECT ...)" if x.flag else "EXISTS (SELECT ...)"
+        if x.kind == X_SCALAR_Q:
+            return "(SELECT ...)"
+        if x.kind == X_IN_Q:
+            return self.render_operand(x.a) + (" NOT IN (SELECT ...)" if x.flag else " IN (SELECT ...)")
         if x.kind == X_CASE:
             var s = String("CASE")
             if x.a >= 0:
@@ -515,9 +581,21 @@ struct SqlStatement(Movable):
 
     def render_operand(self, e: Int) -> String:
         var k = self.exprs[e].kind
-        if k == X_BIN or k == X_NOT or k == X_ISNULL or k == X_BETWEEN or k == X_IN or k == X_NEG or k == X_SUBIN or k == X_LIKE or k == X_DISTINCT or k == X_ISBOOL:
+        if k == X_BIN or k == X_NOT or k == X_ISNULL or k == X_BETWEEN or k == X_IN or k == X_NEG or k == X_SUBIN or k == X_IN_Q or k == X_LIKE or k == X_DISTINCT or k == X_ISBOOL:
             return "(" + self.render(e) + ")"
         return self.render(e)
+
+
+struct SqlQuery(Movable):
+    """A parsed query (F-159): every statement it is made of in one store, the one the text ends with last. A derived table, a CTE, a subquery or an
+    operand of UNION is a statement of its own (its own expressions); the statements that read it hold its index."""
+    var stmts: List[SqlStatement]
+
+    def __init__(out self):
+        self.stmts = List[SqlStatement]()
+
+    def root(self) -> Int:
+        return len(self.stmts) - 1
 
 
 def _bound_text(kind: Int, n: Int) -> String:
@@ -581,6 +659,9 @@ struct _Parser(Movable):
     var st: SqlStatement
     var depths: List[Int]            # the depth of each expression of `st.exprs`
     var level: Int                   # nesting of the recursive descent now
+    var store: List[SqlStatement]    # F-159: the finished statements of a query (see SqlQuery); a nested query is parsed by a parser of its own that borrows it
+    var ref_kid: Int                 # the statement of the derived table `table_ref` just read (-1 for a named table)
+    var ref_cols: List[String]       # ... and the column names after its alias
 
     def __init__(out self, var toks: List[Token], text: String):
         self.toks = toks^
@@ -588,6 +669,9 @@ struct _Parser(Movable):
         self.depths = List[Int]()
         self.level = 0
         self.st = SqlStatement(text)
+        self.store = List[SqlStatement]()
+        self.ref_kid = -1
+        self.ref_cols = List[String]()
 
     def take(deinit self) -> SqlStatement:
         return self.st^
@@ -689,10 +773,8 @@ struct _Parser(Movable):
                 _ = self.advance()
                 self.st.explain = EXPLAIN_ANALYZE
             t = self.tok()
-        if t.kind == T_IDENT and t.up == "WITH":
-            raise self.unsupported(t, "`WITH` (common table expressions)", "F-159")
-        if t.kind == T_IDENT and t.up == "SELECT":
-            self.select()
+        if (t.kind == T_IDENT and (t.up == "SELECT" or t.up == "WITH")) or (t.kind == T_SYM and t.text == "("):
+            self.query_expr()
         elif t.kind == T_IDENT and (t.up == "INSERT" or t.up == "UPDATE" or t.up == "DELETE" or t.up == "CREATE" or t.up == "DROP" or
                                     t.up == "ALTER" or t.up == "COPY" or t.up == "VALUES" or t.up == "SET" or t.up == "PRAGMA" or
                                     t.up == "ATTACH" or t.up == "DESCRIBE" or t.up == "SHOW" or t.up == "PIVOT" or t.up == "FROM" or
@@ -705,7 +787,209 @@ struct _Parser(Movable):
         if self.tok().kind != T_EOF:
             raise self.expected("the end of the statement")
 
-    def select(mut self) raises:
+    def has_set_op(self) -> Bool:
+        """Whether UNION, INTERSECT or EXCEPT comes before this query's end (outside parentheses)."""
+        var depth = 0
+        var i = self.pos
+        while i < len(self.toks):
+            var t = self.toks[i].copy()
+            if t.kind == T_EOF or (t.kind == T_SYM and t.text == ";"):
+                return False
+            if t.kind == T_SYM and t.text == "(":
+                depth += 1
+            elif t.kind == T_SYM and t.text == ")":
+                depth -= 1
+                if depth < 0:
+                    return False
+            elif depth == 0 and t.kind == T_IDENT and (t.up == "UNION" or t.up == "INTERSECT" or t.up == "EXCEPT"):
+                return True
+            i += 1
+        return False
+
+    def nested(mut self) -> _Parser:
+        """A parser for a query inside this one, at the same place and sharing the store (give the store back with `finish_nested`)."""
+        var sub = _Parser(self.toks.copy(), self.st.text)
+        sub.pos = self.pos
+        sub.level = self.level + 1
+        swap(sub.store, self.store)
+        return sub^
+
+    def finish_nested(mut self, mut sub: _Parser) -> Int:
+        """Takes the store and the position back from a nested parser and stores its statement; returns the statement's index."""
+        swap(sub.store, self.store)
+        self.pos = sub.pos
+        var done = SqlStatement(self.st.text)
+        swap(done, sub.st)
+        self.store.append(done^)
+        return len(self.store) - 1
+
+    def query_after_paren(mut self) raises -> Int:
+        """After `(`: a whole query up to and including the `)`; returns its statement's index."""
+        self.enter(self.tok())
+        var sub = self.nested()
+        try:
+            sub.query_expr()
+        except e:
+            swap(sub.store, self.store)
+            raise e^
+        var k = self.finish_nested(sub)
+        _ = self.expect_sym(")")
+        self.level -= 1
+        return k
+
+    def set_operand(mut self) raises -> Int:
+        if self.is_sym("("):
+            _ = self.advance()
+            if not (self.is_kw("SELECT") or self.is_kw("WITH") or self.is_sym("(")):
+                raise self.expected("SELECT")
+            return self.query_after_paren()
+        if not self.is_kw("SELECT"):
+            raise self.expected("SELECT")
+        var sub = self.nested()
+        try:
+            sub.select_core()
+        except e:
+            swap(sub.store, self.store)
+            raise e^
+        return self.finish_nested(sub)
+
+    def store_setop(mut self, op: Int, left: Int, right: Int, t: Token) -> Int:
+        var n = SqlStatement(self.st.text)
+        n.set_op = op
+        n.set_left = left
+        n.set_right = right
+        n.table_line = t.line
+        n.table_col = t.col
+        self.store.append(n^)
+        return len(self.store) - 1
+
+    def set_kind(mut self, word: String, t: Token) raises -> Int:
+        """After UNION / INTERSECT / EXCEPT: ALL or DISTINCT; the operation."""
+        var all = False
+        if self.is_kw("ALL"):
+            _ = self.advance()
+            all = True
+        elif self.is_kw("DISTINCT"):
+            _ = self.advance()
+        if self.is_kw("BY"):
+            raise self.unsupported(self.tok(), "`" + word + " BY NAME`", "")
+        if word == "UNION":
+            return SET_UNION_ALL if all else SET_UNION
+        if all:
+            raise self.unsupported(t, "`" + word + " ALL`", "")
+        return SET_INTERSECT if word == "INTERSECT" else SET_EXCEPT
+
+    def intersect_chain(mut self) raises -> Int:
+        var left = self.set_operand()
+        while self.is_kw("INTERSECT"):
+            var t = self.advance()
+            var op = self.set_kind("INTERSECT", t)
+            var right = self.set_operand()
+            left = self.store_setop(op, left, right, t)
+        return left
+
+    def set_chain(mut self) raises:
+        """`a UNION [ALL] b INTERSECT c EXCEPT d ...` (INTERSECT binds tighter) into this statement, left to right."""
+        var left = self.intersect_chain()
+        var have = False
+        var pop = SET_NONE
+        var pl = -1
+        var pr = -1
+        var pline = self.tok().line
+        var pcol = self.tok().col
+        while self.is_kw("UNION") or self.is_kw("EXCEPT"):
+            if have:
+                left = self.store_setop(pop, pl, pr, Token(T_EOF, String(), String(), pline, pcol))
+            var t = self.advance()
+            var op = self.set_kind(t.up, t)
+            var right = self.intersect_chain()
+            have = True
+            pop = op
+            pl = left
+            pr = right
+            pline = t.line
+            pcol = t.col
+        if not have:                                                            # an INTERSECT chain: its last node is this statement
+            var n = self.store.pop()
+            pop = n.set_op
+            pl = n.set_left
+            pr = n.set_right
+            pline = n.table_line
+            pcol = n.table_col
+        self.st.table_line = pline
+        self.st.table_col = pcol
+        self.st.set_op = pop
+        self.st.set_left = pl
+        self.st.set_right = pr
+
+    def with_clause(mut self) raises:
+        _ = self.advance()                                                      # WITH
+        if self.is_kw("RECURSIVE"):
+            raise self.unsupported(self.tok(), "`WITH RECURSIVE`", "")
+        while True:
+            var nm = self.tok()
+            if nm.kind != T_IDENT and nm.kind != T_QIDENT:
+                raise self.expected("a name for the common table expression")
+            if nm.kind == T_IDENT and _reserved(nm.up):
+                raise self.expected("a name for the common table expression")
+            _ = self.advance()
+            var cols = List[String]()
+            if self.is_sym("("):
+                _ = self.advance()
+                while True:
+                    var c = self.tok()
+                    if c.kind != T_IDENT and c.kind != T_QIDENT:
+                        raise self.expected("a column name")
+                    cols.append(c.text)
+                    _ = self.advance()
+                    if self.is_sym(","):
+                        _ = self.advance()
+                        continue
+                    break
+                _ = self.expect_sym(")")
+            _ = self.expect_kw("AS")
+            var hint = CTE_AUTO
+            if self.is_kw("NOT") and self.is_kw("MATERIALIZED", 1):
+                _ = self.advance()
+                _ = self.advance()
+                hint = CTE_INLINED
+            elif self.is_kw("MATERIALIZED"):
+                _ = self.advance()
+                hint = CTE_MATERIALIZED
+            _ = self.expect_sym("(")
+            if not (self.is_kw("SELECT") or self.is_kw("WITH") or self.is_sym("(")):
+                raise self.expected("SELECT")
+            var k = self.query_after_paren()
+            var c = Cte(nm.text, k, hint, nm.line, nm.col)
+            c.columns = cols^
+            self.st.ctes.append(c^)
+            if self.is_sym(","):
+                _ = self.advance()
+                continue
+            break
+
+    def query_expr(mut self) raises:
+        """`[WITH ...] select | (query) [UNION | INTERSECT | EXCEPT ...] [ORDER BY ...] [LIMIT ...]` into this statement."""
+        if self.is_kw("WITH"):
+            self.with_clause()
+        if self.has_set_op():
+            self.set_chain()
+        elif self.is_sym("("):                                                  # (query) ORDER BY ..: a derived table read whole
+            var at = self.advance()
+            if not (self.is_kw("SELECT") or self.is_kw("WITH") or self.is_sym("(")):
+                raise self.expected("SELECT")
+            var k = self.query_after_paren()
+            self.st.items.append(SelectItem(-1, String(), False, at.line, at.col, True))
+            self.st.table_kid = k
+            self.st.table_line = at.line
+            self.st.table_col = at.col
+        elif self.is_kw("SELECT"):
+            self.select_core()
+        else:
+            raise self.expected("SELECT")
+        self.order_limit()
+
+    def select_core(mut self) raises:
         _ = self.advance()                                                      # SELECT
         if self.is_kw("DISTINCT"):
             if self.is_kw("ON", 1):
@@ -750,17 +1034,27 @@ struct _Parser(Movable):
                 continue
             break
         if not self.is_kw("FROM"):
-            if self.tok().kind == T_EOF or self.is_sym(";"):
-                raise _tok_error(self.tok(), "SELECT without FROM is not supported yet (F-152)")
-            raise self.expected("FROM")
-        _ = self.advance()
-        var tr = self.table_ref()
-        self.st.table = tr[0]
-        self.st.table_is_file = tr[2]
-        self.st.table_line = tr[3]
-        self.st.table_col = tr[4]
-        self.st.table_alias = tr[1]
-        self.join_tail()
+            if self.tok().kind == T_EOF or self.is_sym(";") or self.is_sym(")") or self.is_kw("UNION") or self.is_kw("INTERSECT") or self.is_kw("EXCEPT") or \
+               self.is_kw("ORDER") or self.is_kw("LIMIT") or self.is_kw("WHERE") or self.is_kw("GROUP") or self.is_kw("HAVING") or self.is_kw("QUALIFY"):
+                for it in self.st.items:
+                    if it.star:
+                        raise sql_error(it.line, it.col, "`SELECT *` needs a FROM clause")
+                self.st.no_from = True                              # F-159: SELECT of constants; the query runner gives it a one-row table
+                self.st.table_line = self.tok().line
+                self.st.table_col = self.tok().col
+            else:
+                raise self.expected("FROM")
+        else:
+            _ = self.advance()
+            var tr = self.table_ref()
+            self.st.table = tr[0]
+            self.st.table_is_file = tr[2]
+            self.st.table_line = tr[3]
+            self.st.table_col = tr[4]
+            self.st.table_alias = tr[1]
+            self.st.table_kid = self.ref_kid
+            self.st.table_cols = self.ref_cols.copy()
+            self.join_tail()
         if self.is_kw("WHERE"):
             _ = self.advance()
             self.st.where = self.expr()
@@ -780,10 +1074,13 @@ struct _Parser(Movable):
         if self.is_kw("HAVING"):
             _ = self.advance()
             self.st.having = self.expr()
-        if self.is_kw("QUALIFY") or self.is_kw("WINDOW") or self.is_kw("TABLESAMPLE") or self.is_kw("SAMPLE"):
+        if self.is_kw("QUALIFY"):
+            _ = self.advance()
+            self.st.qualify = self.expr()
+        if self.is_kw("WINDOW") or self.is_kw("TABLESAMPLE") or self.is_kw("SAMPLE"):
             raise self.unsupported(self.tok(), "`" + self.tok().up + "`", "")
-        if self.is_kw("UNION") or self.is_kw("INTERSECT") or self.is_kw("EXCEPT"):
-            raise self.unsupported(self.tok(), "`" + self.tok().up + "`", "")
+
+    def order_limit(mut self) raises:
         if self.is_kw("ORDER"):
             _ = self.advance()
             _ = self.expect_kw("BY")
@@ -951,8 +1248,43 @@ struct _Parser(Movable):
     def table_ref(mut self) raises -> Tuple[String, String, Bool, Int, Int]:
         """One table in FROM: (name, alias, is a file name, line, column)."""
         var tt = self.tok()
+        self.ref_kid = -1
+        self.ref_cols = List[String]()
         if self.is_sym("("):
-            raise self.unsupported(tt, "a subquery in FROM", "F-159")
+            if not (self.is_kw("SELECT", 1) or self.is_kw("WITH", 1) or self.is_sym("(", 1)):
+                raise self.unsupported(tt, "a parenthesized table or join", "")
+            _ = self.advance()
+            var k = self.query_after_paren()
+            var dalias = String()
+            if self.is_kw("AS"):
+                _ = self.advance()
+                var a = self.tok()
+                if a.kind != T_IDENT and a.kind != T_QIDENT:
+                    raise self.expected("a name after AS")
+                dalias = a.text
+                _ = self.advance()
+            elif (self.tok().kind == T_IDENT and not _reserved(self.tok().up)) or self.tok().kind == T_QIDENT:
+                dalias = self.tok().text
+                _ = self.advance()
+            if self.is_sym("("):
+                if dalias.byte_length() == 0:
+                    raise self.expected("a table alias before the column names")
+                _ = self.advance()
+                while True:
+                    var cn = self.tok()
+                    if cn.kind != T_IDENT and cn.kind != T_QIDENT:
+                        raise self.expected("a column name")
+                    self.ref_cols.append(cn.text)
+                    _ = self.advance()
+                    if self.is_sym(","):
+                        _ = self.advance()
+                        continue
+                    break
+                _ = self.expect_sym(")")
+            self.ref_kid = k
+            return (String(), dalias, False, tt.line, tt.col)
+        if tt.kind == T_IDENT and tt.up == "LATERAL":
+            raise self.unsupported(tt, "`LATERAL`", "")
         if tt.kind != T_IDENT and tt.kind != T_QIDENT and tt.kind != T_STR:
             raise self.expected("a table name or 'file name'")
         if tt.kind == T_IDENT and _reserved(tt.up):
@@ -999,7 +1331,7 @@ struct _Parser(Movable):
                 _ = self.advance()
                 var r = self.table_ref()
                 if self.st.has_right:
-                    self.st.extra.append(TableRef(r[0], r[1], r[2], r[3], r[4]))
+                    self.st.extra.append(TableRef(r[0], r[1], r[2], r[3], r[4], self.ref_kid, self.ref_cols.copy()))
                 else:
                     self.set_right(r)
                     self.st.comma_join = True
@@ -1020,7 +1352,7 @@ struct _Parser(Movable):
             var r = self.table_ref()
             var more = self.st.has_right
             if more:
-                self.st.extra.append(TableRef(r[0], r[1], r[2], r[3], r[4]))
+                self.st.extra.append(TableRef(r[0], r[1], r[2], r[3], r[4], self.ref_kid, self.ref_cols.copy()))
             else:
                 self.set_right(r)
             if self.is_kw("ON"):
@@ -1051,47 +1383,6 @@ struct _Parser(Movable):
             else:
                 raise self.expected("ON or USING after JOIN")
 
-    def subquery(mut self) raises -> Int:
-        """After `(`: `SELECT [DISTINCT] item | * FROM table [alias] [WHERE cond] )`. Returns its index in `st.subs`."""
-        var at = self.tok()
-        if not self.is_kw("SELECT"):
-            raise self.unsupported(at, "a subquery that starts with `" + at.up + "`", "F-159")
-        _ = self.advance()
-        if self.is_kw("DISTINCT"):
-            _ = self.advance()
-        elif self.is_kw("ALL"):
-            _ = self.advance()
-        var sub = SubQuery()
-        sub.line = at.line
-        sub.col = at.col
-        if self.is_sym("*"):
-            _ = self.advance()
-        else:
-            sub.sel = self.expr()
-        if self.is_sym(","):
-            raise self.unsupported(self.tok(), "a subquery with more than one column", "")
-        if not self.is_kw("FROM"):
-            raise self.expected("FROM")
-        _ = self.advance()
-        var tr = self.table_ref()
-        sub.table = tr[0]
-        sub.alias = tr[1]
-        sub.is_file = tr[2]
-        var u = self.tok()
-        if self.is_sym(",") or (u.kind == T_IDENT and (u.up == "JOIN" or u.up == "INNER" or u.up == "LEFT" or u.up == "RIGHT" or u.up == "FULL" or
-                                                      u.up == "CROSS" or u.up == "NATURAL" or u.up == "SEMI" or u.up == "ANTI")):
-            raise self.unsupported(u, "a join inside a subquery", "F-155")
-        if self.is_kw("WHERE"):
-            _ = self.advance()
-            sub.where = self.expr()
-        var v = self.tok()
-        if v.kind == T_IDENT and (v.up == "GROUP" or v.up == "HAVING" or v.up == "ORDER" or v.up == "LIMIT" or v.up == "OFFSET" or v.up == "UNION" or
-                                  v.up == "INTERSECT" or v.up == "EXCEPT" or v.up == "QUALIFY" or v.up == "WINDOW"):
-            raise self.unsupported(v, "`" + v.up + "` in a subquery", "F-159")
-        _ = self.expect_sym(")")
-        self.st.subs.append(sub^)
-        return len(self.st.subs) - 1
-
     def set_right(mut self, r: Tuple[String, String, Bool, Int, Int]):
         self.st.has_right = True
         self.st.right_table = r[0]
@@ -1099,6 +1390,8 @@ struct _Parser(Movable):
         self.st.right_is_file = r[2]
         self.st.right_line = r[3]
         self.st.right_col = r[4]
+        self.st.right_kid = self.ref_kid
+        self.st.right_cols = self.ref_cols.copy()
 
     # -- expressions, loosest first
     def expr(mut self) raises -> Int:
@@ -1180,9 +1473,11 @@ struct _Parser(Movable):
         if at.kind == T_IDENT and at.up == "IN":
             _ = self.advance()
             _ = self.expect_sym("(")
-            if self.is_kw("SELECT") or self.is_kw("WITH") or self.is_kw("FROM"):
-                var si = self.subquery()
-                var sid = self.node(X_SUBIN, "", left, -1, -1, at, neg)
+            if self.is_kw("FROM"):
+                raise self.unsupported(self.tok(), "a subquery that starts with `FROM`", "")
+            if self.is_kw("SELECT") or self.is_kw("WITH"):
+                var si = self.query_after_paren()
+                var sid = self.node(X_IN_Q, "", left, -1, -1, at, neg)
                 self.st.exprs[sid].items.append(si)
                 return sid
             var id = self.node(X_IN, "", left, -1, -1, at, neg)
@@ -1327,8 +1622,13 @@ struct _Parser(Movable):
         if t.kind == T_SYM:
             if t.text == "(":
                 _ = self.advance()
-                if self.is_kw("SELECT") or self.is_kw("WITH") or self.is_kw("FROM"):
-                    raise self.unsupported(self.tok(), "a scalar subquery", "F-159")
+                if self.is_kw("FROM"):
+                    raise self.unsupported(self.tok(), "a subquery that starts with `FROM`", "")
+                if self.is_kw("SELECT") or self.is_kw("WITH"):
+                    var k = self.query_after_paren()
+                    var sid = self.node(X_SCALAR_Q, "", -1, -1, -1, t)
+                    self.st.exprs[sid].items.append(k)
+                    return sid
                 var e = self.expr()
                 if self.is_sym(","):
                     raise self.unsupported(self.tok(), "a row value `(a, b)`", "")
@@ -1396,10 +1696,10 @@ struct _Parser(Movable):
                     _ = self.advance()
                 _ = self.advance()
                 _ = self.expect_sym("(")
-                if not self.is_kw("SELECT"):
+                if not (self.is_kw("SELECT") or self.is_kw("WITH")):
                     raise self.expected("SELECT")
-                var si = self.subquery()
-                var eid = self.node(X_EXISTS, "", -1, -1, -1, t, neg)
+                var si = self.query_after_paren()
+                var eid = self.node(X_EXISTS_Q, "", -1, -1, -1, t, neg)
                 self.st.exprs[eid].items.append(si)
                 return eid
             if _reserved(w) and w != "LEFT" and w != "RIGHT":
@@ -1544,11 +1844,48 @@ struct _Parser(Movable):
         return id
 
 
-def parse_sql(text: String) raises -> SqlStatement:
-    """The syntax tree of one SELECT or EXPLAIN SELECT statement; raises `SQL error at line L, column C: ...`."""
+def parse_query(text: String) raises -> SqlQuery:
+    """The syntax trees of one query (SELECT, EXPLAIN SELECT, WITH, UNION ...): the statements it is made of, the one the text ends with last."""
     var toks = lex_sql(text)
     if len(toks) == 1:
         raise sql_error(1, 1, "the statement is empty")
     var p = _Parser(toks^, text)
     p.statement()
-    return p^.take()
+    var q = SqlQuery()
+    swap(q.stmts, p.store)
+    var root = SqlStatement(text)
+    swap(root, p.st)
+    q.stmts.append(root^)
+    return q^
+
+
+def parse_sql(text: String) raises -> SqlStatement:
+    """The syntax tree of one plain SELECT or EXPLAIN SELECT statement (no WITH, subquery, derived table or set operation: `parse_query` reads those);
+    raises `SQL error at line L, column C: ...`."""
+    var q = parse_query(text)
+    if len(q.stmts) != 1:
+        raise sql_error(1, 1, "this query has a WITH clause, a subquery or a UNION: parse_query reads those")
+    return q.stmts.pop()
+
+
+def query_files(q: SqlQuery) -> List[String]:
+    """The file names ('orders.parquet') the query reads in any FROM, once each (the statements in the order of the query's store: a subquery before the statement that holds it)."""
+    var out = List[String]()
+    for i in range(len(q.stmts)):
+        ref st = q.stmts[i]
+        if st.table_is_file:
+            out.append(st.table)
+        if st.has_right and st.right_is_file:
+            out.append(st.right_table)
+        for ex in st.extra:
+            if ex.is_file:
+                out.append(ex.name)
+    var seen = List[String]()
+    for f in out:
+        var dup = False
+        for g in seen:
+            if g == f:
+                dup = True
+        if not dup:
+            seen.append(f)
+    return seen^

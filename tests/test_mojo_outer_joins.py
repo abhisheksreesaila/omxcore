@@ -324,19 +324,10 @@ def test_right_full_and_cross_joins_are_refused_by_name(mx, data, sql, message):
 
 
 def test_unsupported_subquery_shapes_say_so(mx, data):
+    # (F-159 lifted the limits on OR, several subqueries, subqueries beside a join, uncorrelated EXISTS and GROUP BY inside: tests/test_mojo_compound.py)
     t = ["cust", "ords", "dim"]
-    e = err(mx, data, "SELECT count(*) FROM cust WHERE ck IN (SELECT ck FROM ords) OR seg = 3", t)
-    assert "a subquery (IN, NOT IN, EXISTS, NOT EXISTS) is supported as a condition of WHERE joined to the others by AND" in e["message"], e
-    e = err(mx, data, "SELECT count(*) FROM cust WHERE ck IN (SELECT ck FROM ords) AND seg IN (SELECT k FROM dim)", t)
-    assert e["message"].startswith("more than one subquery in WHERE is not supported yet"), e
-    e = err(mx, data, "SELECT count(*) FROM cust c JOIN dim d ON c.ck = d.k WHERE c.ck IN (SELECT ck FROM ords)", t)
-    assert e["message"].startswith("a subquery in a query that also joins tables is not supported yet"), e
-    e = err(mx, data, "SELECT count(*) FROM cust WHERE EXISTS (SELECT 1 FROM ords WHERE amt > 3)", t)
-    assert "the subquery needs an equality" in e["message"], e
     e = err(mx, data, "SELECT count(*) FROM cust WHERE ck IN (SELECT ck, amt FROM ords)", t)
-    assert e["message"].startswith("a subquery with more than one column is not supported yet"), e
-    e = err(mx, data, "SELECT count(*) FROM cust WHERE ck IN (SELECT ck FROM ords GROUP BY ck)", t)
-    assert "`GROUP` in a subquery is not supported yet" in e["message"], e
+    assert e["message"].startswith("a subquery in IN must return one column, this one returns 2"), e
     e = err(mx, data, "SELECT count(*) FROM cust c LEFT JOIN ords o ON c.ck = o.ck AND c.seg > 3", ["cust", "ords"])
     assert "not supported in a LEFT JOIN yet" in e["message"], e
     e = err(mx, data, "SELECT o.oid FROM cust c SEMI JOIN ords o ON c.ck = o.ck", ["cust", "ords"])

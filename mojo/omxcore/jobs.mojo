@@ -17,7 +17,8 @@ from .job import Job, JobCtl, JobBody, JobDone, NoCallback, start_job_then
 from .query import Query, QueryResult, AUTO
 from .bind import Catalog
 from .planner import PlannerOptions, RulePlanner
-from .sqlexec import SqlResult, sql_with
+from .sqlexec import SqlResult
+from .sqlquery import sql_with
 from .csv import read_csv, CsvOptions, CsvResult
 from .parquet import ParquetResult, ParquetScan, read_parquet, scan_csv, write_parquet, ZSTD, DEFAULT_ROW_GROUP
 from .table import SharedTable

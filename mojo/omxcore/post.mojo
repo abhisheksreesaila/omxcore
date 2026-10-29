@@ -111,6 +111,8 @@ def run_post(q: BoundQuery, keys: List[ValCol], aggs: List[ValCol], dicts: DictA
             f.v[i] = float_bits(decimal_to_float(v.v[i], v.scale)) if not v.is_null(i) else 0
         f.nul = v.nul.copy()
         _put_column(g, "f" + String(s), f, dicts)
+    if g.columns() == 0:                                             # no key and no aggregate (`SELECT 1 HAVING true`): the rows of a table with no column are none, so a column carries the groups
+        _put_column(g, "n", ValCol(INT.value, 0, n), dicts)
     var shared = g^.share()
     var src = SqlSource("groups", shared)
     var dicts2 = DictAccess(shared, None, List[List[String]]())
