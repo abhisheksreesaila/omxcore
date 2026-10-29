@@ -91,6 +91,10 @@ The gate asks each device to beat DuckDB, but the SQL path runs everything on th
 ## F-193 A typed NULL constant keeps its own kind beside other constants (wrong column kind) [todo] (found by F-159, 2026-10-28)
 - [ ] `SELECT CAST(NULL AS DATE) AS m, CAST(NULL AS BIGINT) AS q` returns q as BIGINT (today DATE: a wrong answer); every constant select item keeps its type whatever else is in the list (exec.mojo); fuzz constant lists of every kind vs DuckDB
 
+## F-194 Tests and scripts leave nothing in /tmp [todo] (2026-10-28)
+`/tmp` is a 32 GB tmpfs with a per-user quota (docs/lessons.md); the owner's quota filled and tests failed. Today `tests/conftest.py` makes `omxcore-shim-*` in `tempfile.gettempdir()`, `scripts/stress_cpu_kernels.py` makes `mxframe-shim-*`, and something makes `mxframe-src-*` / `omxcore-src-*` (28 left behind).
+- [ ] every test, fixture and script puts scratch under `~/.cache/mxframe-test-tmp` (or `MXFRAME_TEST_TMPDIR`) and removes it; a check in `tests/` fails if a run leaves a new `/tmp/mxframe-*` / `/tmp/omxcore-*` entry
+
 ## F-057 Morsel co-processing that wins [done]
 Needs: F-053, F-055 · Builds on F-006 (`coproc.py`, `coproc_fused.py`, the Router) · Agreed 2026-10-15
 - [ ] research first (added to `docs/spec-auto-mode.md`): morsel-driven parallelism (Leis 2014), HetExchange, "Pump Up the Volume" and later CPU+GPU co-processing work; what F-006 measured (PCIe x8: streaming host data loses to CPU, resident data splits win) decides which ideas are worth it on this hardware
