@@ -16,7 +16,7 @@ Each statement then goes to the engine as the one-SELECT statement it was before
 from std.time import perf_counter_ns
 from .table import Table, SharedTable, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, F32_COLUMN
 from .sql import (SqlStatement, SqlQuery, SqlExpr, SelectItem, TableRef, WinSpec, Cte, SubQuery, OrderItem, parse_query, sql_error, lower_ascii, EXPLAIN_NONE, EXPLAIN_ANALYZE,
-                  SET_NONE, NO_FROM_TABLE, SET_UNION_ALL, SET_UNION, SET_INTERSECT, SET_EXCEPT, CTE_AUTO, CTE_MATERIALIZED, CTE_INLINED,
+                  SET_NONE, SET_UNION_ALL, SET_UNION, SET_INTERSECT, SET_EXCEPT, CTE_AUTO, CTE_MATERIALIZED, CTE_INLINED,
                   X_SCALAR_Q, X_IN_Q, X_EXISTS_Q, X_SUBIN, X_EXISTS, X_NOT, X_COL, X_INT, X_NULL, X_CAST, X_TRUE, X_FALSE, X_IN, X_BIN, X_CALL, X_ISBOOL, JK_INNER, JK_LEFT)
 from .bind import Catalog, _split_and_expr, _and_chain, _has_aggregate
 from .subq import (SIDE_OUTER, side_of, Scope, scope_of, Flat, flatten, flat_source, clone_shell, collect, is_subquery_node, add_node, column_node, equal_node, and_node,
@@ -315,6 +315,16 @@ def _exec_body[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: SqlS
         st.table_alias = String()
         st.table_is_file = False
         st.items.append(SelectItem(-1, String(), False, line, col, True))
+    if st.no_from:                                             # constants: a one-row table under a name no query wrote
+        var one = Table.empty()
+        var oc = one.add_column("__c", INT)
+        one.append(oc, 1)
+        var nm = run.fresh("__n")
+        while catalog.find(nm) >= 0:                           # (a name nobody has: a user's table of that name stays theirs)
+            nm = run.fresh("__n")
+        catalog.add_table(nm, one^.share())
+        st.table = nm
+        st.no_from = False
     _ = try_inline(run, catalog, st, planner, inner)
     _resolve_slots(run, catalog, st, planner, inner)
     var steps = lower_subqueries(run, catalog, st, planner, inner)
@@ -614,7 +624,7 @@ comptime MAX_IN_LIST = 10000
 
 def _is_simple(k: SqlStatement) -> Bool:
     """A subquery of the shape F-154 lifts into a semi (anti) join as it stands: one table, a select item, a WHERE, nothing else."""
-    if k.set_op != SET_NONE or len(k.ctes) > 0 or k.has_right or len(k.extra) > 0 or k.table_kid >= 0 or k.table_is_file or k.join_on >= 0:
+    if k.no_from or k.set_op != SET_NONE or len(k.ctes) > 0 or k.has_right or len(k.extra) > 0 or k.table_kid >= 0 or k.table_is_file or k.join_on >= 0:
         return False
     if len(k.group_by) > 0 or k.having >= 0 or k.limit >= 0 or k.offset > 0 or len(k.wins) > 0 or k.qualify >= 0:
         return False
@@ -1038,7 +1048,7 @@ def run_stages[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: SqlS
 
 def _inlinable(k: SqlStatement) -> Bool:
     """A derived table or CTE that is only a filter and a projection of one source: `SELECT cols | expressions FROM t [WHERE p]`."""
-    if k.set_op != SET_NONE or len(k.ctes) > 0 or k.has_right or len(k.extra) > 0 or k.table_kid >= 0 or k.join_on >= 0:
+    if k.no_from or k.set_op != SET_NONE or len(k.ctes) > 0 or k.has_right or len(k.extra) > 0 or k.table_kid >= 0 or k.join_on >= 0:
         return False
     if len(k.group_by) > 0 or k.having >= 0 or k.distinct or len(k.order_by) > 0 or k.limit >= 0 or k.offset > 0 or len(k.wins) > 0 or k.qualify >= 0:
         return False
@@ -1214,14 +1224,10 @@ def sql_with[P: Planner](mut catalog: Catalog, text: String, planner: P, options
     var plain = len(q.stmts) == 1
     if plain:
         ref st = q.stmts[0]
-        plain = len(st.ctes) == 0 and st.qualify < 0 and st.set_op == SET_NONE and not catalog.reads_a_view(st) and st.table != NO_FROM_TABLE
+        plain = len(st.ctes) == 0 and st.qualify < 0 and st.set_op == SET_NONE and not catalog.reads_a_view(st) and not st.no_from
     if plain:
         return run_plain(catalog, q.stmts.pop(), text, planner, options)
     var work = catalog.copy()
-    var one = Table.empty()
-    var oc = one.add_column("__c", INT)
-    one.append(oc, 1)
-    work.add_table(NO_FROM_TABLE, one^.share())
     var root = len(q.stmts) - 1
     var run = QueryRun(q, text)
     var t0 = perf_counter_ns()

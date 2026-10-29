@@ -391,8 +391,6 @@ struct Cte(Copyable, Movable):
         self.col = col
 
 
-comptime NO_FROM_TABLE = "__one"     # the table of a SELECT with no FROM (one row, one column)
-
 comptime EXPLAIN_NONE = 0
 comptime EXPLAIN_PLAN = 1
 comptime EXPLAIN_ANALYZE = 2   # F-155: the query runs and the plan shows the actual rows and milliseconds of each operator
@@ -439,10 +437,12 @@ struct SqlStatement(Movable):
     var set_left: Int
     var set_right: Int
     var qualify: Int            # QUALIFY condition, -1 for none
+    var no_from: Bool           # F-159: SELECT of constants with no FROM (the query runner gives the statement a one-row table of its own)
     var table_cols: List[String]    # `(SELECT ...) alias (a, b)`: column names of the derived table in FROM (the right table's: `right_cols`)
     var right_cols: List[String]
 
     def __init__(out self, text: String):
+        self.no_from = False
         self.table_cols = List[String]()
         self.right_cols = List[String]()
         self.ctes = List[Cte]()
@@ -1035,8 +1035,8 @@ struct _Parser(Movable):
             break
         if not self.is_kw("FROM"):
             if self.tok().kind == T_EOF or self.is_sym(";") or self.is_sym(")") or self.is_kw("UNION") or self.is_kw("INTERSECT") or self.is_kw("EXCEPT") or \
-               self.is_kw("ORDER") or self.is_kw("LIMIT"):
-                self.st.table = NO_FROM_TABLE                       # F-159: SELECT of constants reads a one-row table the query runner provides
+               self.is_kw("ORDER") or self.is_kw("LIMIT") or self.is_kw("WHERE") or self.is_kw("GROUP") or self.is_kw("HAVING") or self.is_kw("QUALIFY"):
+                self.st.no_from = True                              # F-159: SELECT of constants; the query runner gives it a one-row table
                 self.st.table_line = self.tok().line
                 self.st.table_col = self.tok().col
             else:

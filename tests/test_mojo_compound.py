@@ -632,3 +632,24 @@ def test_text_bool_date_equal_to_a_correlated_scalar(mx, data, sql, f):
 ])
 def test_select_with_no_from(mx, data, sql):
     q(mx, data, "memory", sql)
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT 1 WHERE false",
+    "SELECT 1 + 1 AS x WHERE 1 = 1",
+    "SELECT 3 AS x GROUP BY x HAVING x > 2",
+    "SELECT 3 AS x GROUP BY x HAVING x > 5",
+    "SELECT count(*) WHERE 1 = 0",
+    "SELECT 2 AS x ORDER BY x LIMIT 1",
+    "SELECT 5 AS x QUALIFY row_number() OVER () = 1",
+])
+def test_select_with_no_from_takes_the_other_clauses(mx, data, sql):
+    q(mx, data, "memory", sql)
+
+
+def test_the_no_from_table_is_not_a_name_a_query_can_use(mx, data):
+    assert "table `__one` not found" in error_of(mx, data, "SELECT * FROM __one")
+    assert "table `__one` not found" in error_of(mx, data, "SELECT 1 FROM __one")
+    # a user table of that name is not replaced by the constants' row
+    out = run_mx(mx, ["sql", "--stream", "never", "SELECT count(*) FROM __one WHERE (SELECT 7) = 7"], {"__one": data["paths"]["u"]})
+    assert out["rows"] == [[40]]
