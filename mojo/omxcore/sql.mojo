@@ -1036,6 +1036,9 @@ struct _Parser(Movable):
         if not self.is_kw("FROM"):
             if self.tok().kind == T_EOF or self.is_sym(";") or self.is_sym(")") or self.is_kw("UNION") or self.is_kw("INTERSECT") or self.is_kw("EXCEPT") or \
                self.is_kw("ORDER") or self.is_kw("LIMIT") or self.is_kw("WHERE") or self.is_kw("GROUP") or self.is_kw("HAVING") or self.is_kw("QUALIFY"):
+                for it in self.st.items:
+                    if it.star:
+                        raise sql_error(it.line, it.col, "`SELECT *` needs a FROM clause")
                 self.st.no_from = True                              # F-159: SELECT of constants; the query runner gives it a one-row table
                 self.st.table_line = self.tok().line
                 self.st.table_col = self.tok().col

@@ -448,25 +448,43 @@ def call_node(mut k: SqlStatement, name: String, arg: Int) -> Int:
     return len(k.exprs) - 1
 
 
-def key_name(i: Int) -> String:
-    return "__k" + String(i)
+def key_name(i: Int, tag: String) -> String:
+    return "__k" + String(i) + tag
 
 
-def build_exists_source(mut k: SqlStatement, cor: Correlation):
+def hidden_tag(sc: Scope) -> String:
+    """A suffix that makes the names of D's columns (`__k0`, `__v`, `__lo`, `__hi`) differ from every column of the outer tables, so a join of the two never reads the wrong one."""
+    var n = 0
+    while True:
+        var tag = String() if n == 0 else "_" + String(n)
+        var clash = False
+        for e in range(sc.entries()):
+            for c in sc.cols[e]:
+                if c == "__v" + tag or c == "__lo" + tag or c == "__hi" + tag:
+                    clash = True
+                for i in range(16):
+                    if c == "__k" + String(i) + tag:
+                        clash = True
+        if not clash:
+            return tag
+        n += 1
+
+
+def build_exists_source(mut k: SqlStatement, cor: Correlation, tag: String):
     """K becomes D: the distinct inner sides of the equalities (EXISTS, IN), or per key the min and max of the inequality's inner side."""
     var exprs = List[Int]()
     var names = List[String]()
     for i in range(len(cor.key_in)):
         exprs.append(cor.key_in[i])
-        names.append(key_name(i))
+        names.append(key_name(i, tag))
     k.group_by = List[Int]()
     if cor.theta_in >= 0:
         var lo = call_node(k, "MIN", cor.theta_in)
         var hi = call_node(k, "MAX", cor.theta_in)
         exprs.append(lo)
-        names.append("__lo")
+        names.append("__lo" + tag)
         exprs.append(hi)
-        names.append("__hi")
+        names.append("__hi" + tag)
         for i in range(len(cor.key_in)):
             k.group_by.append(cor.key_in[i])
     else:
@@ -478,15 +496,15 @@ def build_exists_source(mut k: SqlStatement, cor: Correlation):
     k.offset = 0
 
 
-def build_value_source(mut k: SqlStatement, cor: Correlation, value: Int):
+def build_value_source(mut k: SqlStatement, cor: Correlation, value: Int, tag: String):
     """K becomes D with the keys and its value (the scalar subquery's expression, or the IN subquery's column), grouped by the keys when the value is an aggregate."""
     var exprs = List[Int]()
     var names = List[String]()
     for i in range(len(cor.key_in)):
         exprs.append(cor.key_in[i])
-        names.append(key_name(i))
+        names.append(key_name(i, tag))
     exprs.append(value)
-    names.append("__v")
+    names.append("__v" + tag)
     set_items(k, exprs, names)
     k.group_by = List[Int]()
     k.distinct = False

@@ -20,7 +20,7 @@ from .sql import (SqlStatement, SqlQuery, SqlExpr, SelectItem, TableRef, WinSpec
                   X_SCALAR_Q, X_IN_Q, X_EXISTS_Q, X_SUBIN, X_EXISTS, X_NOT, X_COL, X_INT, X_NULL, X_CAST, X_TRUE, X_FALSE, X_IN, X_BIN, X_CALL, X_ISBOOL, JK_INNER, JK_LEFT)
 from .bind import Catalog, _split_and_expr, _and_chain, _has_aggregate
 from .subq import (SIDE_OUTER, side_of, Scope, scope_of, Flat, flatten, flat_source, clone_shell, collect, is_subquery_node, add_node, column_node, equal_node, and_node,
-                   copy_expr, set_literal, set_typed_null, literal_node, statement_is_correlated, analyze, build_exists_source, build_value_source, group_by_keys, key_name)
+                   copy_expr, hidden_tag, set_literal, set_typed_null, literal_node, statement_is_correlated, analyze, build_exists_source, build_value_source, group_by_keys, key_name)
 from .setops import union_all
 from .planner import Planner, RulePlanner, PlannerOptions
 from .sqlexec import SqlResult, run_plain
@@ -424,16 +424,16 @@ def distinct_rows[P: Planner](mut run: QueryRun, mut catalog: Catalog, var combi
     GROUP BY over every column, which puts all NULLs in one group, as these operations do."""
     var n = combined.columns()
     var left_rows = combined.rows() - right_rows
+    for c in range(n):                                       # every column is renamed first: the user's names cannot meet the ones below
+        combined.cols[c].name = "c" + String(c)
+    combined.by_name = Dict[String, Int]()
+    for c in range(n):
+        combined.by_name[combined.cols[c].name] = c
     # side column: 0 for the left operand's rows, 1 for the right's
     var side = combined.add_column("__side", INT)
     for r in range(combined.rows()):
         combined.append(side, Int64(0 if r < left_rows else 1))
     var cols = String()
-    for c in range(n):
-        combined.cols[c].name = "c" + String(c)
-    combined.by_name = Dict[String, Int]()
-    for c in range(combined.columns()):
-        combined.by_name[combined.cols[c].name] = c
     var name = register_table(run, catalog, combined^, "__u")
     for c in range(n):
         cols += ("" if c == 0 else ", ") + "c" + String(c)
@@ -498,7 +498,7 @@ def qualify_run[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: Sql
             frag = _quote(ex.text)
         else:
             st.items.append(SelectItem(order[k].expr, "__o" + String(k), True, ex.line, ex.col))
-            frag = _quote("__o" + String(k))
+            frag = "@" + String(hidden)                 # (the hidden columns follow the visible ones, in this order: they are found by position, never by name)
             hidden += 1
         frags.append(frag)
     var inner_explain = explain
@@ -511,15 +511,33 @@ def qualify_run[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: Sql
     for c in range(nvis):
         text += ("" if c == 0 else ", ") + _quote(t.name(c))
     var vis_names = List[String]()
+    var taken = List[String]()
     for c in range(nvis):
         vis_names.append(t.name(c))
+        taken.append(lower_ascii(t.name(c)))
+    var hidden_names = List[String]()                   # names for the hidden columns that no visible column has
+    for h in range(hidden):
+        var base = String("__q") if h == 0 else "__o" + String(h)
+        var nm = base
+        var n = 0
+        while lower_ascii(nm) in taken:
+            n += 1
+            nm = base + "_" + String(n)
+        taken.append(lower_ascii(nm))
+        hidden_names.append(nm)
+        t.cols[nvis + h].name = nm
+    t.by_name = Dict[String, Int]()
+    for c in range(t.columns()):
+        t.by_name[t.cols[c].name] = c
     var tname = register_table(run, catalog, t^, "__q")
-    text += " FROM " + _quote(tname) + " WHERE \"__q\""
+    text += " FROM " + _quote(tname) + " WHERE " + _quote(hidden_names[0])
     if len(order) > 0:
         text += " ORDER BY "
         for k in range(len(order)):
             var f = frags[k]
-            if f.startswith("#"):
+            if f.startswith("@"):
+                f = _quote(hidden_names[Int(String(f[byte=1:]))])
+            elif f.startswith("#"):
                 var n = Int(String(f[byte=1:]))
                 if n < 1 or n > nvis:
                     raise sql_error(line, col, "ORDER BY position " + String(n) + " is not in the select list")
@@ -708,6 +726,7 @@ def _native_in[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st: SqlS
 
 def _correlated_exists[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st: SqlStatement, n: Int, negated: Bool, sc: Scope, planner: P,
                                    opts: PlannerOptions) raises -> Step:
+    var tag = hidden_tag(sc)
     var kid = st.exprs[n].items[0]
     var line = st.exprs[n].line
     var col = st.exprs[n].col
@@ -729,7 +748,7 @@ def _correlated_exists[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut 
     var k = run.take(kid)
     var inner = scope_of(k, catalog)
     var cor = analyze(k, inner, sc, True, "EXISTS")
-    build_exists_source(k, cor)
+    build_exists_source(k, cor, tag)
     run.stmts[kid] = k^
     var r = exec_statement(run, catalog, kid, planner, opts)
     var rows = r.table.rows()
@@ -747,7 +766,7 @@ def _correlated_exists[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut 
         sub.col = col
         var on = -1
         for i in range(keys):
-            var dk = column_node(st, key_name(i), d, line, col)
+            var dk = column_node(st, key_name(i, tag), d, line, col)
             var oc = column_node(st, cor.key_name[i], cor.key_qual[i], line, col)
             on = and_node(st, on, equal_node(st, dk, oc, line, col))
         sub.where = on
@@ -760,8 +779,8 @@ def _correlated_exists[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut 
     # one inequality: D holds the min and max of the inner side per key; the outer row is kept by what they say
     var o = column_node(st, cor.theta_name, cor.theta_qual, line, col)
     var cond: Int
-    var dlo = lo if keys == 0 else column_node(st, "__lo", d, line, col)
-    var dhi = hi if keys == 0 else column_node(st, "__hi", d, line, col)
+    var dlo = lo if keys == 0 else column_node(st, "__lo" + tag, d, line, col)
+    var dhi = hi if keys == 0 else column_node(st, "__hi" + tag, d, line, col)
     var op = cor.theta_op
     if op == "<>":
         var a = add_node(st, X_BIN, "<>", dlo, o, line, col)
@@ -774,7 +793,7 @@ def _correlated_exists[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut 
         cond = add_node(st, X_BIN, op, dhi, o, line, col)
     var on = -1
     for i in range(keys):
-        var dk = column_node(st, key_name(i), d, line, col)
+        var dk = column_node(st, key_name(i, tag), d, line, col)
         var oc = column_node(st, cor.key_name[i], cor.key_qual[i], line, col)
         on = and_node(st, on, equal_node(st, oc, dk, line, col))
     var absent = flag != negated
@@ -787,6 +806,7 @@ def _correlated_exists[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut 
 
 def _correlated_in[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st: SqlStatement, n: Int, negated: Bool, sc: Scope, planner: P,
                                opts: PlannerOptions) raises -> Step:
+    var tag = hidden_tag(sc)
     var kid = st.exprs[n].items[0]
     var line = st.exprs[n].line
     var col = st.exprs[n].col
@@ -800,7 +820,7 @@ def _correlated_in[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st: 
         raise sql_error(line, col, "a subquery in IN must return one column")
     var inner = scope_of(k, catalog)
     var cor = analyze(k, inner, sc, False, "IN")
-    build_value_source(k, cor, k.items[0].expr)
+    build_value_source(k, cor, k.items[0].expr, tag)
     k.distinct = True
     run.stmts[kid] = k^
     var r = exec_statement(run, catalog, kid, planner, opts)
@@ -812,10 +832,10 @@ def _correlated_in[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st: 
     sub.col = col
     var on = -1
     for i in range(len(cor.key_in)):
-        var dk = column_node(st, key_name(i), d, line, col)
+        var dk = column_node(st, key_name(i, tag), d, line, col)
         var oc = column_node(st, cor.key_name[i], cor.key_qual[i], line, col)
         on = and_node(st, on, equal_node(st, dk, oc, line, col))
-    var dv = column_node(st, "__v", d, line, col)
+    var dv = column_node(st, "__v" + tag, d, line, col)
     on = and_node(st, on, equal_node(st, dv, left, line, col))
     sub.where = on
     st.subs.append(sub^)
@@ -829,6 +849,7 @@ def _correlated_in[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st: 
 
 def _correlated_scalar[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st: SqlStatement, n: Int, conj: Int, sc: Scope, planner: P,
                                    opts: PlannerOptions) raises -> Step:
+    var tag = hidden_tag(sc)
     var kid = st.exprs[n].items[0]
     var line = st.exprs[n].line
     var col = st.exprs[n].col
@@ -849,7 +870,7 @@ def _correlated_scalar[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut 
             calls += 1
     if calls > 0 and not is_count:
         raise sql_error(line, col, "a correlated scalar subquery with COUNT inside an expression is not supported yet (an empty group is 0, not NULL)")
-    build_value_source(k, cor, value)
+    build_value_source(k, cor, value, tag)
     group_by_keys(k, cor)
     run.stmts[kid] = k^
     var r = exec_statement(run, catalog, kid, planner, opts)
@@ -857,14 +878,14 @@ def _correlated_scalar[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut 
     var d = register_result(run, catalog, r, "__d")
     var on = -1
     for i in range(len(cor.key_in)):
-        var dk = column_node(st, key_name(i), d, line, col)
+        var dk = column_node(st, key_name(i, tag), d, line, col)
         var oc = column_node(st, cor.key_name[i], cor.key_qual[i], line, col)
         on = and_node(st, on, equal_node(st, oc, dk, line, col))
     var cmp = st.exprs[conj].kind == X_BIN and (st.exprs[conj].text == "=" or st.exprs[conj].text == "<>" or st.exprs[conj].text == "<" or
                                                  st.exprs[conj].text == "<=" or st.exprs[conj].text == ">" or st.exprs[conj].text == ">=") and \
           (st.exprs[conj].a == n or st.exprs[conj].b == n)
     var left = is_count or not cmp
-    var vnode = SqlExpr(X_COL, String("__v"), d, -1, -1, -1, List[Int](), False, line, col)
+    var vnode = SqlExpr(X_COL, "__v" + tag, d, -1, -1, -1, List[Int](), False, line, col)
     if is_count:
         st.exprs.append(vnode^)
         var zero = SqlExpr(X_INT, String("0"), String(), -1, -1, -1, List[Int](), False, line, col)
@@ -873,7 +894,7 @@ def _correlated_scalar[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut 
         items.append(len(st.exprs) - 2)
         items.append(len(st.exprs) - 1)
         st.exprs[n] = SqlExpr(X_CALL, String("COALESCE"), String(), 0, -1, -1, items^, False, line, col)
-    elif cmp and st.exprs[conj].text == "=" and _numeric_column(catalog, d, "__v"):
+    elif cmp and st.exprs[conj].text == "=" and _numeric_column(catalog, d, "__v" + tag):
         # `x = D.__v` between columns of two tables would be taken for a join key (and an INT against a FLOAT cannot be one): `__v + 0` is an expression, compared as SQL compares
         st.exprs.append(vnode^)
         st.exprs.append(SqlExpr(X_INT, String("0"), String(), -1, -1, -1, List[Int](), False, line, col))

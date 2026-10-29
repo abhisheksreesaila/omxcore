@@ -36,8 +36,12 @@ def data(tmp_path_factory):
         case when i % 9 = 0 then null else (i % 5)::BIGINT end as k,
         case when i % 6 = 0 then null else ((i * 11) % 30)::BIGINT end as w,
         (['West', 'east', 'Zed'])[1 + (i % 3)] as s from range({N_U}) r(i)""")
+    # a table whose column names are the ones the rewrites make for themselves
+    con.execute("""create table w as select i::BIGINT as b, ((i * 7) % 5)::BIGINT as "__o0", (i % 3)::BIGINT as "__q", (i % 4)::BIGINT as "__v",
+        (i % 3)::BIGINT as "__k0", (i % 2)::BIGINT as "__w0", (i % 5)::BIGINT as "__lo", ((i * 3) % 7)::BIGINT as "__hi", (i % 4)::BIGINT as k,
+        ((i * 5) % 11)::BIGINT as "__o1", (i % 6)::BIGINT as "__k1", (i % 7)::BIGINT as "c0", (i % 2)::BIGINT as "__side" from range(40) r(i)""")
     paths = {}
-    for name in ("t", "u"):
+    for name in ("t", "u", "w"):
         paths[name] = d / f"{name}.parquet"
         con.execute(f"copy {name} to '{paths[name]}' (format parquet, row_group_size 64)")
         paths[name + "_csv"] = d / f"{name}.csv"
@@ -49,7 +53,7 @@ MODES = ["memory", "scan"]
 
 
 def tables_of(sql):
-    return [t for t in ("t", "u") if re.search(rf"\b{t}\b", sql)]
+    return [t for t in ("t", "u", "w") if re.search(rf"\b{t}\b", sql)]
 
 
 def q(mx, data, mode, sql, ordered=False, duck=None):
@@ -692,3 +696,39 @@ def test_a_user_table_named_like_an_internal_name_is_left_alone(mx, data, name):
 ])
 def test_having_without_group_by_is_one_group(mx, data, sql):
     q(mx, data, "memory", sql)
+
+
+# ── F-159 review 5: a column of the user's named like a rewrite's own column ────────────────────
+
+HIDDEN_NAMES = [
+    'select "__o0", b from w qualify row_number() over (order by b) >= 1 order by b + 1 desc',
+    'select "__q", b from w qualify row_number() over (order by b) <= 5 order by b desc',
+    'select "__q", "__o0", b from w qualify row_number() over (partition by "__q" order by b) <= 2 order by b * 2 desc, b + 1, "__o0"',
+    'select "__o1", b from w qualify rank() over (order by "__o1", b) < 20 order by b % 3, b',
+    'select b from w qualify row_number() over (order by b) <= 9 order by "__o0" desc, b',
+    'select "__w0", row_number() over (order by b) from w order by 2',
+    'select b, "__w0", sum("__o0") over (partition by "__w0" order by b) from w order by b',
+    'select "__w0" + 1, rank() over (order by b % 5, b) from w order by 2, 1',
+    'select b from w where exists (select 1 from w w2 where w2."__k0" = w."__k0" and w2.b <> w.b and w2.b > 36)',
+    'select b from w where b > (select avg(b) from w w2 where w2."__k0" = w."__k0")',
+    'select b from w where "__v" < (select max(b) from w w2 where w2.k = w."__k1")',
+    'select b from w where exists (select 1 from w w2 where w2.k = w.k and w2."__lo" < w."__lo") and "__hi" >= (select min("__hi") from w w2 where w2.k = w.k)',
+    'select b from w where not exists (select 1 from w w2 where w2."__k0" = w."__k0" and w2."__v" > w."__v")',
+    'select b from w where "__v" in (select "__v" from w w2 where w2."__k1" = w."__k1" and w2.b > 30)',
+    'select a.b, c.b from w a join w c on a."__k0" = c."__k0" where a.b < c.b and a.b < (select max(b) from w w3 where w3."__k0" = a."__k0") - 36',
+    'select "__k0", count(*) from w group by "__k0" having count(*) > (select count(*) from w w2 where w2."__v" = 0) / 3 order by 1',
+    'select c0 from w union select "__side" from w',
+    'select c0, "__side" from w intersect select c0, "__side" from w where b < 9 order by 1, 2',
+    'select c0 from w except select b from w where b < 3 order by 1',
+]
+
+
+@pytest.mark.parametrize("sql", HIDDEN_NAMES)
+def test_a_column_named_like_a_hidden_column_of_a_rewrite(mx, data, sql):
+    q(mx, data, "memory", sql, ordered="order by" in sql)
+    q(mx, data, "scan", sql, ordered="order by" in sql)
+
+
+def test_select_star_with_no_from_says_it_needs_one(mx, data):
+    for sql in ["SELECT *", "SELECT * HAVING true", "SELECT * WHERE 1 = 1", "SELECT 1 WHERE EXISTS (SELECT *)"]:
+        assert "`SELECT *` needs a FROM clause" in error_of(mx, data, sql)
