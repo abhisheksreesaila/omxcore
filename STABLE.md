@@ -8,21 +8,28 @@ green. Anything newer on `main` may still be in review: don't vendor it.
 
 ## Current stable
 
-**`5e4cdb1`** (2026-10-28): window functions; a sort bigger than memory (SQL and the sheet's `permutation`); the GPU never
-fails on data bigger than its memory. Includes everything in 5053a44 and earlier.
+**`834ef9a`** (2026-10-29): SQL CTEs, derived tables, views, subqueries (correlated ones too), UNION / INTERSECT /
+EXCEPT and QUALIFY; GPU shared memory bounded by the device (omxcore#19). Includes everything in 5e4cdb1 and earlier.
 
 ```sh
 # build the package from a clean copy of the stable commit (never from a working checkout), on Linux as before
-git -C <omxcore> archive 5e4cdb1 | tar -x -C <scratch>
+git -C <omxcore> archive 834ef9a | tar -x -C <scratch>
 cd <scratch> && pixi run bash scripts/build_mojo_pkg.sh      # -> build/omxcore.mojoc (and build/mxframe.mojoc)
-cp build/omxcore.mojoc <app>/vendor/ && echo 5e4cdb1 > <app>/vendor/OMXCORE_COMMIT
+cp build/omxcore.mojoc <app>/vendor/ && echo 834ef9a > <app>/vendor/OMXCORE_COMMIT
 ```
 
 The Mac build commands are unchanged from 3d2455d (below). **No new libSystem symbols** (`scripts/check_mac_link.sh`
 OK). For parallel saves on the Mac, build the app with `-D MXFRAME_JOB_THREADS` (the pthread symbols listed under
 23edc59, nothing more); without it, saves run on one thread.
 
-## What changed since the previous stable (5053a44), for apps
+## What changed since the previous stable (5e4cdb1), for apps
+
+| Area | What you get | Ticket |
+|---|---|---|
+| SQL: CTEs, subqueries, set operations | `WITH` (a CTE read once runs in place, read more than once runs once; `MATERIALIZED` hints), derived tables in FROM (with column aliases), `Catalog.view`; scalar subqueries (empty → typed NULL, more than one row raises), `IN` / `EXISTS`, correlated ones decorrelated into a join; `UNION ALL` / `UNION` / `INTERSECT` / `EXCEPT` (TEXT dictionaries merged, numbers promoted as DuckDB does); `QUALIFY` and filtering on a window result; `SELECT` with no FROM. Equal to DuckDB; 21 of 22 TPC-H through `mx sql`. Refused by name: `WITH RECURSIVE`, `LATERAL`, correlated `NOT IN`, correlated subqueries outside WHERE or under OR, `INTERSECT` / `EXCEPT ALL`, `UNION BY NAME`. Every step's result is held in memory | F-159 |
+| GPU shared memory | no kernel asks for more shared memory than the target has: the Python path's group kernel caps its table at 32 KB on an Apple GPU (8192 groups; 12288 on NVIDIA as before), and the pipeline kernel refuses a launch past `SMEM_LIMIT`. No change in answers; 10,000 groups on the GPU under Apple's plan equal the CPU | F-195 |
+
+## What changed in 5e4cdb1 (since 5053a44), for apps
 
 | Area | What you get | Ticket |
 |---|---|---|
@@ -120,6 +127,7 @@ and a repro for a bug. Needs that are generic go into the engine; app-specific o
 ## History
 | Stable | Date | Highlights |
 |---|---|---|
+| `834ef9a` | 2026-10-29 | SQL CTEs, views, subqueries, set operations, QUALIFY; GPU shared memory bounded by the device |
 | `5e4cdb1` | 2026-10-28 | window functions; sort bigger than memory (SQL and `permutation`); the GPU never fails on data bigger than it |
 | `5053a44` | 2026-10-27 | a save's memory follows a byte budget (`budget=`) |
 | `8017543` | 2026-10-26 | parallel zstd saves, faster Mojo encoder, ~1 MB pages |
