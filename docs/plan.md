@@ -88,10 +88,10 @@ The gate asks each device to beat DuckDB, but the SQL path runs everything on th
 - [ ] also a window `sum(d) OVER (...)` past int64 (raises "a window sum passed the int64 range"; DuckDB uses HUGEINT), found in the F-190 review
 - [ ] `sum(decimal * decimal)` (Q11's `sum(ps_supplycost * ps_availqty)`) and other DECIMAL sums whose total passes int64 give DuckDB's answer (DuckDB sums DECIMAL into HUGEINT) instead of raising; the result type follows DuckDB's DECIMAL width rules; exact everywhere; GPU keeps declining or matches (PTX unchanged)
 
-## F-193 A typed NULL constant keeps its own kind beside other constants (wrong column kind) [todo] (found by F-159, 2026-10-28)
+## F-193 A typed NULL constant keeps its own kind beside other constants (wrong column kind) [todo, started and paused 2026-10-28 (owner: stop tonight), branch worktree-agent-a98f3febaf5aeeb60] (found by F-159, 2026-10-28)
 - [ ] `SELECT CAST(NULL AS DATE) AS m, CAST(NULL AS BIGINT) AS q` returns q as BIGINT (today DATE: a wrong answer); every constant select item keeps its type whatever else is in the list (exec.mojo); fuzz constant lists of every kind vs DuckDB
 
-## F-194 Tests and scripts leave nothing in /tmp [todo] (2026-10-28)
+## F-194 Tests and scripts leave nothing in /tmp [todo, started and paused 2026-10-28, branch worktree-agent-a75d31f85a467fb2f] (2026-10-28)
 `/tmp` is a 32 GB tmpfs with a per-user quota (docs/lessons.md); the owner's quota filled and tests failed. Today `tests/conftest.py` makes `omxcore-shim-*` in `tempfile.gettempdir()`, `scripts/stress_cpu_kernels.py` makes `mxframe-shim-*`, and something makes `mxframe-src-*` / `omxcore-src-*` (28 left behind).
 - [ ] every test, fixture and script puts scratch under `~/.cache/mxframe-test-tmp` (or `MXFRAME_TEST_TMPDIR`) and removes it; a check in `tests/` fails if a run leaves a new `/tmp/mxframe-*` / `/tmp/omxcore-*` entry
 
