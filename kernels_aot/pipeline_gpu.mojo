@@ -802,6 +802,7 @@ def pipeline_kernel[RPT: Int, B: Int, W: DType](
     var A = n_slots
 
     # dynamic shared memory: [register file | constants | warp partials | program]
+    # sized at launch by _smem_bytes; bound: SMEM_LIMIT (run_pipeline_gpu refuses a larger launch with -5)
     var smem = external_memory[Scalar[W], address_space=SH, alignment=16]()
     var regs = smem
     var consts = smem + n_regs * TILE
@@ -1356,6 +1357,8 @@ def run_pipeline_gpu(
     var bsz = NARROW_B if narrow else _block_threads(mode)
     var rpt = 1 if narrow else _rows_per_thread(n_regs, G, A)
     var smem = _smem_bytes(mode, G, A, n_regs, code_ints, narrow)
+    if smem > SMEM_LIMIT:            # _choose_mode keeps every plan within it; never launch past the target's limit
+        return -5
     var small = 1 if (mode == 0 or mode == 3 or mode == 4 or mode == 5) else 0
     var total = A * G
     if small == 0 or end <= start:

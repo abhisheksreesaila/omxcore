@@ -506,6 +506,27 @@ def test_many_groups_min_max_negative_and_sparse() raises:
     dt.release()
 
 
+def test_ten_thousand_groups_equal_the_cpu() raises:
+    """F-195 (omxcore#19): between 8192 and 12288 groups a 48 KB shared table is past an Apple GPU's 32 KB. On Apple's
+    plan (`check_apple_gpu.py` M6) and on NVIDIA, ~10,000 groups give the CPU's answer, at and past both caps."""
+    var t = Table.empty()
+    var k = t.add_column("k", INT)
+    var v = t.add_column("v", INT)
+    var rng = Rng(19)
+    for _ in range(400_000):
+        t.append(k, Int64(rng.int(0, 12_999)))
+        t.append(v, Int64(rng.int(-1_000_000, 1_000_000)))
+    var s = t^.share()
+    var dt = DeviceTable(s)
+    for groups in [8192, 10_000, 12_288, 13_000]:
+        var q = Query(s).on_device(dt).group_by(col("k"), groups=groups).agg(sum(col("v")), count(), min_of(col("v")), max_of(col("v")))
+        var g = q^.compute(GPU)
+        expect(g.device == GPU, String(groups) + " groups ran on the GPU: `" + g.fallback_reason + "`")
+        same(g, Query(s).group_by(col("k"), groups=groups).agg(sum(col("v")), count(), min_of(col("v")), max_of(col("v"))).compute(CPU),
+             String(groups) + " groups")
+    dt.release()
+
+
 def main() raises:
     if not gpu_available():
         print("skipped: no GPU")
@@ -516,6 +537,7 @@ def main() raises:
     test_values_past_int32_and_2_53()
     test_two_million_rows_use_the_multi_block_modes()
     test_many_groups_min_max_negative_and_sparse()
+    test_ten_thousand_groups_equal_the_cpu()
     test_overflow_raises_the_same_error()
     test_a_frames_edits_without_re_uploading()
     test_release_frees_the_device_memory()

@@ -1799,3 +1799,10 @@ Owner: GPU **on by default** on Apple Silicon (unified memory: the GPU comes fre
 ## F-186 Done means: the orders queries on Apple's GPU equal pyarrow; NVIDIA unchanged [done]
 Stable 3d2455d (2026-10-25), hand-off abhisheksreesaila/omxcode#3. Review: round 1 NEEDS WORK (fixed), round 2 PASS. Report: docs/goals/apple-gpu/report.md. Not done: real-silicon speed and correctness (owner's Mac); float32 on Apple.
 - [x] 1M-row orders (INT, DECIMAL, TEXT): count / sum / min / max overall and by a TEXT column, a WHERE, ORDER BY an aggregate with LIMIT, on `device=GPU` on the runner, equal pyarrow; Linux suites green; NVIDIA timing A/B vs 3a33697 within noise; STABLE.md + app issue
+
+## F-195 GPU shared memory bounded by the device: `group_shared_kernel` within 32 KB on Apple, `pipeline_kernel`'s bound stated [done]
+Issue: abhisheksreesaila/omxcore#19 (omxcode's `gpu_audit.py`, goal 32 M6). Needs: none
+- [x] `group_shared_kernel`'s shared path is capped by the target (`GROUP_SMEM_LIMIT`: 32 KB on an Apple GPU, 48 KB elsewhere); above it the global path runs as before; NVIDIA's cap stays 12288 groups
+- [x] `pipeline_kernel` names its bound (`SMEM_LIMIT`) beside its `external_memory`, and its launch refuses (-5) a size over it instead of launching
+- [x] tests: the group kernel's plan fits the target for 1 .. 12288+ groups (host code, also under `-D OMXCORE_APPLE_GPU_SHAPE`); a ~10,000-group group-by on the GPU equals the CPU (run under Apple's plan by `check_apple_gpu.py` M6)
+- Review: PASS (round 1; stale comment fixed). Checked: test_gpu_plan + test_gpu under both shapes (10,000 groups on the GPU under Apple's plan), NVIDIA PTX = baseline (M2), Python GPU tests 180 passed, Python AOT group path equal numpy at 8192-12289 groups. Not checked: real Apple silicon.

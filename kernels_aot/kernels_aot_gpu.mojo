@@ -7,6 +7,7 @@ from max.gpu.primitives.id import lane_id
 from std.bit import pop_count, count_trailing_zeros
 from std.sys._assembly import inlined_assembly
 from std.memory import stack_allocation
+from std.sys import has_apple_gpu_accelerator, is_defined
 from _atomic import Atomic
 
 comptime BLOCK: Int = 256
@@ -229,7 +230,8 @@ def utf8_isin_mask_gpu(
 # shared slots in each, flushed every slot with a global atomic, and faulted
 # for > 8192 groups.)
 #
-#   SHARED ng <= 12288  block-private table in *dynamic* shared memory sized to
+#   SHARED ng <= SHARED_MAX_GROUPS (12288; 8192 on Apple) block-private table in
+#                       *dynamic* shared memory sized to
 #                       exactly ng slots, zeroed / flushed once per block
 #   GLOBAL otherwise    atomics straight into the output (float min/max are the
 #                       LLVM atomicrmw fmin/fmax, a CAS loop on NVPTX)
@@ -245,7 +247,10 @@ comptime OP_SUM: Int = 0
 comptime OP_COUNT: Int = 1
 comptime OP_MIN: Int = 2
 comptime OP_MAX: Int = 3
-comptime SHARED_MAX_GROUPS: Int = 12288       # 48 KB of Float32 slots
+# Dynamic shared memory a block may ask for: an Apple GPU (Metal) has 32 KB, NVIDIA 48 KB without opt-in. Same test
+# as pipeline_gpu's APPLE_GPU / SMEM_LIMIT (`-D OMXCORE_APPLE_GPU_SHAPE` gives any GPU Apple's limits). F-195.
+comptime GROUP_SMEM_LIMIT: Int = (32 if has_apple_gpu_accelerator() or is_defined["OMXCORE_APPLE_GPU_SHAPE"]() else 48) * 1024
+comptime SHARED_MAX_GROUPS: Int = GROUP_SMEM_LIMIT // 4   # Float32 slots: 12288 on NVIDIA, 8192 on Apple
 comptime SM_SHARED_BYTES: Int = 96 * 1024     # usable per SM on sm_80/86
 comptime MAX_BLOCKS_PER_SM: Int = 6           # global path: 1536 threads / 256
 comptime SHARED_BLOCKS_PER_SM: Int = 3        # shared path: more resident blocks made shared-memory
@@ -424,6 +429,13 @@ def group_shared_kernel[op: Int](
             _atomic_fold[op, AddressSpace.GENERIC](_f32(out_addr) + t, sv)
         t += BLOCK
 
+def group_shared_bytes(ng: Int, n: Int) -> Int:
+    """The shared memory `run_group` launches `group_shared_kernel` with for `ng` groups and `n` rows (one Float32
+    slot per group), or 0 when the global path runs: more groups than GROUP_SMEM_LIMIT holds, or too few rows."""
+    if ng <= SHARED_MAX_GROUPS and n >= 4 * ng:
+        return ng * 4
+    return 0
+
 def run_group[op: Int](
     out_addr: Int, val_addr: Int, lab_addr: Int, n: Int, ng: Int
 ) raises:
@@ -434,8 +446,8 @@ def run_group[op: Int](
         Int64(out_addr), Int64(ng), grid_dim=ceildiv(ng, BLOCK), block_dim=BLOCK)
     if n > 0:
         var sms = ctx.get_attribute(DeviceAttribute.MULTIPROCESSOR_COUNT)
-        if ng <= SHARED_MAX_GROUPS and n >= 4 * ng:
-            var smem = ng * 4
+        var smem = group_shared_bytes(ng, n)     # bound: GROUP_SMEM_LIMIT
+        if smem > 0:
             var per_sm = max(1, min(SHARED_BLOCKS_PER_SM, SM_SHARED_BYTES // (smem + 1024)))
             # each block must cover >= ~2 rows per slot it flushes
             var blocks = max(1, min(sms * per_sm, n // (2 * ng)))
