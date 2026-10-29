@@ -186,6 +186,14 @@ def main() raises:
     if len(before) != len(after):
         fail("the catalog had " + String(len(before)) + " sources and has " + String(len(after)) + " after a compound query")
 
+    # a view or a source named like an internal name keeps its name
+    cat.view("__d1", "SELECT qty FROM orders WHERE qty > 6")
+    r = sql(cat, "WITH a AS (SELECT qty FROM orders) SELECT (SELECT count(*) FROM __d1) AS v, (SELECT count(*) FROM a) AS c, (SELECT max(qty) FROM (SELECT qty FROM orders WHERE qty < 3 ORDER BY qty)) AS m")
+    check(rows_of(r.table), "2 10 2\n", "a view named like an internal name")
+    cat.add_table("__d9", orders())
+    r = sql(cat, "SELECT count(*) FROM (SELECT qty FROM __d9 ORDER BY qty) x, (SELECT qty FROM orders ORDER BY qty) y WHERE x.qty = y.qty")
+    check(rows_of(r.table), "9\n", "a source named like an internal name")
+
     # a view reads the views before it, and a source and a view cannot share a name
     cat.view("bigger", "SELECT qty FROM big_orders WHERE qty > 6")
     r = sql(cat, "SELECT qty FROM bigger ORDER BY qty")

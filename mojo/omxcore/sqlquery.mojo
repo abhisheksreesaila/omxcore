@@ -67,9 +67,13 @@ struct QueryRun(Movable):
         self.next = 0
         self.text = text
 
-    def fresh(mut self, prefix: String) -> String:
-        self.next += 1
-        return prefix + String(self.next)
+    def fresh(mut self, prefix: String, catalog: Catalog) -> String:
+        """The one place an internal name is made: a name no source or view of the catalog has (a user's table called `__d2` stays theirs)."""
+        while True:
+            self.next += 1
+            var name = prefix + String(self.next)
+            if catalog.find(name) < 0 and catalog.view_index(name) < 0:
+                return name
 
     def take(mut self, idx: Int) -> SqlStatement:
         var st = SqlStatement(self.text)
@@ -160,7 +164,7 @@ def _commas(n: Int) -> String:
 
 def register_result(mut run: QueryRun, mut catalog: Catalog, mut r: SqlResult, prefix: String) -> String:
     """Puts a result's table in the catalog under a fresh internal name."""
-    var name = run.fresh(prefix)
+    var name = run.fresh(prefix, catalog)
     catalog.add_table(name, r.take_table().share())
     return name
 
@@ -319,9 +323,7 @@ def _exec_body[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: SqlS
         var one = Table.empty()
         var oc = one.add_column("__c", INT)
         one.append(oc, 1)
-        var nm = run.fresh("__n")
-        while catalog.find(nm) >= 0:                           # (a name nobody has: a user's table of that name stays theirs)
-            nm = run.fresh("__n")
+        var nm = run.fresh("__n", catalog)
         catalog.add_table(nm, one^.share())
         st.table = nm
         st.no_from = False
@@ -394,7 +396,7 @@ def run_plain_explained[P: Planner](mut run: QueryRun, mut catalog: Catalog, var
 
 
 def register_table(mut run: QueryRun, mut catalog: Catalog, var t: Table, prefix: String) -> String:
-    var name = run.fresh(prefix)
+    var name = run.fresh(prefix, catalog)
     catalog.add_table(name, t^.share())
     return name
 
@@ -972,7 +974,8 @@ def run_stages[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: SqlS
     query over the table the step before made (joined with its D when it has one); the last step joins the statement's own query."""
     var plain = List[Int]()
     _split_and_expr(st, st.where, plain)
-    if st.has_right or len(st.extra) > 0:
+    var flattened = st.has_right or len(st.extra) > 0
+    if flattened:
         var orig = clone_shell(st)
         var sc = scope_of(st, catalog)
         var flat = Flat()
@@ -998,7 +1001,7 @@ def run_stages[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: SqlS
         st.join_kind = JK_INNER
         st.extra = List[TableRef]()
         plain = List[Int]()
-    var carried = _shown(st.table, st.table_alias) if not (st.table_alias.byte_length() == 0 and st.table.startswith("__t")) else String()
+    var carried = String() if flattened else _shown(st.table, st.table_alias)
     var merge_last = True
     for it in st.items:
         if it.star:

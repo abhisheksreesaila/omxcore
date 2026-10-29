@@ -653,3 +653,42 @@ def test_the_no_from_table_is_not_a_name_a_query_can_use(mx, data):
     # a user table of that name is not replaced by the constants' row
     out = run_mx(mx, ["sql", "--stream", "never", "SELECT count(*) FROM __one WHERE (SELECT 7) = 7"], {"__one": data["paths"]["u"]})
     assert out["rows"] == [[40]]
+
+
+# ── F-159 review 4: the names the query runner makes never replace a table of the user ────────────
+
+INTERNAL_NAMES = ["__d1", "__d2", "__c1", "__n1", "__t1", "__u1", "__q1", "__v1"]
+
+
+@pytest.mark.parametrize("name", INTERNAL_NAMES)
+def test_a_user_table_named_like_an_internal_name_is_left_alone(mx, data, name):
+    con = data["con"]
+    con.execute(f"create or replace view {name} as select * from u")
+    shapes = [
+        f"WITH k AS (SELECT w FROM {name} WHERE w > 2) SELECT (SELECT count(*) FROM {name}) tot, (SELECT count(*) FROM k) kc, (SELECT max(w) FROM {name} WHERE w < 3) m",
+        f"SELECT count(*) FROM (SELECT w FROM {name} WHERE w > 5 ORDER BY w) x, {name} y WHERE x.w = y.w",
+        f"WITH a AS (SELECT k, w FROM {name}) SELECT count(*) FROM a x JOIN a y ON x.k = y.k WHERE EXISTS (SELECT 1 FROM {name} z WHERE z.k = x.k AND z.w <> x.w)",
+        f"SELECT (SELECT 1) one, (SELECT count(*) FROM {name}) n",
+        f"SELECT w FROM {name} WHERE k IN (SELECT k FROM {name} UNION SELECT 9) AND w > (SELECT avg(w) FROM {name} z WHERE z.k = {name}.k)",
+        f"SELECT k FROM {name} UNION ALL SELECT k FROM t WHERE id < 3",
+        f"SELECT k FROM t WHERE id < 40 QUALIFY row_number() OVER (PARTITION BY k ORDER BY id) = 1 AND k IN (SELECT k FROM {name})",
+    ]
+    for sql in shapes:
+        files = {name: data["paths"]["u"]}
+        if re.search(r"\bt\b", sql):
+            files["t"] = data["paths"]["t"]
+        check(mx, sql, con, files=files)
+    con.execute(f"drop view {name}")
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT 1 HAVING 1 = 1",
+    "SELECT 1 HAVING true",
+    "SELECT 1 AS x FROM t HAVING true",
+    "SELECT 1 AS x FROM t WHERE id < 0 HAVING true",
+    "SELECT 1 AS x FROM t HAVING false",
+    "SELECT count(*) FROM t WHERE id < 0 HAVING true",
+    "SELECT 7 AS x, 'a' AS y FROM t HAVING 1 < 2",
+])
+def test_having_without_group_by_is_one_group(mx, data, sql):
+    q(mx, data, "memory", sql)
