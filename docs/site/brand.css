@@ -1,0 +1,27 @@
+/* omxcore's brand, copied from omxlabs (omxlabs/assets/suite.css: --ox-core, .pm, .lm, .lm-core and their keyframes;
+   the mark's svg is marks.js "core", built in site.js). One colour and one mark, wherever omxcore appears: blue, and a chip
+   whose nine cores light in a diagonal wave while you point at the brand. At rest the mark holds still.
+   This is the only file of the site that names a colour: the accent tokens below are what every page reads (--oq-accent).
+   Load order: omxqua fonts.css, tokens.css, components.css, then this file, then site.css. */
+
+.oq-root { --ox-core: #4aa8ff; --lm-spring: cubic-bezier(.34, 1.56, .64, 1); }
+/* night (the default): the brand blue itself, dark text on it (7.8:1 on #0b0b0d). Light: a deeper blue that keeps text and
+   white button labels at 4.5:1 or better (5.8:1 on surface-0), since #4aa8ff on white is 2.5:1. */
+.oq-night.oq-app-core { --oq-accent: var(--ox-core); --oq-on-accent: #0b0b0d; }
+.oq-light.oq-app-core { --oq-accent: #0b5cad; --oq-on-accent: #ffffff; }
+
+/* the product mark: a faint tile in the product colour with an inset outline (suite.css .pm) */
+.pm { --s: 30px; --px: var(--oq-accent); flex: none; display: inline-grid; place-items: center; width: var(--s); height: var(--s); border-radius: calc(var(--s) * .3);
+  color: var(--px); background: color-mix(in srgb, var(--px) 12%, transparent); box-shadow: inset 0 0 0 1.5px color-mix(in srgb, var(--px) 55%, transparent); }
+.lm { width: 62%; height: 62%; overflow: visible; }
+.lm * { transform-box: fill-box; transform-origin: center; }
+.lm .s, .lm .f { color: inherit; }   /* site.css colours code tokens .s and .k; the mark keeps its own colour */
+.lm .s { fill: none; stroke: currentColor; stroke-width: 2.4; stroke-linecap: round; stroke-linejoin: round; }
+.lm .f { fill: currentColor; }
+/* omxcore: nine cores light in a wave, the pins flicker: SQL on every GPU thread at once */
+.lm-core .pin { stroke-width: 1.8; } .lm-core .d { opacity: .35; }
+a:hover .lm-core .d, a:focus-visible .lm-core .d { animation: lmLane .5s ease-out 2; animation-delay: calc(var(--i) * .08s); }
+a:hover .lm-core .pin, a:focus-visible .lm-core .pin { animation: lmFlick .25s 4 alternate; }
+@keyframes lmLane { 0% { opacity: .35; transform: scale(1); } 40% { opacity: 1; transform: scale(1.7); } 100% { opacity: .35; transform: scale(1); } }
+@keyframes lmFlick { to { opacity: .2; } }
+@media (prefers-reduced-motion: reduce) { .lm * { animation: none !important; } }

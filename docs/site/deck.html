@@ -1,13 +1,15 @@
 <!doctype html>
-<html lang="en" class="oq-root oq-light oq-family-dev oq-app-teal" data-theme="light">
+<html lang="en" class="oq-root oq-night oq-family-dev oq-app-core" data-theme="dark">
 <head>
 <meta charset="utf-8">
+<link rel="icon" href="favicon-core.svg" type="image/svg+xml">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>omxcore: the story, as slides</title>
 <meta name="description" content="omxcore in fourteen slides: the mission, why Mojo, a query as it runs, CPU or GPU, bigger than memory, the numbers, and why it's built for agents.">
 <link rel="stylesheet" href="omxqua/src/fonts.css">
 <link rel="stylesheet" href="omxqua/src/tokens.css">
 <link rel="stylesheet" href="omxqua/src/components.css">
+<link rel="stylesheet" href="brand.css">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.2.1/dist/reveal.css">
 <script src="omxqua/src/omxqua.js" defer></script>
 <script src="site.js"></script>
@@ -90,13 +92,12 @@
   /* the two islands: the brand and the theme choice, solid surface-2 with the one shadow */
   .dk-brand { position: fixed; top: 14px; left: 16px; z-index: 30; height: 44px; padding: 0 16px 0 8px; border-radius: 999px; background: var(--oq-surface-2); box-shadow: var(--oq-shadow-2);
     display: flex; align-items: center; gap: 10px; font: 650 15px var(--oq-font-display); letter-spacing: -.02em; color: var(--oq-ink); text-decoration: none; }
-  .dk-brand .mark { width: 30px; height: 30px; border-radius: 50%; font-size: 13px; }
   .dk-theme { position: fixed; top: 14px; right: 16px; z-index: 30; background: var(--oq-surface-2); box-shadow: var(--oq-shadow-2); }
   @media (prefers-reduced-motion: reduce) { .bar .fill, .reveal .slides section .fragment { transition: none; } .present .ram { animation: none; } .caret { animation: none; } }
 </style>
 </head>
 <body>
-<a data-press class="dk-brand" href="index.html"><span class="mark">ox</span>omxcore</a>
+<a data-press class="dk-brand" href="index.html"><span class="pm"><svg class="lm lm-core" viewBox="0 0 24 24" aria-hidden="true"><rect class="s" x="5" y="5" width="14" height="14" rx="2.5"/><path class="s pin" d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/><circle class="f d" style="--i:0" cx="9" cy="9" r="1.2"/><circle class="f d" style="--i:1" cx="12" cy="9" r="1.2"/><circle class="f d" style="--i:2" cx="15" cy="9" r="1.2"/><circle class="f d" style="--i:1" cx="9" cy="12" r="1.2"/><circle class="f d" style="--i:2" cx="12" cy="12" r="1.2"/><circle class="f d" style="--i:3" cx="15" cy="12" r="1.2"/><circle class="f d" style="--i:2" cx="9" cy="15" r="1.2"/><circle class="f d" style="--i:3" cx="12" cy="15" r="1.2"/><circle class="f d" style="--i:4" cx="15" cy="15" r="1.2"/></svg></span>omxcore</a>
 <button class="btn text dk-theme" id="theme-btn" type="button" aria-label="Switch light and night" aria-pressed="false"></button>
 
 <div class="reveal"><div class="slides">

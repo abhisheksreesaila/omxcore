@@ -1,9 +1,9 @@
-/* omxcore docs site on omxqua (vendored in omxqua/, v0.1.4): family dev, shell top, light by default, night when chosen.
+/* omxcore docs site on omxqua (vendored in omxqua/, v0.1.4): family dev, shell top, night by default, light when chosen; omxcore blue from brand.css.
    Every colour, radius, size and curve here is an --oq-* token; the parts (.card, .btn, .chip, .badge, .tbl, .src, ...) come
    from omxqua's components.css. This file only adds what a documentation page needs on top of them.
-   Load order on every page: omxqua/src/fonts.css, tokens.css, components.css, then this file, then omxqua.js. */
+   Load order on every page: omxqua/src/fonts.css, tokens.css, components.css, brand.css, then this file, then omxqua.js. */
 
-/* chart series, named once. omxcore is the accent (teal: oq-app-teal on every page); DuckDB and Polars are data colours that pass contrast in both themes. */
+/* chart series, named once. omxcore is the accent (brand blue: oq-app-core on every page, defined in brand.css); DuckDB and Polars are data colours that pass contrast in both themes. */
 .oq-root {
   --mx: var(--oq-accent); --dk: var(--oq-data-4); --pl: var(--oq-data-1); --pa: var(--oq-data-6);
   --d-cpu: var(--oq-data-2); --d-gpu: var(--oq-data-3); --d-auto: var(--oq-data-6);

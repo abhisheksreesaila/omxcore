@@ -62,7 +62,7 @@ def _default_link():
 
 def test_page_exists_and_opens_with_a_read_box():
     text = _page_text()
-    assert 'class="oq-root oq-light oq-family-dev oq-app-teal oq-top" data-theme="light"' in text
+    assert 'class="oq-root oq-night oq-family-dev oq-app-core oq-top" data-theme="dark"' in text
     assert 'href="site.css"' in text and 'src="site.js"' in text and '<main class="main" id="main">' in text
     assert text.index("<h1") < text.index('class="read"'), "calm first (2026-10-20): the title, then the how-to-read box"
 

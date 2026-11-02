@@ -27,13 +27,15 @@ const ICONS = {  // Lucide-style strokes (ISC)
   flag: '<path d="M4 22V4a1 1 0 0 1 .4-.8A6 6 0 0 1 8 2c3 0 5 2 8 2a6 6 0 0 0 4-1v12a6 6 0 0 1-4 1c-3 0-5-2-8-2a6 6 0 0 0-4 1"/>',
   file: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/>',
 };
+// omxcore's mark (omxlabs/assets/marks.js "core"): a chip with nine cores; brand.css lights them in a wave on hover
+const CORE_MARK = '<span class="pm"><svg class="lm lm-core" viewBox="0 0 24 24" aria-hidden="true"><rect class="s" x="5" y="5" width="14" height="14" rx="2.5"/><path class="s pin" d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/><circle class="f d" style="--i:0" cx="9" cy="9" r="1.2"/><circle class="f d" style="--i:1" cx="12" cy="9" r="1.2"/><circle class="f d" style="--i:2" cx="15" cy="9" r="1.2"/><circle class="f d" style="--i:1" cx="9" cy="12" r="1.2"/><circle class="f d" style="--i:2" cx="12" cy="12" r="1.2"/><circle class="f d" style="--i:3" cx="15" cy="12" r="1.2"/><circle class="f d" style="--i:2" cx="9" cy="15" r="1.2"/><circle class="f d" style="--i:3" cx="12" cy="15" r="1.2"/><circle class="f d" style="--i:4" cx="15" cy="15" r="1.2"/></svg></span>';
 const ico = (n) => `<svg class="ico" viewBox="0 0 24 24" aria-hidden="true">${ICONS[n]}</svg>`;
 
-// ---------- light / night: oq-light by default, oq-night when chosen; one choice for every page ("mx-theme") ----------
+// ---------- light / night: oq-night by default (omxcore's brand is blue on dark), oq-light when chosen; one choice for every page ("mx-theme") ----------
 function applyTheme(t) {
   const r = document.documentElement;
-  r.classList.toggle("oq-night", t === "dark"); r.classList.toggle("oq-light", t !== "dark");
-  r.dataset.theme = t === "dark" ? "dark" : "light";
+  r.classList.toggle("oq-night", t !== "light"); r.classList.toggle("oq-light", t === "light");
+  r.dataset.theme = t === "light" ? "light" : "dark";
 }
 applyTheme(localStorage.getItem("mx-theme"));
 
@@ -66,7 +68,7 @@ function renderShell() {
   const sections = !!window.SHELL_ITEMS;
   const btn = (it) => `<button type="button" data-i="${it.i}" data-href="${it.href}"${it.on ? ' class="on" aria-current="page"' : ""}>${it.label}</button>`;
   // desktop: brand island · nav pill · the right island (the Beacon's place; nothing here is live, so it holds the theme choice)
-  const brand = `<a class="brand-isl" href="${sections ? "#top" : "index.html"}"><span class="mark">ox</span>omxcore</a>`;
+  const brand = `<a class="brand-isl" href="${sections ? "#top" : "index.html"}">${CORE_MARK}omxcore</a>`;
   const topnav = `<nav class="topnav" id="topnav" aria-label="${sections ? "On this page" : "Pages"}"><i class="tb-thumb"></i>` +
     items.map((it) => btn(it)).join("") +
     `<button type="button" class="more" data-more aria-label="Show all pages">+<span>${items.length - 4}</span></button></nav>`;

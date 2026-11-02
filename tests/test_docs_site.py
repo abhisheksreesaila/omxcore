@@ -55,7 +55,7 @@ LANDING = {"story.html", "deck.html"}   # the story and its slides: their own fr
 @pytest.mark.parametrize("page", [p for p in PAGES if p.name not in LANDING], ids=lambda p: p.name)
 def test_page_shell(page):
     p = _parse(page)
-    assert p.theme == "light", "light is the default theme"
+    assert p.theme == "dark", "night is the default theme (omxcore blue on dark, as on omxlabs.tech)"
     assert "site.css" in p.refs and "site.js" in p.refs
     assert "read" in p.classes, 'every page opens with a "how to read this" box'
 
@@ -119,13 +119,13 @@ def test_vendored_omxqua_is_complete():
 
 @pytest.mark.parametrize("page", PAGES, ids=lambda p: p.name)
 def test_every_page_loads_omxqua_in_order_with_the_dev_family(page):
-    """The four files in the documented order, root classes oq-root + oq-light + oq-family-dev (+ oq-top for the pages
+    """The four files in the documented order, root classes oq-root + oq-night + oq-family-dev + oq-app-core (+ oq-top for the pages
     with the shell), no font service and no omxqua CDN."""
     text = page.read_text()
     at = [text.index(f'"{ref}"') for ref in OMXQUA]
     assert at == sorted(at), f"{page.name}: omxqua files out of order"
     root = re.search(r"<html[^>]*class=\"([^\"]*)\"", text).group(1).split()
-    assert {"oq-root", "oq-light", "oq-family-dev", "oq-app-teal"} <= set(root), root   # teal accent: owner, 2026-10-20
+    assert {"oq-root", "oq-night", "oq-family-dev", "oq-app-core"} <= set(root), root   # omxcore blue (brand.css), replacing teal (2026-10-20)
     if page.name != "deck.html":
         assert "oq-top" in root, "the shell is Top islands"
     assert "googleapis" not in text and "jsdelivr.net/gh/" not in text, page.name
@@ -163,3 +163,20 @@ def test_every_link_that_looks_like_a_button_springs():
             cls = re.search(r'class="([^"]*)"', tag)
             if cls and {"btn", "card", "pill", "dk-brand"} & set(cls.group(1).split()):
                 assert "data-press" in tag, f"{page.name}: {tag}"
+
+
+@pytest.mark.parametrize("page", PAGES, ids=lambda p: p.name)
+def test_every_page_wears_the_omxcore_brand(page):
+    """omxcore's brand from omxlabs.tech: brand.css (the blue and the chip mark) after omxqua's components and before
+    site.css, and the chip favicon."""
+    text = page.read_text()
+    assert text.index('"omxqua/src/components.css"') < text.index('"brand.css"') < text.index('"site.css"' if page.name != "deck.html" else '"site.js"')
+    assert '<link rel="icon" href="favicon-core.svg" type="image/svg+xml">' in text
+    assert (SITE / "favicon-core.svg").is_file()
+
+
+def test_brand_blue_and_mark_come_from_omxlabs():
+    css = (SITE / "brand.css").read_text()
+    assert "--ox-core: #4aa8ff" in css and ".oq-night.oq-app-core { --oq-accent: var(--ox-core); --oq-on-accent: #0b0b0d; }" in css
+    assert "prefers-reduced-motion" in css
+    assert 'class="lm lm-core"' in (SITE / "site.js").read_text()
