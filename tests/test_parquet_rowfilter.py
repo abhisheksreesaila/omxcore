@@ -128,7 +128,7 @@ def test_filter_reading_does_not_import_pandas():
             "import tempfile, os, numpy as np, pyarrow as pa, pyarrow.parquet as pq\n"
             "import omxcore as mx\n"
             "from omxcore import col\n"
-            "d = tempfile.mkdtemp(); p = os.path.join(d, 't.parquet')\n"
+            "d = tempfile.mkdtemp(); p = os.path.join(d, 't.parquet'); import atexit, shutil; atexit.register(shutil.rmtree, d, True)\n"
             "from omxcore.np_arrow import array as A\n"
             "pq.write_table(pa.table({'a': A(np.arange(4000, dtype=np.int64)), 'b': A(np.ones(4000, np.float32))}), p, row_group_size=500)\n"
             "import omxcore.io_parquet as iop; iop.MIN_ROWS_FOR_ROW_FILTER = 0; iop._estimated_pass = lambda *a: 0.0\n"

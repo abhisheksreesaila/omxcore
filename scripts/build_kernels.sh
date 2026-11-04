@@ -9,6 +9,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC_DIR="$REPO_ROOT/kernels"
 OUT_PKG="$REPO_ROOT/kernels.mojoc"
+export TMPDIR="${MXFRAME_TEST_TMPDIR:-$HOME/.cache/mxframe-test-tmp}"   # not the shared /tmp tmpfs
+mkdir -p "$TMPDIR"
 STAGE_DIR="$(mktemp -d)"
 
 cleanup() {

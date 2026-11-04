@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """F-141: Parquet decode timings, one thread (the serial build) and all cores.
 
-Makes a 20M-row numeric file and a 5M-row text-heavy file under /tmp/f141_bench (pyarrow, 1M-row groups, snappy), builds
+Makes a 20M-row numeric file and a 5M-row text-heavy file under ~/.cache/mxframe-bench/f141_bench (pyarrow, 1M-row groups, snappy), builds
 mojo/tools/pq_decode_bench.mojo twice (normal, and -D MXFRAME_SERIAL), and prints for each:
   scan numeric   Query(scan_parquet) end to end
   read numeric   read_parquet (decode) and then the in-memory kernel's time on the same query
