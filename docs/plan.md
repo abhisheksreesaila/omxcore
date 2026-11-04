@@ -82,7 +82,7 @@ Root cause (F-162 review): `/` is already FLOAT (bind.mojo); `OP_I2F` (query.moj
 
 ## Night queue 2026-11-04 (owner: autopilot, no benchmarks, hourly status; vision: lean, small, fast, GPU-native frame; no edge-case polish)
 Owner decisions 2026-11-04: sorting ignores case (core option, app turns it on); the (blank) group follows SQL / SQLite (NULLs are one group, sorted first ascending); Mac / Apple GPU checks and all benchmarking wait for the owner's machine and a quiet GPU (another agent uses the GPUs tonight: GPU tests only when `nvidia-smi` shows the GPU idle).
-Order: 1 F-192 → 2 F-193 → 3 F-194 → 4 F-196 → 5 F-191 → 6 F-197 → 7 F-161 → 8 F-158 (bisect the compiler crash first) → 9 F-160 → 10 F-162. Parked: F-137's register limit (edge), real-Mac checks, scoreboards.
+Order: 1 F-192 → 2 F-193 → 3 F-194 (done) → 4 F-196 → 5 F-191 → 6 F-197 → 7 F-161 → 8 F-158 (bisect the compiler crash first) → 9 F-160 → 10 F-162. Parked: F-137's register limit (edge), real-Mac checks, scoreboards.
 
 ## F-196 Data bigger than the GPU stays on the GPU: AUTO streams it, no re-upload per query [todo] (owner 2026-11-04: "most things won't fit")
 F-189 made it never fail, but AUTO answers an over-budget table on the CPU and `compute(GPU)` re-uploads every piece per query.
@@ -104,7 +104,8 @@ The gate asks each device to beat DuckDB, but the SQL path runs everything on th
 ## F-193 A typed NULL constant keeps its own kind beside other constants (wrong column kind) [todo, started and paused 2026-10-28 (owner: stop tonight), branch worktree-agent-a98f3febaf5aeeb60] (found by F-159, 2026-10-28)
 - [ ] `SELECT CAST(NULL AS DATE) AS m, CAST(NULL AS BIGINT) AS q` returns q as BIGINT (today DATE: a wrong answer); every constant select item keeps its type whatever else is in the list (exec.mojo); fuzz constant lists of every kind vs DuckDB
 
-## F-194 Tests and scripts leave nothing in /tmp [todo, started and paused 2026-10-28, branch worktree-agent-a75d31f85a467fb2f] (2026-10-28)
+## F-194 Tests and scripts leave nothing in /tmp [done 2026-11-04] (2026-10-28)
+- Built: `scripts/scratch.py` (root `MXFRAME_TEST_TMPDIR` or `~/.cache/mxframe-test-tmp`); `tests/conftest.py` points TMPDIR / `tempfile.tempdir` there (pytest `tmp_path` and children follow, plain pytest too), shims and the calibration file live there; a `pytest_sessionfinish` check fails a run that leaves a new `/tmp/mxframe-*` / `/tmp/omxcore-*` entry holding this run's pid or checkout hash (others warn: another process's; `MXFRAME_LITTER_CHECK=0` turns it off); stress, tpch_user, bench and build scripts and quickstart's `--save-csv` moved. Tests: `tests/test_tmp_litter.py` (a subprocess session that litters fails, a clean one passes); full suite 28,681 passed, mojo-test green; /tmp listing unchanged. Review: rounds 1-2 NEEDS WORK (other processes' litter failed the run; no behaviour test; quickstart's CRLF rewritten), round 3 fixed. Gaps: an entry an xdist worker makes under its own pid only warns; `mxframe-src-*` never traced (no code makes it now); `demo.py` clears Mojo's own `/tmp/.modular` on a corrupt cache (kept).
 `/tmp` is a 32 GB tmpfs with a per-user quota (docs/lessons.md); the owner's quota filled and tests failed. Today `tests/conftest.py` makes `omxcore-shim-*` in `tempfile.gettempdir()`, `scripts/stress_cpu_kernels.py` makes `mxframe-shim-*`, and something makes `mxframe-src-*` / `omxcore-src-*` (28 left behind).
 - [ ] every test, fixture and script puts scratch under `~/.cache/mxframe-test-tmp` (or `MXFRAME_TEST_TMPDIR`) and removes it; a check in `tests/` fails if a run leaves a new `/tmp/mxframe-*` / `/tmp/omxcore-*` entry
 
