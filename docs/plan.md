@@ -82,7 +82,7 @@ Root cause (F-162 review): `/` is already FLOAT (bind.mojo); `OP_I2F` (query.moj
 
 ## Night queue 2026-11-04 (owner: autopilot, no benchmarks, hourly status; vision: lean, small, fast, GPU-native frame; no edge-case polish)
 Owner decisions 2026-11-04: sorting ignores case (core option, app turns it on); the (blank) group follows SQL / SQLite (NULLs are one group, sorted first ascending); Mac / Apple GPU checks and all benchmarking wait for the owner's machine and a quiet GPU (another agent uses the GPUs tonight: GPU tests only when `nvidia-smi` shows the GPU idle).
-Order: 1 F-192 → 2 F-193 (done) → 3 F-194 (done) → 4 F-196 → 5 F-191 → 6 F-197 → 7 F-161 → 8 F-158 (bisect the compiler crash first) → 9 F-160 → 10 F-162. Parked: F-137's register limit (edge), real-Mac checks, scoreboards.
+Order: 1 F-192 → 2 F-193 (done) → 3 F-194 (done) → 4 F-196 → 5 F-191 → 6 F-197 (done: already true) → 7 F-161 → 8 F-158 (bisect the compiler crash first) → 9 F-160 → 10 F-162. Parked: F-137's register limit (edge), real-Mac checks, scoreboards.
 
 ## F-196 Data bigger than the GPU stays on the GPU: AUTO streams it, no re-upload per query [todo] (owner 2026-11-04: "most things won't fit")
 F-189 made it never fail, but AUTO answers an over-budget table on the CPU and `compute(GPU)` re-uploads every piece per query.
@@ -90,7 +90,8 @@ F-189 made it never fail, but AUTO answers an over-budget table on the CPU and `
 - [ ] pieces upload double-buffered (the next piece copies while the current one runs) and a piece that fits stays resident between queries under the budget (LRU by bytes), so a second query re-uploads only what was evicted (counted in a test)
 - [ ] budget tests with `MXFRAME_GPU_MEM_BUDGET`; NVIDIA PTX unchanged; Apple plan compiles (`-D OMXCORE_APPLE_GPU_SHAPE`)
 
-## F-197 Case-insensitive sort as a core option (omxplorer's sort) [todo] (owner 2026-11-04)
+## F-197 Case-insensitive sort as a core option (omxplorer's sort) [done 2026-11-04: already true, nothing built] (owner 2026-11-04)
+- Found: `Frame.permutation` and SQL `ORDER BY` on TEXT already rank by ASCII-lowercased bytes with the raw bytes as tie-break (`_text_ranks` / `text_ranks`, frame.mojo; rows.mojo; spill sorts the same ranks): `mx` on `b B a A Zed apple _x NULL é E` gives `_x A a apple B b E Zed é NULL`. That is DuckDB's `COLLATE NOCASE` order (ASCII-only fold, non-ASCII by bytes after z). So the owner's "sort ignores case" holds today; an `ignore_case` option would change nothing (Subtract Before You Add). Not built: `COLLATE NOCASE` syntax (add when an app or SQL user needs it), a byte-order opt-out. The (blank) group: NULLs form one group (SQL / SQLite); placement stays last ascending (DuckDB / pandas default; SQLite puts them first; `NULLS FIRST` asks for it). Tell the app with the next STABLE hand-off.
 - [ ] `Frame.permutation(c, descending, ignore_case=False)` and `ORDER BY ... COLLATE NOCASE` in SQL: TEXT ranks by a case-folded word (ties broken by the word itself, stable); default unchanged; equal to DuckDB `COLLATE NOCASE` ordering; an mxapp issue tells the app to turn it on and that the (blank) group is SQL's NULL group
 
 ## F-191 SQL honours GPU and AUTO (`mx sql --device gpu|auto`, `sql_with` on a device) [todo] (found by the F-162 harness, 2026-10-28)
