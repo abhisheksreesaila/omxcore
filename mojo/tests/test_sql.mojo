@@ -190,10 +190,22 @@ def main() raises:
     for i in range(3):
         rt.append_text(r_reg, r_names[i])
         rt.append(r_w, Int64(10 * (i + 1)))
-    cat.add_table("reg", rt^.share())
+    var reg_t = rt^.share()
+    cat.add_table("reg", reg_t)
     r = sql(cat, "SELECT r.w, count(*), sum(e.qty) FROM edited e JOIN reg r ON e.region = r.region GROUP BY r.w ORDER BY r.w")
     check(rows_of(r.table), "10 4 105\n20 2 4\n30 1 1\n", "a join over a frame")
     has_note(r, "join build side: r (3 rows")
+    has_note(r, "join path: fused: ")
+    var streamed_frame = False                                  # F-158: the frame's chunks probe one at a time (its edits seen), never read into a table
+    for n in r.notes:
+        streamed_frame = streamed_frame or "chunk by chunk" in n
+    if not streamed_frame:
+        fail("a Frame on the probe side streams")
+    var fb = Catalog()                                          # ... and equals the join over the baked frame (edit + append + removed row)
+    fb.add_table("edited", f.bake().share())
+    fb.add_table("reg", reg_t)
+    var baked = sql(fb, "SELECT r.w, count(*), sum(e.qty) FROM edited e JOIN reg r ON e.region = r.region GROUP BY r.w ORDER BY r.w")
+    check(rows_of(r.table), rows_of(baked.table), "a join over a frame equals the join over bake()")
     var jt = sql(cat, "SELECT r.w, count(*), sum(e.qty) FROM orders e JOIN reg r ON e.region = r.region GROUP BY r.w ORDER BY r.w")
     var js = sql(cat, "SELECT r.w, count(*), sum(e.qty) FROM filed e JOIN reg r ON e.region = r.region GROUP BY r.w ORDER BY r.w")
     check(rows_of(js.table), rows_of(jt.table), "a join over a scan equals the join over the table")

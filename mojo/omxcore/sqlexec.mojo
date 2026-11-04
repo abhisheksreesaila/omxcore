@@ -32,7 +32,7 @@ from .plan import LogicalPlan, build_plan, executable
 from .post import run_post
 from .join import (needed_columns, side_query, joined_query, virtual_schema, all_needed, needed_after, table_of_column, filter_query, final_query, count_query,
                    with_probe_filter, final_needed, virtual_schema_multi, star_query)
-from .joincore import JoinKeys, JoinSide, KeyPlan, make_key_plan, column_ndv, normalize_keys, unmatchable_not_null, join_pairs, select_rows, gather_join, JoinPairs, JOIN_BUDGET_BYTES
+from .joincore import JoinKeys, JoinSide, KeyPlan, make_key_plan, column_ndv, normalize_keys, unmatchable_not_null, join_pairs, select_rows, gather_join, JoinPairs, JOIN_BUDGET_BYTES, build_budget_error
 from .kernels.hashjoin_cpu import hj_build, JoinMap, PM_SEMI, PM_ANTI, PM_ANTI_NA, PM_NONE
 from .kargs import KernelRun
 from .winsql import plan_windows, finish_windows, WIN_TABLE
@@ -95,15 +95,6 @@ struct Partial(Movable):
         return len(self.counts)
 
 
-def _checked_add(a: Int, b: Int) raises -> Int:
-    var x = Int64(a)
-    var y = Int64(b)
-    var s = x + y
-    if ((x ^ s) & (y ^ s)) < 0:
-        raise Error(OVERFLOW_MESSAGE)
-    return Int(s)
-
-
 def _mix(h: UInt64) -> UInt64:
     var x = h ^ (h >> 33)
     x *= 0xFF51AFD7ED558CCD
@@ -118,87 +109,6 @@ def _hash_group(kw: List[List[Int64]], g: Int) -> UInt64:
     for k in range(len(kw)):
         h = _mix(h ^ UInt64(kw[k][g]))
     return h
-
-
-struct _KeyIndex(Movable):
-    """The hash table from key words to group number over an accumulator's groups, kept across the merges of a scan's row
-    groups: it grows when the groups do, and only the groups added since it last looked are inserted."""
-    var table: List[Int32]
-    var mask: UInt64
-    var indexed: Int
-
-    def __init__(out self):
-        self.table = List[Int32](length=16, fill=-1)
-        self.mask = 15
-        self.indexed = 0
-
-    def insert(mut self, acc: Partial, g: Int):
-        var pos = Int(_hash_group(acc.kw, g) & self.mask)
-        while self.table[pos] >= 0:
-            pos = (pos + 1) & Int(self.mask)
-        self.table[pos] = Int32(g)
-
-    def sync(mut self, acc: Partial, room: Int):
-        """Makes room for `room` more groups and indexes the groups acc gained since."""
-        var cap = len(self.table)
-        if 2 * (acc.groups() + room) > cap:
-            while cap < 2 * (acc.groups() + room):
-                cap *= 2
-            self.table = List[Int32](length=cap, fill=-1)
-            self.mask = UInt64(cap - 1)
-            self.indexed = 0
-        for g in range(self.indexed, acc.groups()):
-            self.insert(acc, g)
-        self.indexed = acc.groups()
-
-
-def _merge_hashed(mut acc: Partial, other: Partial, ops: List[Int], mut ix: _KeyIndex) raises:
-    """Folds `other`'s groups into `acc` by key."""
-    var og = other.groups()
-    if og == 0:
-        return
-    if acc.groups() == 0:
-        acc.slots = other.slots.copy()
-        acc.counts = other.counts.copy()
-        acc.kw = other.kw.copy()
-        return
-    ix.sync(acc, og)
-    for o in range(og):
-        var pos = Int(_hash_group(other.kw, o) & ix.mask)
-        var found = -1
-        while ix.table[pos] >= 0:
-            var g = Int(ix.table[pos])
-            var same = True
-            for k in range(len(acc.kw)):
-                if acc.kw[k][g] != other.kw[k][o]:
-                    same = False
-                    break
-            if same:
-                found = g
-                break
-            pos = (pos + 1) & Int(ix.mask)
-        if found < 0:
-            found = acc.groups()
-            for s in range(len(acc.slots)):
-                acc.slots[s].append(other.slots[s][o])
-            acc.counts.append(other.counts[o])
-            for k in range(len(acc.kw)):
-                acc.kw[k].append(other.kw[k][o])
-            ix.table[pos] = Int32(found)
-            ix.indexed = acc.groups()
-            continue
-        for s in range(len(acc.slots)):
-            var a = acc.slots[s][found]
-            var b = other.slots[s][o]
-            if ops[s] >= A_FSUM:
-                acc.slots[s][found] = fold_float(ops[s], a, b)
-            elif ops[s] == A_MIN:
-                acc.slots[s][found] = min(a, b)
-            elif ops[s] == A_MAX:
-                acc.slots[s][found] = max(a, b)
-            else:
-                acc.slots[s][found] = _checked_add(a, b)
-        acc.counts[found] += other.counts[o]
 
 
 comptime MERGE_PART_BITS = 8                  # 256 partitions: each is merged by one worker, with no sharing and no locks
@@ -992,7 +902,7 @@ def _kind_name(k: Int) -> String:
     return "inner"
 
 
-def _join_side[P: Planner](mut catalog: Catalog, q: BoundQuery, t: Int, needed: List[Int], planner: P, opts: PlannerOptions, trust: Bool) raises -> JoinSide:
+def _join_side[P: Planner](mut catalog: Catalog, q: BoundQuery, t: Int, needed: List[Int], planner: P, opts: PlannerOptions, trust: Bool, build: Bool = False) raises -> JoinSide:
     """Side `t` of the join: the source table itself when nothing filters it and it is a plain table, else the result of a row query."""
     opts.job.check()                                              # F-175: between the steps of a join
     ref src = catalog.sources[q.sources[t]]
@@ -1008,6 +918,7 @@ def _join_side[P: Planner](mut catalog: Catalog, q: BoundQuery, t: Int, needed: 
             kc.append(g - start)
         return JoinSide(src.table, cols^, kc^, True)
     var sq = side_query(catalog, q, t, needed)
+    sq.is_side = build                                              # F-158: only the side the hash table is built from counts against the join budget
     var r = _run_sql_once(catalog, sq, planner, opts, trust, String())
     var cols = List[Int]()
     for i in range(len(needed)):
@@ -1307,7 +1218,7 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
     var defer_probe = -1                                             # the side whose filter is left to the pipeline, or -1
     var streaming = False                                            # ... and it is a scan or a Frame whose chunks probe one at a time
     if (str0 or may0) and left_builds:
-        left = _join_side[P](catalog, q, 0, lneed, planner, opts, trust)       # the build side is read
+        left = _join_side[P](catalog, q, 0, lneed, planner, opts, trust, True)       # the build side is read
         lrows = left.table.rows()
     elif str0:
         defer_probe = 0
@@ -1315,7 +1226,7 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
     elif may0:
         defer_probe = 0
     if (str1 or may1) and not left_builds:
-        right = _join_side[P](catalog, q, 1, rneed, planner, opts, trust)
+        right = _join_side[P](catalog, q, 1, rneed, planner, opts, trust, True)
         rrows = right.table.rows()
     elif str1:
         defer_probe = 1
@@ -1331,6 +1242,9 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
         else:
             rneed = needed_columns(qe, 1)
             right = _plain_side(catalog, qe, 1, rneed)
+    ref built = left if left_builds else right                       # a build side read as a row query (not the source table itself) counts against the budget
+    if not built.zero_copy and built.table.rows() * max(len(built.cols), 1) * 8 > (opts.join_budget if opts.join_budget > 0 else JOIN_BUDGET_BYTES):
+        raise build_budget_error(catalog.sources[q.sources[0 if left_builds else 1]].name, built.table.rows(), len(built.cols), opts.join_budget if opts.join_budget > 0 else JOIN_BUDGET_BYTES)
     var ms_sides = Float64(perf_counter_ns() - t_sides) / 1e6
     var t_keys = perf_counter_ns()
     var keys = JoinKeys()
@@ -1451,7 +1365,7 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
         stages.append(StreamStage(bside, ArcPointer(m^), kplan^, probe_keys_src.copy()))
         var ps = ArcPointer(ProbeStream(probe_src.copy(), used^, pos^, stages^, fmode, False, vstage^, vreal_s^))
         var template = ArcPointer(stream_template(ps))
-        res.notes.append("join path: fused: " + (commas(np) + " probe rows (before the filter) of " + String(len(ps[].used)) + " columns arrive chunk by chunk, " if True else "") +
+        res.notes.append("join path: fused: " + commas(np) + " probe rows (before the filter) of " + String(len(ps[].used)) + " columns arrive chunk by chunk, " +
                          ("each looks its partner up in blocks of 1,024" if not semi_anti else "each is kept or dropped by whether its key is present in the build side, in blocks of 1,024") +
                          " (no joined row is written, no copy of the probe side)" + (" (a row without a partner stays: its build-side columns are NULL)" if kind == 1 else ""))
         inner = _run_sql_once(cat2, jq, planner, opts, trust, lie, template)

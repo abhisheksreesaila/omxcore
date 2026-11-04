@@ -17,6 +17,7 @@ call these.
 from std.memory.alloc import unsafe_alloc
 from .table import Table, SharedTable, Column, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
 from .holistic import float_key
+from .gpu import human_bytes
 from .kernels._fpenv import par_n, core_count
 from .kernels.hashjoin_cpu import JoinMap, hj_build, hj_probe_pairs, hj_probe_select, hj_release, E_BUDGET, PM_SEMI, PM_ANTI, PM_ANTI_NA
 
@@ -739,6 +740,13 @@ def select_rows(m: JoinMap, keys: JoinKeys, n_probe: Int, fmode: Int, threads: I
     out.n = count
     out.probe_a = Int(rows)
     return out^
+
+
+def build_budget_error(name: String, rows: Int, ncols: Int, budget: Int) -> Error:
+    """F-158: the build side collected so far (`rows` of `ncols` columns) is past the join's memory budget."""
+    return Error("the build side of the join (" + name + ") has " + commas(rows) + " rows of " + String(ncols) + (" column" if ncols == 1 else " columns") +
+                 " so far, past the join's memory budget of " + human_bytes(budget) + ": filter it, carry fewer columns, put the larger table on the other side, or raise the budget " +
+                 "(`PlannerOptions.join_budget`, `mx --join-budget`); a join that spills to disk is not built yet")
 
 
 struct JoinSide(Movable):
