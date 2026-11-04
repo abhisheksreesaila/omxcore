@@ -35,7 +35,7 @@ from .join import (needed_columns, side_query, joined_query, virtual_schema, all
 from .joincore import JoinKeys, JoinSide, KeyPlan, make_key_plan, column_ndv, normalize_keys, unmatchable_not_null, join_pairs, select_rows, gather_join, JoinPairs, JOIN_BUDGET_BYTES, build_budget_error
 from .kernels.hashjoin_cpu import hj_build, JoinMap, PM_SEMI, PM_ANTI, PM_ANTI_NA, PM_NONE
 from .kargs import KernelRun
-from .winsql import plan_windows, finish_windows, WIN_TABLE
+from .winsql import plan_windows, finish_windows, point_wide_columns, fix_wide_columns, WIN_TABLE
 from .jfront import FusedJoin, StageData, StreamStage, ProbeStream, chunk_join, stream_template, front_spec, jf_front
 from std.memory import ArcPointer
 from .rows import RowStage, prepare_rows, execute_rows, _Item
@@ -46,7 +46,8 @@ from .sqlprog import lower_rows
 from .planner import (plan_sinks, Planner, RulePlanner, PlannerOptions, PhysicalPlan, Stats, ColStat, G_NONE, G_DENSE, G_HASHED, commas, JoinStats, JoinPlan,
                       BUILD_AUTO, BUILD_LEFT, BUILD_RIGHT)
 from .sqlprog import SqlProgram, DictAccess, lower_sql, collect_columns, PHASE_ALL, PHASE_PLAIN, PHASE_HOL
-from .sqleval import ValCol, float_bits, ld_div
+from .sqleval import ValCol, float_bits, ld_div, ld_div_wide
+from .wide import wide_text
 from .exec import (_read_ahead, _table_addresses, _column_range, _is_range_kind, _key_columns, prepare_ranges, _alias_lists, _delta_nulls, make_stats,
                    delta_table, _gather, _sort_keys, _order_rows, _SortCols, _top_rows, _fill_column, _unique_name, _to_table, _ones_mask,
                    _Chunks, _open_chunks, _load_chunk, chunk_rows_total, LIE, _check_footer, _all, _Inputs, _inputs)
@@ -453,6 +454,8 @@ def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hre
             elif f == F_SUM or f == F_MIN or f == F_MAX:
                 if nonnull == 0:
                     vc.set_null(i)
+                elif f == F_SUM and sp.agg_hi_slot[a] >= 0:         # F-192: the total is the sum of the upper halves times 2^32 plus the lower ones
+                    vc.set_wide(i, (Int128(Int64(acc.slots[sp.agg_hi_slot[a]][g])) << Int128(32)) + Int128(Int64(acc.slots[vs][g])))
                 elif arg_float and f != F_SUM:                       # NaN is above every number: MAX is NaN when there is one, MIN only when there is nothing else
                     var nans = acc.slots[sp.agg_nan_slot[a]][g]
                     if (f == F_MAX and nans > 0) or (f == F_MIN and nonnull - nans == 0):
@@ -468,7 +471,10 @@ def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hre
                     vc.v[i] = float_bits(Float64(from_bits=UInt64(Int64(acc.slots[vs][g]))) / Float64(nonnull))
                 else:
                     var den = UInt128(nonnull) * UInt128(Int(pow10_checked(q.rexprs[sp_a.arg].scale)))
-                    vc.v[i] = float_bits(ld_div(Int64(acc.slots[vs][g]), den))
+                    if sp.agg_hi_slot[a] >= 0:
+                        vc.v[i] = float_bits(ld_div_wide((Int128(Int64(acc.slots[sp.agg_hi_slot[a]][g])) << Int128(32)) + Int128(Int64(acc.slots[vs][g])), den))
+                    else:
+                        vc.v[i] = float_bits(ld_div(Int64(acc.slots[vs][g]), den))
         if sp_a.kind == TEXT.value:
             vc.src = q.rexprs[sp_a.arg].src
         aggs.append(vc^)
@@ -721,10 +727,10 @@ def _run_hol_hashed(t: SharedTable, sp: SqlProgram, look: _GroupLookup, mask_add
         done = end
 
 
-def _lower(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, dicts: DictAccess, inp: _Inputs, phase: Int) raises -> SqlProgram:
+def _lower(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, dicts: DictAccess, inp: _Inputs, phase: Int, wide: Bool = False) raises -> SqlProgram:
     try:
         return lower_sql(q, plan, inp.nullable.copy(), inp.pos.copy(), inp.chunk_cols, dicts.share(),
-                         _alias_lists(src), inp.masked, phase)
+                         _alias_lists(src), inp.masked, phase, wide)
     except e:
         var msg = String(e)
         if msg.startswith("the query needs more than"):
@@ -1983,6 +1989,16 @@ def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPl
     return res^
 
 
+def _sums_integers(q: BoundQuery) -> Bool:
+    """Whether the query has a SUM or AVG of INT or DECIMAL values: the aggregates that can hold 128 bits (F-192)."""
+    for a in q.aggs:
+        if (a.func == F_SUM or a.func == F_AVG) and not a.hol and a.arg >= 0:
+            var k = q.rexprs[a.arg].kind
+            if k == INT.value or k == DECIMAL.value:
+                return True
+    return False
+
+
 def _run_sql_once[P: Planner](mut catalog: Catalog, q0: BoundQuery, planner: P, opts: PlannerOptions, trust: Bool, lie: String,
                               fj: Optional[ArcPointer[FusedJoin]] = None) raises -> SqlResult:
     var t0 = perf_counter_ns()
@@ -2039,7 +2055,21 @@ def _run_sql_once[P: Planner](mut catalog: Catalog, q0: BoundQuery, planner: P, 
     if q.rows:
         res.table = execute_rows(src, q, plan, opts, dicts, notes, inp, stage^, trust, fj, True)
     else:
-        res.table = _execute(src, q, plan, opts, dicts, notes, inp, sp^, trust, fj)
+        try:
+            res.table = _execute(src, q, plan, opts, dicts, notes, inp, sp^, trust, fj)
+        except e:
+            if String(e) != OVERFLOW_MESSAGE or not _sums_integers(q):
+                raise e^
+            # F-192: a total passed int64 (or an expression did: then this raises the same message again). DuckDB sums into 128 bits: run again with
+            # every integer SUM / AVG split into the sums of its upper and lower halves, which cannot overflow, and join the halves in 128 bits.
+            notes = res.notes.copy()
+            notes.append("sums: a total passed int64 (about 9.2e18); ran again with 128-bit totals (each value's upper and lower 32 bits summed apart)")
+            var sp_wide: SqlProgram
+            try:
+                sp_wide = _lower(src, q, plan, dicts, inp, PHASE_PLAIN if (plan.group == G_HASHED and plan.holistic) else PHASE_ALL, True)
+            except lowering:                                                  # (the split sums need more registers than the query has: the error is the total's)
+                raise Error(OVERFLOW_MESSAGE)
+            res.table = _execute(src, q, plan, opts, dicts, notes, inp, sp_wide^, trust, fj)
     res.notes = notes^
     res.explain = _explain_text(lp, res.notes)
     res.ms = Float64(perf_counter_ns() - t0) / 1e6
@@ -2234,12 +2264,16 @@ def _run_windows[P: Planner](mut catalog: Catalog, var st: SqlStatement, text: S
     var t_w = perf_counter_ns()
     finish_windows(wp, rows, opts.threads, opts.job, notes)
     notes.append("window: " + _ms(Float64(perf_counter_ns() - t_w) / 1e6) + " ms")
-    var cat2 = Catalog()
-    cat2.add_table(WIN_TABLE, rows^.share())
     var outer = SqlStatement(String())
     swap(outer, wp.outer)
+    var wide_cols = point_wide_columns(rows, outer)                  # F-192: totals past int64 pass through the outer query as ranks
+    if len(wide_cols.out) > 0:
+        notes.append("totals past int64 in " + String(len(wide_cols.out)) + " output column(s) go through the outer query as ranks")
+    var cat2 = Catalog()
+    cat2.add_table(WIN_TABLE, rows^.share())
     var oq = bind_statement(cat2, outer^, text)
     var out = run_sql(cat2, oq, planner, opts)
+    fix_wide_columns(out.table, wide_cols)
     for nt in out.notes:
         notes.append(nt)
     out.notes = notes^

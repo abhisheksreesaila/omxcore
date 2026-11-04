@@ -12,7 +12,7 @@ produced); a `WinGroup` names the PARTITION BY columns, the ORDER BY keys and th
 Functions: row_number, rank, dense_rank, percent_rank, cume_dist, ntile(k), lag / lead(x [, offset [, default]]), first_value / last_value /
 nth_value(x, n), and sum, count, count(*), avg, min, max over a frame. Frames are monotone (both ends only move forward), so a sum, count or
 average is a running total that adds the rows entering and subtracts the rows leaving, and min / max a monotone deque: O(rows). INT and
-DECIMAL sums are exact (a 128-bit accumulator; a result outside int64 raises, like the engine's other sums); a FLOAT sum adds in partition
+DECIMAL sums are exact (a 128-bit accumulator; a result outside int64 is kept in 128 bits, `Column.high`, F-192, as DuckDB's HUGEINT); a FLOAT sum adds in partition
 order when the frame starts at the partition's start and otherwise combines a fixed binary tree (no cancellation from subtracting).
 Frames: ROWS with any offsets, RANGE with UNBOUNDED / CURRENT ROW bounds (peers included; the default frame with an ORDER BY is RANGE
 UNBOUNDED PRECEDING to CURRENT ROW, the whole partition without one). The ranking functions, ntile, lag and lead ignore the frame.
@@ -22,7 +22,8 @@ from .table import Table, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, Wor
 from .frame import _radix_order_job, text_ranks
 from .job import JobCtl
 from .holistic import float_key
-from .sqleval import float_bits, ld_div
+from .sqleval import float_bits, ld_div_wide
+from .wide import wide_lo, wide_hi
 from .fan import ParTask, run_tasks
 from .sql import FM_NONE, FM_ROWS, FM_RANGE, FB_UNB_PREC, FB_PREC, FB_CUR, FB_FOL, FB_UNB_FOL
 from .expr import Expr
@@ -46,7 +47,6 @@ comptime W_MIN = 15
 comptime W_MAX = 16
 
 comptime TASK_ROWS = 16384        # a task takes whole partitions until it holds about this many rows
-comptime WINDOW_OVERFLOW = "a window sum passed the int64 range (about 9.2e18)"
 
 
 struct WinOrder(Copyable, Movable):
@@ -157,6 +157,7 @@ struct _FnRun(Copyable, Movable):
     var keys: List[Int64]            # min / max: a comparable key per row
     var outv: Int
     var outn: Int
+    var outh: Int                    # a sum: the address of the upper 64 bits of each result (F-192), else 0
 
     def __init__(out self):
         self.kind = 0
@@ -176,6 +177,7 @@ struct _FnRun(Copyable, Movable):
         self.keys = List[Int64]()
         self.outv = 0
         self.outn = 0
+        self.outh = 0
 
 
 struct _Ctx(Movable):
@@ -188,7 +190,6 @@ struct _Ctx(Movable):
     var task_at: List[Int]           # the partition each task starts at, then the partition count
     var fns: List[_FnRun]
     var job: Int                     # the job's words (0: none): a task stops taking partitions once it is cancelled
-    var err: List[Int]               # set to 1 by a task whose sum left the int64 range
 
     def __init__(out self):
         self.n = 0
@@ -200,13 +201,13 @@ struct _Ctx(Movable):
         self.task_at = List[Int]()
         self.fns = List[_FnRun]()
         self.job = 0
-        self.err = List[Int](length=1, fill=0)
 
 
 struct _Out(Movable):
     var kind: Int
     var scale: Int
     var vals: List[Int64]
+    var hi: List[Int64]              # a sum of INT or DECIMAL values: the upper 64 bits of each result (the sum is kept in 128 bits)
     var nul: List[UInt8]             # 1 where the result is NULL
     var dict: ArcPointer[WordDict]   # TEXT results: the words their codes belong to
     var name: String
@@ -215,6 +216,7 @@ struct _Out(Movable):
         self.kind = kind
         self.scale = scale
         self.vals = List[Int64](length=n, fill=0)
+        self.hi = List[Int64]()
         self.nul = List[UInt8](length=n, fill=0)
         self.dict = ArcPointer(WordDict())
         self.name = name
@@ -539,6 +541,9 @@ def _prepare(t: Table, g: WinGroup, n: Int, threads: Int, job: JobCtl, mut outs:
                     wd.codes[f.def_text] = code
                 out.dict = ArcPointer(wd^)
                 fr.def_val = Int64(code)
+        if f.kind == W_SUM and (ot[0] == INT.value or ot[0] == DECIMAL.value):
+            out.hi = List[Int64](length=n, fill=0)
+            fr.outh = Int(out.hi.unsafe_ptr())
         fr.outv = Int(out.vals.unsafe_ptr())
         fr.outn = Int(out.nul.unsafe_ptr())
         ctx.fns.append(fr^)
@@ -548,9 +553,7 @@ def _prepare(t: Table, g: WinGroup, n: Int, threads: Int, job: JobCtl, mut outs:
     var task = _WinTask(Int(UnsafePointer(to=ctx)))
     run_tasks(task, ntasks, threads)
     job.check()                                                      # (a cancelled run left some partitions undone: no result)
-    var failed = ctx.err[0]
-    if failed != 0:
-        raise Error(WINDOW_OVERFLOW)
+    _ = ctx^                                                         # (the tasks read it by address: it lives until they are done)
 
 
 @fieldwise_init
@@ -780,20 +783,17 @@ def _eval_agg(c: _Ctx, fr: _FnRun, ps: Int, pe: Int):
         elif k == W_SUM:
             if is_float:
                 _put(fr, row, float_bits(facc))
-            elif acc > Int128(Int64.MAX) or acc < Int128(Int64.MIN):
-                UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=Int(c.err.unsafe_ptr()))[0] = 1
-            else:
-                _put(fr, row, Int64(acc))
+            else:                                                          # (past int64 the lower word is here and the upper one beside it: F-192)
+                _put(fr, row, wide_lo(acc))
+                UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=fr.outh)[row] = wide_hi(acc)
         elif k == W_AVG:
             if is_float:
                 _put(fr, row, float_bits(facc / Float64(cnt)))
-            elif acc > Int128(Int64.MAX) or acc < Int128(Int64.MIN):
-                UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=Int(c.err.unsafe_ptr()))[0] = 1
             else:
                 var den = UInt128(cnt)
                 for _ in range(fr.scale):
                     den *= UInt128(10)
-                _put(fr, row, float_bits(ld_div(Int64(acc), den)))
+                _put(fr, row, float_bits(ld_div_wide(acc, den)))
         else:                                                              # min / max: the deque's front
             var v = argv[perm[dq[head]]]
             if is_float and Float64(from_bits=UInt64(v)) != Float64(from_bits=UInt64(v)):
@@ -816,6 +816,14 @@ def apply_windows(mut t: Table, groups: List[WinGroup], threads: Int = 0, job: J
             if outs[i].nul[j] != 0:
                 nulls += 1
         swap(t.cols[ci].values, outs[i].vals)
+        if len(outs[i].hi) > 0:                                          # a sum past int64 keeps its upper words; one that fits does not need them
+            var past = False
+            for j in range(n):
+                if outs[i].hi[j] != (t.cols[ci].values[j] >> 63) and outs[i].nul[j] == 0:
+                    past = True
+                    break
+            if past:
+                swap(t.cols[ci].high, outs[i].hi)
         if nulls > 0:
             var bits = List[UInt8](length=(n + 7) // 8, fill=0xFF)
             for j in range(n):

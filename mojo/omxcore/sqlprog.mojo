@@ -21,12 +21,12 @@ from .table import TEXT, BOOL, FLOAT, INT, DECIMAL, DATE, F32_COLUMN, SharedTabl
 from .parquet import ParquetScan
 from .kernels.pipeline_cpu import LP
 from .kernels._fpenv import core_count, par_n
-from .query import (Program, FOOTER_LIE, OP_LOAD_CONST, OP_LOADI, OP_IADD, OP_ISUB, OP_IMUL, OP_F2I, OP_AND, OP_OR, OP_NOT, OP_ISNULL,
+from .query import (Program, FOOTER_LIE, WIDE_LITERAL_MESSAGE, OP_LOAD_CONST, OP_LOADI, OP_IADD, OP_ISUB, OP_IMUL, OP_F2I, OP_AND, OP_OR, OP_NOT, OP_ISNULL,
                     OP_IDIV, OP_IMOD, OP_IMIN, OP_IMAX, OP_ICMP, OP_AGG_ISUM, OP_AGG_IMIN, OP_AGG_IMAX, MAX_REGS,
                     CTL_PLACEHOLDER, A_SUM, A_MIN, A_MAX, A_FSUM, A_FMIN, A_FMAX, _frame_mask, _null_mask,
                     OP_LOAD_COL, OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_AGG_SUM, OP_AGG_MIN, OP_AGG_MAX, NAN_AWARE)
 from .frame import _text_less, text_ranks
-from .bind import (BoundQuery, BExpr, B_DIV, B_I2F, B_FDIV, B_FMOD, B_LEAST, B_GREATEST, B_COL, B_LIT, B_NULL, B_ADD, B_SUB, B_MUL,
+from .bind import (BoundQuery, BExpr, B_WLIT, B_DIV, B_I2F, B_FDIV, B_FMOD, B_LEAST, B_GREATEST, B_COL, B_LIT, B_NULL, B_ADD, B_SUB, B_MUL,
                    B_IDIV, B_IMOD, B_NEG, B_RESCALE, B_CMP, B_AND, B_OR, B_NOT, B_ISNULL, B_IN, C_LT, C_GE, C_LE, C_GT, C_EQ,
                    C_NE, F_SUM, F_MIN, F_MAX, F_AVG, pow10_checked,
                    B_STR, B_CASE, B_COALESCE, B_DISTINCT, B_CAST, B_DATEPART, B_DATETRUNC, B_ADDMONTHS, B_DATEDIFF, B_BOOLIS, B_TFN, B_CONCAT, B_QBIN, DERIVED_BASE)
@@ -204,6 +204,7 @@ struct SqlProgram(Movable):
     var set_bytes: List[UInt8]
     var set_meta: List[Int64]
     var agg_val_slot: List[Int]      # per aggregate: its kernel slot, -1 for none
+    var agg_hi_slot: List[Int]       # F-192, wide totals: per integer SUM / AVG, the slot summing the upper halves of its values (agg_val_slot then sums the lower halves), else -1
     var agg_nul_slot: List[Int]      # per aggregate: the slot counting the NULLs it skipped, -1 when its argument has none
     var agg_nan_slot: List[Int]      # per float min / max: the slot counting the NaNs it left out (NaN is above every number), else -1
     var agg_src: List[Int]           # per aggregate: its holistic value source, -1 for a plain one
@@ -220,6 +221,7 @@ struct SqlProgram(Movable):
         self.set_bytes = List[UInt8]()
         self.set_meta = List[Int64]()
         self.agg_val_slot = List[Int]()
+        self.agg_hi_slot = List[Int]()
         self.agg_nul_slot = List[Int]()
         self.agg_nan_slot = List[Int]()
         self.agg_src = List[Int]()
@@ -552,6 +554,8 @@ struct _Emitter(Movable):
             self.ins(OP_IDIV if x.op == B_FDIV else OP_IMOD if x.op == B_FMOD else OP_IMIN if x.op == B_LEAST else OP_IMAX, a.reg, a.reg, b.reg)
             self.free(b.reg)
             return V(a.reg, self.or_nul(a.nul, b.nul), False)
+        if x.op == B_WLIT:                                         # F-192: past int64: only HAVING, the select list and ORDER BY after aggregation read it
+            raise Error(WIDE_LITERAL_MESSAGE + " (" + x.text + ")")
         raise Error("internal: expression kind " + String(x.op) + " is not a row-level value")
 
     # ── F-156: tables, text, CASE, CAST, dates ────────────────────────────────────────────────────────────
@@ -2361,9 +2365,11 @@ comptime PHASE_HOL = 2       # hashed groups, pass 2: only the holistic sources,
 
 
 def lower_sql(q: BoundQuery, plan: PhysicalPlan, var nullable: List[Bool], var pos: List[Int], nchunk_cols: Int,
-              var dicts: DictAccess, var aliases: List[List[Int]], masked: Bool, phase: Int = PHASE_ALL) raises -> SqlProgram:
+              var dicts: DictAccess, var aliases: List[List[Int]], masked: Bool, phase: Int = PHASE_ALL, wide: Bool = False) raises -> SqlProgram:
     """The program for `q` under `plan`. `nullable[c]`: source column c may hold NULLs; `pos[c]`: its place in the chunk
-    tables the program runs on; `aliases[c]`: a frame's merged TEXT codes; `masked`: a frame mask hides changed rows."""
+    tables the program runs on; `aliases[c]`: a frame's merged TEXT codes; `masked`: a frame mask hides changed rows. `wide` (F-192): an integer
+    SUM / AVG keeps two slots, the sums of each value's upper and lower 32 bits (floor division and remainder by 2^32), so that a total past int64
+    is the exact `hi * 2^32 + lo` where one slot would have overflowed; the executor asks for it only after a total passed int64."""
     var e = _Emitter(Program(nchunk_cols), q.rexprs.copy(), nullable^, pos^, aliases^, dicts^)
     var sp_aggs = q.aggs.copy()
     # which aggregates are holistic: their values go to the kernel hook, one source per distinct argument
@@ -2530,6 +2536,7 @@ def lower_sql(q: BoundQuery, plan: PhysicalPlan, var nullable: List[Bool], var p
     var n_aggs = len(sp_aggs)
     for _ in range(n_aggs):
         out.agg_val_slot.append(-1)
+        out.agg_hi_slot.append(-1)
         out.agg_nul_slot.append(-1)
         out.agg_nan_slot.append(-1)
         out.agg_src.append(-1)
@@ -2574,6 +2581,7 @@ def lower_sql(q: BoundQuery, plan: PhysicalPlan, var nullable: List[Bool], var p
             v = e.value(sp_aggs[i].arg)
         var raw_kept = -1
         var sum_slot = -1
+        var hi_slot = -1
         var min_slot = -1
         var max_slot = -1
         var nul_slot = -1
@@ -2590,13 +2598,33 @@ def lower_sql(q: BoundQuery, plan: PhysicalPlan, var nullable: List[Bool], var p
             else:
                 e.free(m)
             sum_slot = n_slots
-            e.p.section = 2
-            e.ins(OP_AGG_SUM if v.fl else OP_AGG_ISUM, sum_slot, kept)
-            e.p.section = 1
-            out.slot_ops.append(A_FSUM if v.fl else A_SUM)
-            if v.fl:
-                e.p.repro = True                                      # a float sum has one defined order (F-064)
-            n_slots += 1
+            if wide and not v.fl:                                     # F-192: floor(v / 2^32) and v mod 2^32 summed apart: each sum is exact in int64 up to 2^31 rows
+                var c32 = e.const_i(4294967296)
+                var upper = e.tmp()
+                e.ins(OP_IDIV, upper, kept, c32)
+                var lower = e.tmp()
+                e.ins(OP_IMOD, lower, kept, c32)
+                e.free(c32)
+                var kept_hi = e.keep(upper)
+                var kept_lo = e.keep(lower)
+                e.free(upper)
+                e.free(lower)
+                e.p.section = 2
+                e.ins(OP_AGG_ISUM, sum_slot, kept_lo)
+                e.ins(OP_AGG_ISUM, sum_slot + 1, kept_hi)
+                e.p.section = 1
+                out.slot_ops.append(A_SUM)
+                out.slot_ops.append(A_SUM)
+                hi_slot = sum_slot + 1
+                n_slots += 2
+            else:
+                e.p.section = 2
+                e.ins(OP_AGG_SUM if v.fl else OP_AGG_ISUM, sum_slot, kept)
+                e.p.section = 1
+                out.slot_ops.append(A_FSUM if v.fl else A_SUM)
+                if v.fl:
+                    e.p.repro = True                                  # a float sum has one defined order (F-064)
+                n_slots += 1
         var isn = -1                                                  # float min / max: 1.0 where the value is NaN
         if v.fl and (need_min or need_max):
             isn = e.tmp()
@@ -2731,6 +2759,7 @@ def lower_sql(q: BoundQuery, plan: PhysicalPlan, var nullable: List[Bool], var p
                 out.agg_src[j] = src
             elif f == F_SUM or f == F_AVG:
                 out.agg_val_slot[j] = sum_slot
+                out.agg_hi_slot[j] = hi_slot
             elif f == F_MIN:
                 out.agg_val_slot[j] = min_slot
             elif f == F_MAX:

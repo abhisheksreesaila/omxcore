@@ -3,6 +3,7 @@
 # many more queries with DuckDB on generated data; mojo/tests/test_window_builder.mojo covers the builder.)
 from omxcore import (Table, SharedTable, Frame, Catalog, PlannerOptions, sql, SqlResult, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, write_parquet, scan_parquet,
                      scan_csv, CsvOptions, ZSTD)
+from omxcore.wide import wide_text, wide_make
 
 
 def fail(msg: String) raises:
@@ -14,6 +15,8 @@ def cell(t: Table, c: Int, r: Int) raises -> String:
         return "NULL"
     var k = t.kind(c).value
     var v = t.get(c, r)
+    if t.is_wide(c):                                          # F-192: a total past int64
+        return wide_text(wide_make(v, t.get_high(c, r)), t.scale(c))
     if k == TEXT.value:
         return t.text_of(c, Int(v))
     if k == BOOL.value:
@@ -195,7 +198,7 @@ def main() raises:
     if not rows_of(r.table).startswith("Window functions (after the query below, on the CPU)"):
         fail("EXPLAIN did not start with the window step:\n" + rows_of(r.table))
 
-    # a running sum is exact in 128 bits inside (adding the next row before the old one leaves passes int64), and raises when a frame's own sum does
+    # a running sum is exact in 128 bits inside (adding the next row before the old one leaves passes int64), and so is a frame's own sum past int64 (F-192: DuckDB's HUGEINT)
     var t = Table.empty()
     var i = t.add_column("i", INT)
     var v = t.add_column("v", INT)
@@ -206,7 +209,8 @@ def main() raises:
     cat.add_table("wide", t^.share())
     r = sql(cat, "SELECT sum(v) OVER (ORDER BY i ROWS BETWEEN CURRENT ROW AND CURRENT ROW) AS s FROM wide")
     check(rows_of(r.table), "9000000000000000000\n9000000000000000000\n-9000000000000000000\n-9000000000000000000\n", "sums that fit")
-    fails_with(cat, "SELECT sum(v) OVER (ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND 1 FOLLOWING) FROM wide", "a window sum passed the int64 range")
+    r = sql(cat, "SELECT sum(v) OVER (ORDER BY i ROWS BETWEEN UNBOUNDED PRECEDING AND 1 FOLLOWING) AS s FROM wide")
+    check(rows_of(r.table), "18000000000000000000\n9000000000000000000\n0\n0\n", "a frame's own sum past int64")
 
     # 1 thread and many give the same rows, FLOAT sums bit for bit
     cat.add_table("big", big())
