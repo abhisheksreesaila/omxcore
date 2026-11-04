@@ -158,7 +158,10 @@ struct Table(Movable):
         return c
 
     def check(self) raises:
-        """Raises when the columns do not all have the same number of rows."""
+        """Raises when the columns do not all have the same number of rows (or a wide column's upper words are not one per row)."""
+        for c in range(len(self.cols)):
+            if len(self.cols[c].high) != 0 and len(self.cols[c].high) != len(self.cols[c].values):
+                raise Error("column `" + self.cols[c].name + "` has " + _rows(len(self.cols[c].values)) + " but " + String(len(self.cols[c].high)) + " upper words")
         for c in range(1, len(self.cols)):
             if len(self.cols[c].values) != self.rows():
                 raise Error("column `" + self.cols[c].name + "` has " + _rows(len(self.cols[c].values)) +

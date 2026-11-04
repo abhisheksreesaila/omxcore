@@ -15,11 +15,11 @@ module to take those expressions out of the kernel's hands first:
 What the kernel cannot be given (a wide number inside CASE, COALESCE, a CAST ...) is refused with the int64 message, as before.
 """
 from .table import Table, INT, DECIMAL, BOOL, FLOAT
-from .bind import (BoundQuery, BExpr, B_COL, B_LIT, B_NULL, B_WLIT, B_ADD, B_SUB, B_MUL, B_NEG, B_RESCALE, B_CMP, B_ISNULL, B_DIV, B_I2F, B_AND, B_OR, B_NOT,
+from .bind import (BoundQuery, BExpr, B_COL, B_LIT, B_NULL, B_WLIT, B_ADD, B_SUB, B_MUL, B_NEG, B_RESCALE, B_CMP, B_ISNULL, B_CAST, B_DIV, B_I2F, B_AND, B_OR, B_NOT,
                    C_LT, C_LE, C_GT, C_GE, C_EQ, C_NE, decimal_to_float)
 from .sqleval import ValCol, float_bits
 from .query import OVERFLOW_MESSAGE, WIDE_LITERAL_MESSAGE
-from .wide import pow10_wide, wide_make, wide_lo, wide_hi, fits_int64, wide_mul, wide_add, wide_sub, wide_to_float, within_decimal
+from .wide import pow10_wide, wide_make, wide_lo, wide_hi, fits_int64, wide_mul, wide_add, wide_sub, wide_to_float, wide_text, within_decimal
 
 
 def _is_number(kind: Int) -> Bool:
@@ -99,6 +99,11 @@ def _scan(q0: List[BExpr], i: Int, nk: Int, mut s: _Scan):
             _scan(q0, x.a, nk, s)
             good = s.ok[x.a] == 1
             lf = s.leaf[x.a]
+    elif x.op == B_CAST:                                              # a cast of an integer to an integer type: checked against the type's range
+        if x.kind == INT.value and q0[x.a].kind == INT.value:
+            _scan(q0, x.a, nk, s)
+            good = s.ok[x.a] == 1
+            lf = s.leaf[x.a]
     elif x.op == B_ISNULL:
         _scan(q0, x.a, nk, s)
         good = s.ok[x.a] == 1
@@ -138,6 +143,22 @@ def _eval(q0: List[BExpr], i: Int, nk: Int, keys: List[ValCol], aggs: List[ValCo
     if x.op == B_NULL:
         for r in range(n):
             out.set_null(r)
+        return out^
+    if x.op == B_CAST:
+        var a = _eval(q0, x.a, nk, keys, aggs, n)
+        var bits = (Int(x.value) >> 1) & 0x7F
+        var limit = Int128(1) << Int128(bits - 1)
+        var try_ = (Int(x.value) & 1) != 0
+        for r in range(n):
+            if a.is_null(r):
+                out.set_null(r)
+            elif a.v[r] >= limit or a.v[r] < -limit:
+                if try_:
+                    out.set_null(r)
+                else:
+                    raise Error("Conversion Error: the value " + wide_text(a.v[r], 0) + " is out of range for a " + String(bits) + "-bit integer")
+            else:
+                out.v[r] = a.v[r]
         return out^
     if x.op == B_ISNULL:
         var a = _eval(q0, x.a, nk, keys, aggs, n)
@@ -262,7 +283,7 @@ def _materialize(mut q: BoundQuery, i: Int, w: WCol, can_point: Bool, mut rw: Wi
 
 
 def _is_op(x: BExpr) -> Bool:
-    return x.op == B_ADD or x.op == B_SUB or x.op == B_MUL or x.op == B_NEG or x.op == B_RESCALE or x.op == B_CMP or x.op == B_ISNULL
+    return x.op == B_ADD or x.op == B_SUB or x.op == B_MUL or x.op == B_NEG or x.op == B_RESCALE or x.op == B_CMP or x.op == B_ISNULL or x.op == B_CAST
 
 
 def _visit(mut q: BoundQuery, q0: List[BExpr], i: Int, can_point: Bool, nk: Int, keys: List[ValCol], aggs: List[ValCol], n: Int,
@@ -305,7 +326,7 @@ def _float_operand(mut q: BoundQuery, q0: List[BExpr], operand: Int, nk: Int, ke
     col.nul = w.nul.copy()
     for r in range(n):
         if not w.is_null(r):
-            col.v[r] = float_bits(decimal_to_float(Int64(w.v[r]), x.scale) if fits_int64(w.v[r]) else wide_to_float(w.v[r], x.scale))
+            col.v[r] = float_bits(wide_to_float(w.v[r], x.scale))
     return _hidden_node(q, rw, FLOAT.value, 0, col^, x)
 
 
@@ -318,6 +339,11 @@ def wide_prepass(mut q: BoundQuery, nk: Int, keys: List[ValCol], aggs: List[ValC
     # a FLOAT meeting a total
     for i in range(len(q0)):
         var x = q0[i].copy()
+        if x.op == B_I2F:                                             # CAST(total AS DOUBLE): the node itself becomes the column of doubles
+            var f = _float_operand(q, q0, x.a, nk, keys, aggs, n, s, rw)
+            if f != x.a:
+                q.rexprs[i] = q.rexprs[f].copy()
+            continue
         var float_ctx = x.op == B_DIV or ((x.op == B_ADD or x.op == B_SUB or x.op == B_MUL) and x.kind == FLOAT.value)
         if x.op == B_CMP and (q0[x.a].kind == FLOAT.value or q0[x.b].kind == FLOAT.value):
             float_ctx = True

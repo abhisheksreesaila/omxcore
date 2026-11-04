@@ -161,6 +161,7 @@ struct Catalog(Movable):
         self._put(s^)
 
     def add_frame(mut self, name: String, frame: Frame) raises:
+        frame.refuse_wide()
         var s = SqlSource(name, frame.base)
         s.kind = SRC_SCAN if frame.scan else SRC_FRAME
         s.scan = frame.scan.copy()
@@ -1712,7 +1713,8 @@ struct _Binder(Movable):
                            (": a float's text is its shortest form per row, which omxcore does not make" if fk == FLOAT.value and kind == TEXT.value else "")))
         if kind == TEXT.value and fk != TEXT.value and fk != BOOL.value and ax.op != B_COL:
             raise self.err(ast, "CAST(... AS VARCHAR) of " + kind_name(fk, ax.scale) + " needs a column, not an expression: omxcore writes the text of every value between the column's lowest and highest once, and knows that range for a column only")
-        if fk == kind and kind != DECIMAL.value and (kind != INT.value or bits >= 64) and (kind != FLOAT.value):      # the same type: nothing to do
+        var wide_total_cast = self.in_post and kind == INT.value and fk == INT.value and bits >= 64 and ax.op != B_LIT       # F-192: a total past int64 must not pass a BIGINT cast unchecked
+        if fk == kind and kind != DECIMAL.value and (kind != INT.value or bits >= 64) and (kind != FLOAT.value) and not wide_total_cast:      # the same type: nothing to do
             return a
         if fk == BOOL.value and kind == BOOL.value:
             return a

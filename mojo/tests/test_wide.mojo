@@ -2,7 +2,7 @@
 # whose total passes int64 (global, grouped, a NULL-only group, negatives), what HAVING / ORDER BY / the select list do with it, a scalar subquery
 # that is itself past int64, and the places that cannot hold such a total yet saying so. Expected values were computed in Python; the DOUBLE casts
 # are DuckDB 1.5.1's (tests/test_f192_wide_sums.py compares whole queries with DuckDB; this file needs no Python at run time).
-from omxcore import Table, Catalog, sql, INT, DECIMAL
+from omxcore import Table, Catalog, Frame, sql, INT, DECIMAL
 from omxcore.wide import wide_text, wide_make, wide_lo, wide_hi, parse_wide, wide_mul, wide_to_float, fits_int64, within_decimal
 
 
@@ -158,6 +158,39 @@ def sums() raises:
     fails_with(cat, "SELECT sum(sum(b)) OVER () FROM t GROUP BY g", "passed the int64 range")
     fails_with(cat, "SELECT sum(b) OVER (PARTITION BY g) + 1 FROM t WHERE g <= 2", "passed the int64 range")
     fails_with(cat, "SELECT b * 4000000000 FROM t", "passed the int64 range")                  # a single value's arithmetic still raises
+    # a Frame over such a column cannot hold the upper words: it says so when it is read, queried or baked, and Table.check sees a short `high`
+    var wide = sql(cat, "SELECT g, sum(b) AS s FROM t GROUP BY g ORDER BY g")
+    var held = wide.take_table().share()
+    var f = Frame(held)
+    var said = False
+    try:
+        _ = f.bake()
+    except e:
+        said = "totals past int64" in String(e)
+    if not said:
+        fail("a Frame baked a wide column")
+    said = False
+    try:
+        var cat3 = Catalog()
+        cat3.add_frame("f", f)
+    except e:
+        said = "totals past int64" in String(e)
+    if not said:
+        fail("a Frame over a wide column was queried")
+    var sr = sql(cat, "SELECT g, sum(b) AS s FROM t GROUP BY g ORDER BY g")
+    var short = sr.take_table()
+    short.cols[1].high.pop()
+    said = False
+    try:
+        short.check()
+    except e:
+        said = "upper words" in String(e)
+    if not said:
+        fail("Table.check missed a short `high`")
+    # a total cast to a narrower integer type raises like DuckDB's Conversion Error, and a total that fits casts
+    fails_with(cat, "SELECT sum(b)::BIGINT FROM t WHERE g <= 2 GROUP BY g HAVING g = 1", "out of range")
+    r = sql(cat, "SELECT sum(b)::BIGINT FROM t WHERE g = 3")
+    check(rows_of(r.table), "3\n", "a total that fits casts to BIGINT")
     print("ok")
 
 

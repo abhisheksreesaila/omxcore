@@ -1,7 +1,7 @@
 # F-157 (M8): FLOAT64 as a column kind, from Mojo with no Python: tables, Parquet, CSV, Query, Frame and SQL, with exact expected values
 # (sums of multiples of 0.25 are exact in any order). tests/test_mojo_float*.py compare many more queries with DuckDB on random doubles.
 from std.os import makedirs
-from omxcore.wide import wide_make, wide_to_float
+from omxcore.wide import wide_make
 from std.ffi import external_call
 from std.sys import CompilationTarget
 from omxcore import (float_text, Table, SharedTable, Frame, Catalog, Query, QueryResult, INT, DECIMAL, TEXT, FLOAT, F32_COLUMN, col, lit_float, lit_f32,
@@ -397,6 +397,7 @@ def test_money_with_many_places_is_float_by_default_and_exact_on_request() raise
     var rng = Rng(3)
     var exact_total = Int64(0)
     var float_total = Float64(0.0)
+    var exact_product = Int128(0)
     with open(path, "w") as f:
         f.write("rate,qty\n")
         for _ in range(200_000):
@@ -404,6 +405,7 @@ def test_money_with_many_places_is_float_by_default_and_exact_on_request() raise
             var qty = rng.int(100_000, 1_000_000)
             exact_total += Int64(micro)
             float_total += Float64(micro) / 1.0e6 * Float64(qty)
+            exact_product += Int128(micro) * Int128(qty)
             f.write(String(micro // 1_000_000) + "." + String(1_000_000 + micro % 1_000_000)[byte=1:] + "," + String(qty) + "\n")
     var by_default = read_csv(path)
     expect(by_default.table.kind(0) == FLOAT, "6 places: FLOAT by default")
@@ -421,8 +423,7 @@ def test_money_with_many_places_is_float_by_default_and_exact_on_request() raise
     expect(s1.table.get(0, 0) == exact_total, "the exact sum of the six-place rates, to the last digit")
     var p = sql(cat2, "SELECT sum(rate * qty) FROM fx")           # F-192: the product sum passes int64 and is kept in 128 bits, as DuckDB's DECIMAL(38)
     expect(p.table.is_wide(0), "the exact product sum is a total past int64")
-    var as_float = wide_to_float(wide_make(p.table.get(0, 0), p.table.get_high(0, 0)), 6)
-    expect(abs(as_float / float_total - 1.0) < 1e-9, "and it is the float sum's value to 9 digits")
+    expect(wide_make(p.table.get(0, 0), p.table.get_high(0, 0)) == exact_product, "and it is the exact sum of the products, to the last digit")
 
 
 def test_float_text_of_powers_of_two() raises:

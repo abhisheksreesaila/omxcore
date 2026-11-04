@@ -172,9 +172,16 @@ def parse_wide(text: String) -> WideNum:
     return out^
 
 
-def _hug(m: UInt128) -> Float64:
-    """An unsigned 128-bit integer as a double the way DuckDB's HUGEINT cast does it: the upper word times 2^64 plus the lower word (two roundings)."""
-    return Float64(UInt64(m >> UInt128(64))) * 18446744073709551616.0 + Float64(UInt64(m & UInt128(0xFFFFFFFFFFFFFFFF)))
+def _hug(v: Int128) -> Float64:
+    """DuckDB's HUGEINT to DOUBLE cast: an upper word of 0 is the lower word as a double; of -1, minus the double of the lower word's two's complement
+    (2^64 - lower; exactly -2^64 when the lower word is 0); any other, the upper word times 2^64 plus the lower word (two roundings)."""
+    var upper = Int64(v >> Int128(64))
+    var lower = UInt64(v & Int128(0xFFFFFFFFFFFFFFFF))
+    if upper == 0:
+        return Float64(lower)
+    if upper == -1:
+        return -18446744073709551616.0 if lower == 0 else -Float64(UInt64(0) - lower)
+    return Float64(upper) * 18446744073709551616.0 + Float64(lower)
 
 
 def _divmod_small(m: UInt128, p: UInt64) -> Tuple[UInt128, UInt64]:
@@ -193,11 +200,11 @@ def _divmod_small(m: UInt128, p: UInt64) -> Tuple[UInt128, UInt64]:
 
 
 def wide_to_float(v: Int128, scale: Int) -> Float64:
-    """The value read as a DOUBLE, as DuckDB casts a DECIMAL(38, scale) (probed bit for bit against DuckDB 1.5.1 on 2,500 values, scales 0 to 18):
-    scale 0, the two's-complement words (the upper one signed): upper * 2^64 + lower; otherwise the whole part and the fraction apart (the
-    quotient and remainder by 10^scale, both truncating toward zero), each made a double from its words: whole + fraction / 10^scale."""
+    """The value read as a DOUBLE, as DuckDB casts a DECIMAL(38, scale) (DuckDB's HUGEINT cast `_hug` on the value at scale 0; otherwise on the whole
+    part and the fraction apart, the quotient and remainder by 10^scale truncating toward zero: whole + fraction / 10^scale). tests/test_f192_wide_sums.py
+    compares it with DuckDB over totals in the bands around +-2^63 and +-2^64 at scales 0, 2 and 4, and over random 120-bit ones."""
     if scale == 0:
-        return Float64(Int64(v >> Int128(64))) * 18446744073709551616.0 + Float64(UInt64(v & Int128(0xFFFFFFFFFFFFFFFF)))
+        return _hug(v)
     var neg = v < Int128(0)
     var m = _magnitude(v)
     var pu = UInt64(1)
@@ -206,5 +213,9 @@ def wide_to_float(v: Int128, scale: Int) -> Float64:
         pu *= 10
         pf *= 10.0
     var qr = _divmod_small(m, pu)
-    var x = _hug(qr[0]) + Float64(qr[1]) / pf
-    return -x if neg else x
+    var q = Int128(qr[0])
+    var r = Int128(qr[1])
+    if neg:
+        q = -q
+        r = -r
+    return _hug(q) + _hug(r) / pf

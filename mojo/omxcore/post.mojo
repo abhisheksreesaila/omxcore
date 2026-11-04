@@ -11,7 +11,7 @@ column (its value converted to a double here, exactly as DuckDB casts it), so an
 integer-to-float conversion.
 """
 from .table import Table, SharedTable, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
-from .bind import (decimal_to_float, BoundQuery, BExpr, SqlSource, SortKey, B_COL, B_LIT, B_KEY, B_AGG, B_ADD, B_SUB, B_MUL, B_DIV, B_CMP, B_NEG, B_I2F, B_WLIT)
+from .bind import (decimal_to_float, BoundQuery, BExpr, SqlSource, SortKey, B_COL, B_LIT, B_KEY, B_AGG, B_ADD, B_SUB, B_MUL, B_DIV, B_CMP, B_NEG, B_I2F, B_WLIT, F_SUM)
 from .plan import build_plan
 from .planner import RulePlanner, PlannerOptions, commas, Stats, plan_sinks
 from .sqlprog import DictAccess
@@ -19,6 +19,7 @@ from .sqleval import ValCol, float_bits
 from .exec import _put_column, _inputs, make_stats
 from .rows import prepare_rows, execute_rows
 from .query import OVERFLOW_MESSAGE
+from .wide import wide_to_float
 from .postwide import WideRewrite, wide_prepass, fix_wide
 
 
@@ -143,8 +144,14 @@ def _run_post(q: BoundQuery, keys: List[ValCol], aggs: List[ValCol], dicts: Dict
         var src_col = sh.of_col[s]
         var v = keys[src_col].copy() if src_col < nk else aggs[src_col - nk].copy()
         var f = ValCol(FLOAT.value, 0, v.n())
+        var of_sum = src_col >= nk and q.aggs[src_col - nk].func == F_SUM and not q.aggs[src_col - nk].hol      # F-192: DuckDB's SUM is a DECIMAL(38) / HUGEINT, cast by its own rule
         for i in range(v.n()):
-            f.v[i] = float_bits(decimal_to_float(v.v[i], v.scale)) if not v.is_null(i) else 0
+            if v.is_null(i):
+                f.v[i] = 0
+            elif of_sum:
+                f.v[i] = float_bits(wide_to_float(v.wide_at(i), v.scale))
+            else:
+                f.v[i] = float_bits(decimal_to_float(v.v[i], v.scale))
         f.nul = v.nul.copy()
         _put_column(g, "f" + String(s), f, dicts)
     if g.columns() == 0:                                             # no key and no aggregate (`SELECT 1 HAVING true`): the rows of a table with no column are none, so a column carries the groups

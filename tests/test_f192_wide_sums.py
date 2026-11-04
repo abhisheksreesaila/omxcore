@@ -7,6 +7,7 @@ The data is built so that a group's total, and the whole column's, are far past 
 at most 9.99e17 stored as 99999999999999999), with some groups that stay small (so one column mixes narrow and wide totals), one group of NULLs only,
 and negative totals.
 """
+import math
 import random
 import subprocess
 from decimal import Decimal
@@ -16,7 +17,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from mx_oracle import check, mx_binary, run_mx
+from mx_oracle import check, mx_binary, run_mx, typed_rows
 
 ROWS = 600
 
@@ -260,6 +261,90 @@ def test_a_constant_past_int64_in_a_row_filter_says_what_it_can_do(mx, world):
     assert out.returncode == 1
     assert "a number past the int64 range can only be compared with or combined with totals after aggregation" in out.stdout, out.stdout
     assert "100000000000000000000.00" in out.stdout, out.stdout
+
+
+@pytest.fixture(scope="module")
+def bands(tmp_path_factory):
+    """Groups of 24 rows whose total is in the bands where DuckDB's HUGEINT to DOUBLE cast changes rule (upper word 0, -1, other), at scale 0 (BIGINT)
+    and 2 and 4 (DECIMAL(18)): around +-2^63 and +-2^64 and random 120-bit totals, each total split into 24 values that fit the column."""
+    rnd = random.Random(1923)
+    two63, two64 = 1 << 63, 1 << 64
+    totals = []
+    for base in (two63, two64):
+        for sign in (1, -1):
+            totals += [sign * (base + d) for d in (-3, -1, 0, 1, 2, 5, 1000, 12345)]
+            totals += [sign * rnd.randrange(base - (1 << 40), base + (1 << 40)) for _ in range(40)]
+            totals += [sign * rnd.randrange(base // 2, base) for _ in range(20)]
+    totals += [rnd.choice((1, -1)) * rnd.randrange(1 << 64, 1 << 120) for _ in range(40)]
+    g, v0, v2, v4 = [], [], [], []
+    for i, t in enumerate(totals):
+        for col, lim in ((v0, (1 << 63) - 1), (v2, 10**18 - 1), (v4, 10**18 - 1)):
+            if abs(t) > 24 * lim:
+                t_col = (1 if t > 0 else -1) * rnd.randrange(12 * lim, 24 * lim)       # what 24 values of this column can hold
+            else:
+                t_col = t
+            parts = [t_col // 24] * 24
+            parts[0] += t_col - sum(parts)
+            assert all(abs(x) <= lim for x in parts), (t, col)
+            col.extend(parts)
+        g.extend([i] * 24)
+    path = tmp_path_factory.mktemp("f192b") / "b.parquet"
+    pq.write_table(pa.table({"g": pa.array(g, pa.int64()), "v0": pa.array(v0, pa.int64()),
+                             "v2": pa.array([Decimal(x).scaleb(-2) for x in v2], pa.decimal128(18, 2)),
+                             "v4": pa.array([Decimal(x).scaleb(-4) for x in v4], pa.decimal128(18, 4))}), path, row_group_size=500)
+    con = duckdb.connect()
+    con.execute(f"create table b as select * from read_parquet('{path}')")
+    return {"files": {"b": str(path)}, "con": con}
+
+
+BAND_SQL = "select g, sum({c}) / 7.0, sum({c}) / count(*), avg({c}), sum({c})::double, sum({c}) * 1.5 / 3.0 from b group by g order by g"
+
+
+def test_a_total_at_scale_0_cast_to_double_is_duckdbs_bit_for_bit_in_every_band(mx, bands):
+    """Negative totals between -2^64 and -2^63 (upper word -1: -double(2^64 - lower), exactly -2^64 at lower 0), positive ones below 2^64 (upper word
+    0), and the rest: the total as a DOUBLE (division by a double, by a count, AVG's own rule, a plain cast)."""
+    check(mx, BAND_SQL.format(c="v0"), bands["con"], bands["files"], ordered=True)
+
+
+@pytest.mark.parametrize("col", ["v2", "v4"])
+def test_a_total_with_decimal_places_cast_to_double_is_duckdbs_in_every_band(mx, bands, col):
+    """The same bands at scales 2 and 4: DuckDB's cast of a DECIMAL(38, s) is the whole part and the fraction apart, each by the HUGEINT cast.
+    Known gap (docs/plan.md F-192): for a NEGATIVE total whose whole part is between 2^55 and 2^64 (about 1 in 10 in the bands below), DuckDB's
+    double is one ulp nearer zero than this rule gives (probed on 800 values: the rule behind it is not found; positive totals and every total at
+    scale 0 are exact), so the float columns here may differ by an ulp or two (a division carries it), in a negative total only, and everything else is exact."""
+    sql = BAND_SQL.format(c=col)
+    res = run_mx(mx, ["sql", "--max-rows", "0", sql], bands["files"])
+    want = bands["con"].execute(sql).fetchall()
+    got = typed_rows(res)
+    assert len(got) == len(want)
+    off = 0
+    for a, b in zip(got, want):
+        for x, y in zip(a, b):
+            if isinstance(x, float):
+                assert x == y or (y < 0 and abs(x - y) <= 2 * math.ulp(y)), (a, b)
+                off += x != y
+            else:
+                assert x == y, (a, b)
+    assert off < len(want), "every group differing in the last bit is not a rare gap"
+
+
+def test_a_narrow_total_divided_as_a_double_is_duckdbs_too(mx, world):
+    """DuckDB's SUM is a DECIMAL(38) whether or not the total fits int64, so it casts by that rule (F-190's int64 rule differs in the last bit for
+    some DECIMAL(15, 2) totals)."""
+    check(mx, "select g, sum(p) / 7.0, sum(p) / count(*), sum(p * q) / 3.0 from t group by g order by g", world["con"], world["files"], ordered=True)
+    check(mx, "select sum(p) / 7.0, sum(p) / 11.0, sum(q) / 7.0 from t", world["con"], world["files"])
+
+
+def test_a_wide_total_cast_to_bigint_raises_like_duckdb(mx, world):
+    """`sum(v)::bigint` of a total past int64 is a Conversion Error in DuckDB (it returned the low 64 bits as a BIGINT here); a total that fits casts."""
+    for sql in ("select sum(b)::bigint from t", "select g, sum(b)::bigint from t group by g order by g", "select sum(b)::integer from t",
+                "select (sum(b) + 1)::bigint from t"):
+        with pytest.raises(duckdb.Error):
+            world["con"].execute(sql).fetchall()
+        out = subprocess.run([str(mx), "sql", sql, "-t", f"t={world['files']['t']}"], capture_output=True, text=True)
+        assert out.returncode == 1 and "out of range" in out.stdout, (sql, out.stdout)
+    check(mx, "select sum(b)::bigint from t where g = 3", world["con"], world["files"])
+    check(mx, "select try_cast(sum(b) as bigint) from t", world["con"], world["files"])
 
 
 def test_the_totals_really_pass_int64(world):
