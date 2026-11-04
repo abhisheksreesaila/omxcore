@@ -4,6 +4,7 @@
 and build_mx.sh already use for TMPDIR)."""
 import hashlib
 import os
+import re
 import tempfile
 from pathlib import Path
 
@@ -27,6 +28,13 @@ def shim_dir(checkout: Path, kind: str = "shim") -> Path:
     d = root() / f"{kind}-{hashlib.sha1(str(checkout).encode()).hexdigest()[:10]}"
     d.mkdir(exist_ok=True)
     return d
+
+
+def owned(names, checkout: Path, pid: int | None = None) -> set[str]:
+    """The names this run could have made: they hold its pid or the checkout hash that names its shims."""
+    pid = os.getpid() if pid is None else pid
+    h = hashlib.sha1(str(checkout).encode()).hexdigest()[:10]
+    return {n for n in names if h in n or re.search(rf"(?<!\d){pid}(?!\d)", n)}
 
 
 def litter(tmp: str | Path = "/tmp") -> set[str]:

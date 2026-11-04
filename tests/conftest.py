@@ -35,8 +35,11 @@ def pytest_sessionfinish(session, exitstatus):
     if hasattr(session.config, "workerinput"):
         return
     new = scratch.litter() - _litter_before
-    if new:
-        print(f"\nF-194: this run left entries in /tmp: {sorted(new)}")
+    mine = scratch.owned(new, _ROOT)
+    if new - mine:
+        print(f"\nF-194 warning: new entries in /tmp that belong to another process (not this run's pid or checkout): {sorted(new - mine)}")
+    if mine and os.environ.get("MXFRAME_LITTER_CHECK") != "0":
+        print(f"\nF-194: this run left entries in /tmp: {sorted(mine)} (switch the check off with MXFRAME_LITTER_CHECK=0)")
         session.exitstatus = 1
 
 

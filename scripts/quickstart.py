@@ -167,9 +167,10 @@ orders_arrow = pa.table({
 })
 
 if args.save_csv:
-    pa_csv.write_csv(orders_arrow,    "/tmp/orders.csv")
-    pa_csv.write_csv(customers_arrow, "/tmp/customers.csv")
-    print("  Saved /tmp/orders.csv and /tmp/customers.csv")
+    import scratch   # scripts/scratch.py: ~/.cache/mxframe-test-tmp, never the shared /tmp
+    pa_csv.write_csv(orders_arrow,    str(scratch.root() / "orders.csv"))
+    pa_csv.write_csv(customers_arrow, str(scratch.root() / "customers.csv"))
+    print(f"  Saved {scratch.root()}/orders.csv and {scratch.root()}/customers.csv")
 
 print(f"  orders:    {orders_arrow.num_rows:>10,} rows  {orders_arrow.nbytes/1e6:.0f} MB")
 print(f"  customers: {customers_arrow.num_rows:>10,} rows")
@@ -182,8 +183,8 @@ orders    = mxf.from_arrow(orders_arrow)
 customers = mxf.from_arrow(customers_arrow)
 
 # Could also do:
-#   orders = mxf.read_csv("/tmp/orders.csv")
-#   orders = mxf.read_parquet("/tmp/orders.parquet")
+#   orders = mxf.read_csv("orders.csv")
+#   orders = mxf.read_parquet("orders.parquet")
 #   orders = mxf.from_pandas(some_pandas_df)
 
 
