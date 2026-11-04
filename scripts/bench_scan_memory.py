@@ -10,8 +10,8 @@ and prints the answers (they must be equal), the peaks and the sizes. With `--li
 under a cgroup memory cap (systemd-run --user --scope -p MemoryMax) so "exceeds the limit" is the kernel's verdict.
 
 Usage: pixi run python scripts/bench_scan_memory.py [--rows 60000000] [--group 2000000] [--limit-mb 600]
-       [--dir /tmp/f140_bench] [--keep] [--query big|by_region]
-The file goes under --dir (default /tmp/f140_bench) and is deleted at the end unless --keep.
+       [--dir ~/.cache/mxframe-bench/f140_bench] [--keep] [--query big|by_region]
+The file goes under --dir (default ~/.cache/mxframe-bench/f140_bench) and is deleted at the end unless --keep.
 """
 import argparse
 import json
@@ -101,7 +101,7 @@ def main():
     ap.add_argument("--rows", type=int, default=60_000_000)
     ap.add_argument("--group", type=int, default=2_000_000)
     ap.add_argument("--limit-mb", type=int, default=0)
-    ap.add_argument("--dir", default="/tmp/f140_bench")
+    ap.add_argument("--dir", default=os.path.expanduser("~/.cache/mxframe-bench/f140_bench"))
     ap.add_argument("--query", default="by_region")
     ap.add_argument("--keep", action="store_true")
     args = ap.parse_args()

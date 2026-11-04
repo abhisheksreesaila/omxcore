@@ -37,6 +37,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import scratch as _scratch  # noqa: E402
 from tpch_user import spec  # noqa: E402
 from tpch_user.compare import compare_tables  # noqa: E402
 from tpch_user.official import check_official  # noqa: E402
@@ -201,7 +202,7 @@ def main() -> None:
 
     # the DuckDB reference always runs first (it is only *reported* when requested)
     order = ["duckdb"] + [e for e in engines if e != "duckdb"]
-    tmp = Path(tempfile.mkdtemp(prefix="bench-user-felt-"))
+    tmp = Path(tempfile.mkdtemp(prefix="bench-user-felt-", dir=_scratch.root()))
     f, writer, existing = open_log(csv_path, a.resume, a.mode)
     done = {(r["engine"], r["sf"], r["query"]) for r in existing}
     t_start = time.time()
