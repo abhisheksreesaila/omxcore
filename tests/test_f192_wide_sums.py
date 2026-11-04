@@ -7,7 +7,6 @@ The data is built so that a group's total, and the whole column's, are far past 
 at most 9.99e17 stored as 99999999999999999), with some groups that stay small (so one column mixes narrow and wide totals), one group of NULLs only,
 and negative totals.
 """
-import math
 import random
 import subprocess
 from decimal import Decimal
@@ -17,7 +16,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from mx_oracle import check, mx_binary, run_mx, typed_rows
+from mx_oracle import check, mx_binary, run_mx
 
 ROWS = 600
 
@@ -307,25 +306,9 @@ def test_a_total_at_scale_0_cast_to_double_is_duckdbs_bit_for_bit_in_every_band(
 
 
 @pytest.mark.parametrize("col", ["v2", "v4"])
-def test_a_total_with_decimal_places_cast_to_double_is_duckdbs_in_every_band(mx, bands, col):
-    """The same bands at scales 2 and 4: DuckDB's cast of a DECIMAL(38, s) is the whole part and the fraction apart, each by the HUGEINT cast.
-    Known gap (docs/plan.md F-192): for a NEGATIVE total whose whole part is between 2^55 and 2^64 (about 1 in 10 in the bands below), DuckDB's
-    double is one ulp nearer zero than this rule gives (probed on 800 values: the rule behind it is not found; positive totals and every total at
-    scale 0 are exact), so the float columns here may differ by an ulp or two (a division carries it), in a negative total only, and everything else is exact."""
-    sql = BAND_SQL.format(c=col)
-    res = run_mx(mx, ["sql", "--max-rows", "0", sql], bands["files"])
-    want = bands["con"].execute(sql).fetchall()
-    got = typed_rows(res)
-    assert len(got) == len(want)
-    off = 0
-    for a, b in zip(got, want):
-        for x, y in zip(a, b):
-            if isinstance(x, float):
-                assert x == y or (y < 0 and abs(x - y) <= 2 * math.ulp(y)), (a, b)
-                off += x != y
-            else:
-                assert x == y, (a, b)
-    assert off < len(want), "every group differing in the last bit is not a rare gap"
+def test_a_total_with_decimal_places_cast_to_double_is_duckdbs_bit_for_bit_in_every_band(mx, bands, col):
+    """The same bands at scales 2 and 4: DuckDB's cast of a DECIMAL(38, s) is the whole part and the fraction apart, each by the HUGEINT cast."""
+    check(mx, BAND_SQL.format(c=col), bands["con"], bands["files"], ordered=True)
 
 
 def test_a_narrow_total_divided_as_a_double_is_duckdbs_too(mx, world):
