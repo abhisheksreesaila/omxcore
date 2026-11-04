@@ -80,6 +80,19 @@ Root cause (F-162 review): `/` is already FLOAT (bind.mojo); `OP_I2F` (query.moj
 - Built: DuckDB 1.5.1's rule probed on ~90,000 values a scale: up to 2^53 `float(raw) / 10^s`, past it `float(raw / 10^s) + float(raw % 10^s) / 10^s` (truncating); the CPU kernel's `OP_I2F` does the whole cast for Mojo programs (field 0, the Python API, unchanged); one shared `decimal_to_float` for constants, frames, aggregates read as doubles (post.mojo) and variance / stddev (holistic.mojo). GPU untouched (such programs never reach it). Review: round 1 NEEDS WORK (aggregates read as doubles kept the old rule), round 2 PASS (bit for bit with DuckDB on casts, grouped and window aggregates, Parquet and CSV).
 - [x] a DECIMAL past 2^53 converted to DOUBLE rounds to the nearest double as DuckDB does (exactness kept everywhere a DECIMAL stays a DECIMAL); Q14 and the magnitude probes equal DuckDB through `mx sql`; NVIDIA PTX unchanged unless unavoidable (OP_I2F may also exist in the GPU kernel: then the GPU keeps declining such programs or matches)
 
+## Night queue 2026-11-04 (owner: autopilot, no benchmarks, hourly status; vision: lean, small, fast, GPU-native frame; no edge-case polish)
+Owner decisions 2026-11-04: sorting ignores case (core option, app turns it on); the (blank) group follows SQL / SQLite (NULLs are one group, sorted first ascending); Mac / Apple GPU checks and all benchmarking wait for the owner's machine and a quiet GPU (another agent uses the GPUs tonight: GPU tests only when `nvidia-smi` shows the GPU idle).
+Order: 1 F-192 → 2 F-193 → 3 F-194 → 4 F-196 → 5 F-191 → 6 F-197 → 7 F-161 → 8 F-158 (bisect the compiler crash first) → 9 F-160 → 10 F-162. Parked: F-137's register limit (edge), real-Mac checks, scoreboards.
+
+## F-196 Data bigger than the GPU stays on the GPU: AUTO streams it, no re-upload per query [todo] (owner 2026-11-04: "most things won't fit")
+F-189 made it never fail, but AUTO answers an over-budget table on the CPU and `compute(GPU)` re-uploads every piece per query.
+- [ ] AUTO runs an over-budget Table / Frame / Parquet scan on the GPU in pieces when the GPU is the right call by AUTO's rule (rows, program the kernel takes), the CPU otherwise, with `fallback_reason` either way; results equal the CPU
+- [ ] pieces upload double-buffered (the next piece copies while the current one runs) and a piece that fits stays resident between queries under the budget (LRU by bytes), so a second query re-uploads only what was evicted (counted in a test)
+- [ ] budget tests with `MXFRAME_GPU_MEM_BUDGET`; NVIDIA PTX unchanged; Apple plan compiles (`-D OMXCORE_APPLE_GPU_SHAPE`)
+
+## F-197 Case-insensitive sort as a core option (omxplorer's sort) [todo] (owner 2026-11-04)
+- [ ] `Frame.permutation(c, descending, ignore_case=False)` and `ORDER BY ... COLLATE NOCASE` in SQL: TEXT ranks by a case-folded word (ties broken by the word itself, stable); default unchanged; equal to DuckDB `COLLATE NOCASE` ordering; an mxapp issue tells the app to turn it on and that the (blank) group is SQL's NULL group
+
 ## F-191 SQL honours GPU and AUTO (`mx sql --device gpu|auto`, `sql_with` on a device) [todo] (found by the F-162 harness, 2026-10-28)
 The gate asks each device to beat DuckDB, but the SQL path runs everything on the CPU ("SQL runs on the CPU"); the builder's GPU / AUTO (with F-189's budget) is not reached from SQL.
 - [ ] the aggregate stages the GPU kernel can run (the builder's GPU programs: integer / DECIMAL filters and aggregates, AUTO's size rule, F-189's pieces) run on the GPU from SQL; everything else stays on the CPU with a `fallback_reason`; results equal the CPU; NVIDIA PTX unchanged
