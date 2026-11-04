@@ -61,6 +61,7 @@ struct Column(Movable):
     var kind: ColumnKind
     var scale: Int
     var values: List[Int64]
+    var high: List[Int64]              # F-192: a total past int64 (a SUM, a window SUM): the upper 64 bits of each 128-bit value, `values` holding the lower 64; empty while every value fits int64
     var validity: List[UInt8]          # empty: no nulls
     var nulls: Int
     var dict: ArcPointer[WordDict]     # TEXT: the dictionary (shared between columns that hold the same words)
@@ -70,6 +71,7 @@ struct Column(Movable):
         self.kind = kind
         self.scale = scale
         self.values = List[Int64]()
+        self.high = List[Int64]()
         self.validity = List[UInt8]()
         self.nulls = 0
         self.dict = ArcPointer(WordDict())
@@ -156,7 +158,10 @@ struct Table(Movable):
         return c
 
     def check(self) raises:
-        """Raises when the columns do not all have the same number of rows."""
+        """Raises when the columns do not all have the same number of rows (or a wide column's upper words are not one per row)."""
+        for c in range(len(self.cols)):
+            if len(self.cols[c].high) != 0 and len(self.cols[c].high) != len(self.cols[c].values):
+                raise Error("column `" + self.cols[c].name + "` has " + _rows(len(self.cols[c].values)) + " but " + String(len(self.cols[c].high)) + " upper words")
         for c in range(1, len(self.cols)):
             if len(self.cols[c].values) != self.rows():
                 raise Error("column `" + self.cols[c].name + "` has " + _rows(len(self.cols[c].values)) +
@@ -215,6 +220,20 @@ struct Table(Movable):
     def get_float(self, c: Int, row: Int) -> Float64:
         """A FLOAT cell (a null reads 0.0: ask `is_null`)."""
         return Float64(from_bits=UInt64(self.cols[c].values[row]))
+
+    def is_wide(self, c: Int) -> Bool:
+        """Whether the column holds a total past int64 (F-192): `get` is then only the lower 64 bits; `get_high` the upper ones."""
+        return len(self.cols[c].high) > 0
+
+    def get_high(self, c: Int, row: Int) -> Int64:
+        """The upper 64 bits of a cell: its sign extension for a column that is not wide."""
+        return self.cols[c].high[row] if len(self.cols[c].high) > 0 else self.cols[c].values[row] >> 63
+
+    def any_wide(self) -> Bool:
+        for c in range(len(self.cols)):
+            if len(self.cols[c].high) > 0:
+                return True
+        return False
 
     def is_null(self, c: Int, row: Int) -> Bool:
         return self.cols[c].is_null(row)
@@ -282,6 +301,12 @@ struct SharedTable(ImplicitlyCopyable):
 
     def get_float(self, c: Int, row: Int) -> Float64:
         return self._table[].get_float(c, row)
+
+    def is_wide(self, c: Int) -> Bool:
+        return self._table[].is_wide(c)
+
+    def get_high(self, c: Int, row: Int) -> Int64:
+        return self._table[].get_high(c, row)
 
     def is_null(self, c: Int, row: Int) -> Bool:
         return self._table[].is_null(c, row)

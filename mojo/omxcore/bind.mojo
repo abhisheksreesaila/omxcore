@@ -9,6 +9,7 @@ It checks types the way DuckDB does for the subset (decimal scales aligned, a st
 DATE) and raises with the position of the offending text. Nothing here reads data: the planner and the executor do.
 """
 from .table import SharedTable, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, F32_COLUMN
+from .wide import parse_wide, wide_lo, wide_hi
 from .parquet import ParquetScan
 from .frame import Frame, Overlay, Formula
 from .expr import MAX_QUANTILE_BINS, N_COL, N_LIT, N_LITF, N_DIV, N_I2F, N_ADD, N_SUB, N_MUL, N_FLOORDIV, N_MOD, N_NEG, N_LEAST, N_GREATEST, N_SCALE_TO
@@ -160,6 +161,7 @@ struct Catalog(Movable):
         self._put(s^)
 
     def add_frame(mut self, name: String, frame: Frame) raises:
+        frame.refuse_wide()
         var s = SqlSource(name, frame.base)
         s.kind = SRC_SCAN if frame.scan else SRC_FRAME
         s.scan = frame.scan.copy()
@@ -221,6 +223,7 @@ comptime B_DATEDIFF = 57     # a, b: DATEs; value: the part; INT
 comptime B_BOOLIS = 58       # a: a BOOL; value 0: IS TRUE, 1: IS NOT TRUE, 2: IS FALSE, 3: IS NOT FALSE
 comptime B_TFN = 60          # a function of a TEXT value and constants (`items`: B_STR / B_LIT nodes): value = TF_* | flags << 8; its kind says what it answers
 comptime B_CONCAT = 61       # a || b over TEXT; value 1: concat() (a NULL reads as '')
+comptime B_WLIT = 63         # F-192: a number past int64 (a scalar subquery's total, a literal of up to 38 digits): value = its lower 64 bits, `hi` the upper 64, kind INT or DECIMAL. Only the stage after aggregation reads it (post.mojo)
 comptime B_QBIN = 62         # F-177 quantile_bin(a, n): INT 1 .. n; value: n; items: the n - 1 edge literals (the executor fills them from an exact pass: `b` is -1 until then, -2 while it does)
 comptime DERIVED_BASE = 1 << 20      # a `src` from here on names the dictionary of node (src - DERIVED_BASE) of the pool it is in
 
@@ -242,12 +245,14 @@ struct BExpr(Copyable, Movable):
     var value: Int64
     var text: String
     var src: Int                     # a TEXT value: the source column whose dictionary its codes belong to
+    var hi: Int64                    # B_WLIT: the upper 64 bits of the value
     var line: Int
     var col: Int
 
     def __init__(out self, op: Int, kind: Int, scale: Int, a: Int, b: Int, value: Int64, text: String, line: Int, col: Int):
         self.op = op
         self.src = -1
+        self.hi = 0
         self.kind = kind
         self.scale = scale
         self.a = a
@@ -1137,6 +1142,14 @@ struct _Binder(Movable):
         if x.kind == X_INT or x.kind == X_DEC:
             var n = parse_number(x.text)
             if not n.ok:
+                var w = parse_wide(x.text)                      # F-192: past int64 but within DECIMAL(38): HAVING and the select list over totals can read it
+                if w.ok:
+                    var node = self.mk(B_WLIT, INT.value if x.kind == X_INT else DECIMAL.value, w.scale, -1, -1, wide_lo(w.value), String(x.text), ast)
+                    if self.in_post:
+                        self.q.pexprs[node].hi = wide_hi(w.value)
+                    else:
+                        self.q.rexprs[node].hi = wide_hi(w.value)
+                    return node
                 raise self.err(ast, "the number " + x.text + " does not fit: integers must fit 64 bits and decimals 18 places")
             return self.mk(B_LIT, INT.value if x.kind == X_INT else DECIMAL.value, n.scale, -1, -1, n.value, String(x.text), ast)
         if x.kind == X_FLT:
@@ -1700,7 +1713,8 @@ struct _Binder(Movable):
                            (": a float's text is its shortest form per row, which omxcore does not make" if fk == FLOAT.value and kind == TEXT.value else "")))
         if kind == TEXT.value and fk != TEXT.value and fk != BOOL.value and ax.op != B_COL:
             raise self.err(ast, "CAST(... AS VARCHAR) of " + kind_name(fk, ax.scale) + " needs a column, not an expression: omxcore writes the text of every value between the column's lowest and highest once, and knows that range for a column only")
-        if fk == kind and kind != DECIMAL.value and (kind != INT.value or bits >= 64) and (kind != FLOAT.value):      # the same type: nothing to do
+        var wide_total_cast = self.in_post and kind == INT.value and fk == INT.value and bits >= 64 and ax.op != B_LIT       # F-192: a total past int64 must not pass a BIGINT cast unchecked
+        if fk == kind and kind != DECIMAL.value and (kind != INT.value or bits >= 64) and (kind != FLOAT.value) and not wide_total_cast:      # the same type: nothing to do
             return a
         if fk == BOOL.value and kind == BOOL.value:
             return a

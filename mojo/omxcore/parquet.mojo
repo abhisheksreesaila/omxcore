@@ -445,8 +445,16 @@ def _data_page(mut file: List[UInt8], col: Column, lo: Int, hi: Int, optional: B
     return uncompressed
 
 
+def _refuse_wide(t: Table) raises:
+    """F-192: a total past int64 is two words per value; the Parquet writer writes one."""
+    for c in range(t.columns()):
+        if t.is_wide(c):
+            raise Error("column `" + t.name(c) + "` holds totals past int64 (128 bits), which a Parquet file written here cannot hold yet")
+
+
 def _write(path: String, t: Table, metadata: String, requested: Int, row_group_rows: Int, job: JobCtl = JobCtl(), threads: Int = 0, budget: Int = 0) raises:
     t.check()
+    _refuse_wide(t)
     if t.columns() == 0:
         raise Error("a table with no columns cannot be written as Parquet")
     if row_group_rows < 8 or row_group_rows % 8 != 0:
@@ -662,6 +670,7 @@ struct ParquetWriter(Movable):
 
     def write_rows(mut self, t: Table, lo: Int, hi: Int) raises:
         """Appends rows lo..hi of `t` as one row group."""
+        _refuse_wide(t)
         if t.columns() != self.schema.columns():
             raise Error("a row group has " + String(t.columns()) + " columns, the file " + String(self.schema.columns()))
         var cols = t.columns()

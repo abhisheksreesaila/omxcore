@@ -1840,6 +1840,7 @@ def _compact_registers(pred_reg: Int, mut code: List[Int32]) -> Tuple[Int, Int]:
 
 
 comptime OVERFLOW_MESSAGE = "a sum or an expression passed the int64 range (about 9.2e18)"
+comptime WIDE_LITERAL_MESSAGE = "a number past the int64 range can only be compared with or combined with totals after aggregation (HAVING, the select list, ORDER BY), not read in a row"
 comptime FOOTER_LIE = "footer statistics wrong: "              # the prefix `run_sql` reads to run a query again without a file's statistics
 
 

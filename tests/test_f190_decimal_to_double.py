@@ -113,12 +113,14 @@ def test_the_probes_of_the_review(mx, tmp_path):
         check(mx, sql, con, {"t": path})
 
 
-def test_a_sum_that_really_passes_int64_still_raises(mx, tmp_path):
+def test_a_sum_that_passes_int64_reads_as_duckdbs_double(mx, tmp_path):
+    """F-192: the total is kept in 128 bits (it raised before), and its DOUBLE is DuckDB's."""
     t = pa.table({"v": pa.array([Decimal(10**17 - 1)] * 100, pa.decimal128(18, 0))})
     path = tmp_path / "o.parquet"
     pq.write_table(t, path)
-    out = run_mx(mx, ["sql", "SELECT sum(v) / 2.0 FROM t"], {"t": path}, expect_exit=1)
-    assert out is None or "int64 range" in str(out)
+    con = duckdb.connect()
+    con.execute(f"create table t as select * from read_parquet('{path}')")
+    check(mx, "SELECT sum(v) / 2.0 FROM t", con, {"t": path})
 
 
 # ── TPC-H Q14 at SF1, over DuckDB's own dbgen ─────────────────────────────────────────────────────────

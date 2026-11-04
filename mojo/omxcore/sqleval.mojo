@@ -7,6 +7,7 @@ as a row query over the groups through the executor (`post.mojo`). What stays is
 """
 from std.math import fma
 from .table import INT, DECIMAL, TEXT, BOOL, FLOAT
+from .wide import wide_make, wide_lo, wide_hi, fits_int64
 
 
 struct ValCol(Copyable, Movable):
@@ -14,6 +15,7 @@ struct ValCol(Copyable, Movable):
     var scale: Int
     var src: Int                     # a TEXT value: the source column whose dictionary its codes belong to
     var v: List[Int64]
+    var hi: List[Int64]              # F-192: a total past int64: the upper 64 bits of each value, `v` holding the lower 64; empty while every value fits int64
     var nul: List[UInt8]             # 1 where NULL; empty when none is
 
     def __init__(out self, kind: Int, scale: Int, n: Int):
@@ -21,6 +23,7 @@ struct ValCol(Copyable, Movable):
         self.scale = scale
         self.src = -1
         self.v = List[Int64](length=n, fill=0)
+        self.hi = List[Int64]()
         self.nul = List[UInt8]()
 
     def n(self) -> Int:
@@ -33,6 +36,25 @@ struct ValCol(Copyable, Movable):
         if len(self.nul) == 0:
             self.nul = List[UInt8](length=len(self.v), fill=0)
         self.nul[i] = 1
+
+    def is_wide(self) -> Bool:
+        return len(self.hi) > 0
+
+    def wide_at(self, i: Int) -> Int128:
+        """Value i as 128 bits (a column that is not wide holds int64s)."""
+        return wide_make(self.v[i], self.hi[i]) if len(self.hi) > 0 else Int128(self.v[i])
+
+    def set_wide(mut self, i: Int, x: Int128):
+        """Stores a 128-bit value; the upper words appear (for every value) with the first one that does not fit int64."""
+        if len(self.hi) == 0:
+            if fits_int64(x):
+                self.v[i] = Int64(x)
+                return
+            self.hi = List[Int64](length=len(self.v), fill=0)
+            for j in range(len(self.v)):
+                self.hi[j] = self.v[j] >> 63
+        self.v[i] = wide_lo(x)
+        self.hi[i] = wide_hi(x)
 
     def has_nulls(self) -> Bool:
         for x in self.nul:
@@ -55,19 +77,25 @@ def float_bits(x: Float64) -> Int64:
 
 
 def ld_div(num: Int64, den: UInt128) -> Float64:
+    """num / den as DuckDB's AVG divides (see `ld_div_wide`)."""
+    return ld_div_wide(Int128(num), den)
+
+
+def ld_div_wide(num: Int128, den: UInt128) -> Float64:
     """num / den as an x87 `long double` division rounded to a double, which is how DuckDB computes AVG: the quotient is
     rounded to a 64-bit mantissa, then to 53 bits. That is not always the correctly rounded quotient (about 1 average
     in 20,000 differs by one ulp), and the oracle is DuckDB's, so this reproduces its rounding exactly.
 
     The two roundings differ only when the 64-bit quotient lands exactly on a midpoint of the 53-bit grid, so unless the
     exact quotient lies within 1/512 ulp of one, the plain double division (correctly rounded) is the answer: found
-    from the exact residual (an FMA). Otherwise, and for operands past 2^53, the quotient is computed bit by bit."""
-    if num == 0:
+    from the exact residual (an FMA). Otherwise, and for operands past 2^53, the quotient is computed bit by bit.
+    The numerator may be a total past int64 (F-192): only the bit loop reads it, and its quotient has 67 or 68 bits whatever the size."""
+    if num == Int128(0):
         return 0.0
-    var neg = num < 0
-    var n = UInt64(0) - UInt64(num) if neg else UInt64(num)
-    if n < (UInt64(1) << 53) and den < (UInt128(1) << 53):
-        var nf = Float64(n)
+    var neg = num < Int128(0)
+    var n = UInt128(-(num + Int128(1))) + UInt128(1) if neg else UInt128(num)
+    if n < (UInt128(1) << 53) and den < (UInt128(1) << 53):
+        var nf = Float64(UInt64(n))
         var df = Float64(UInt64(den))
         var q0 = nf / df
         var r = fma(-q0, df, nf)
@@ -80,7 +108,7 @@ def ld_div(num: Int64, den: UInt128) -> Float64:
         var gap = frac - spacing * 0.5
         if (gap if gap > 0.0 else -gap) > spacing * (1.0 / 512.0):
             return -q0 if neg else q0
-    var bn = _bitlen64(n)
+    var bn = _bitlen128(n)
     var bd = _bitlen128(den)
     var s = 67 - bn + bd                                        # (n << s) / den has 67 or 68 bits
     var total = bn + s
@@ -90,7 +118,7 @@ def ld_div(num: Int64, den: UInt128) -> Float64:
         var idx = total - 1 - i
         var bit = UInt128(0)
         if idx >= s:
-            bit = UInt128((n >> UInt64(idx - s)) & 1)
+            bit = (n >> UInt128(idx - s)) & UInt128(1)
         rem = (rem << UInt128(1)) | bit
         q = q << UInt128(1)
         if rem >= den:

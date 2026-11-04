@@ -439,12 +439,14 @@ def test_forcing_dense_beyond_the_limit_raises(probe, data):
     assert res["error"] == "cannot force dense groups: the domain of 10,001 slots passes the limit of 500"
 
 
-def test_sum_past_int64_raises_in_every_source(probe, data):
+def test_sum_past_int64_is_duckdbs_hugeint_in_every_source(probe, data):
+    """F-192: a total past int64 is DuckDB's HUGEINT (it raised "passed the int64 range" before), from a table and from a scan, dense and hashed."""
+    ds = data["g1m"]
     for mode in ["table", "scan"]:
-        res = run_probe(probe, "SELECT sum(id * id * id) FROM t", {"t": data["g1m"].path}, mode=mode, expect_error=True)
-        assert res["error"] == "a sum or an expression passed the int64 range (about 9.2e18)", (mode, res)
-        res = run_probe(probe, "SELECT k, sum(id * id * id) FROM t GROUP BY k", {"t": data["g1m"].path}, mode=mode, group="hashed", expect_error=True)
-        assert res["error"] == "a sum or an expression passed the int64 range (about 9.2e18)", (mode, res)
+        for sql, group in (("SELECT sum(id * id * id) FROM t", None), ("SELECT k, sum(id * id * id) FROM t GROUP BY k", "hashed"),
+                           ("SELECT k, sum(id * id * id) FROM t GROUP BY k", "dense")):
+            res = run_probe(probe, sql, {"t": ds.path}, mode=mode, group=group)
+            assert_equal(got_rows(res), ds.table.execute(sql).fetchall(), False, f"{mode}/{group}: {sql}")
 
 
 def test_empty_inputs(probe, data):
