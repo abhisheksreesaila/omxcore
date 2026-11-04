@@ -37,9 +37,12 @@ def data(tmp_path_factory):
     con.execute("create table m2n as select * from m2 union all select null, 3, 4, null, 999")   # a NULL in the build side (NOT IN)
     con.execute("create table rep as select i % 40 as k, i as v from range(5000) r(i)")            # repeated keys: the streamed join falls back to materialized
     con.execute("create table bigb as select i as k, i as w from range(1000000) r(i)")
-    con.execute("create table ov as select 1 as k, 9223372036854775000::bigint as v from range(2000) r(i)")
+    for name, vals in [("ov", (3000000000000000000, 6000000000000000000, 9000000000000000000)), ("ovfit", (3000000000000000000, 3000000000000000000, 1))]:
+        # 3 row groups of 50,000 rows; key 1 once per group (row 0 of it) with the group's value, every other key distinct with value 1
+        con.execute(f"create table {name} as select case when i % 50000 = 0 then 1 else 100 + i end as k, "
+                    f"case when i % 50000 = 0 then (case i // 50000 when 0 then {vals[0]} when 1 then {vals[1]} else {vals[2]} end)::bigint else 1::bigint end as v from range(150000) r(i)")
     paths = {}
-    for t, rg in [("facts", 7000), ("d1", 700), ("d2", 100), ("big", 100000), ("f2", 5000), ("m2", 100), ("m2n", 100), ("rep", 1000), ("bigb", 100000), ("ov", 500)]:
+    for t, rg in [("facts", 7000), ("d1", 700), ("d2", 100), ("big", 100000), ("f2", 5000), ("m2", 100), ("m2n", 100), ("rep", 1000), ("bigb", 100000), ("ov", 50000), ("ovfit", 50000)]:
         paths[t] = d / f"{t}.parquet"
         con.execute(f"copy {t} to '{paths[t]}' (format parquet, row_group_size {rg})")
     return {"con": con, "paths": paths}
@@ -118,12 +121,24 @@ def test_repeated_build_keys_fall_back_to_materialized_without_a_probe_budget(mx
             assert "join path: materialized" in note(res, "join path"), res["notes"]
 
 
+def _sum_k1(mx, data, table, stream):
+    cmd = [str(mx), "sql", "--stream", stream, "--group", "hashed", "-t", f"{table}={data['paths'][table]}", f"SELECT sum(v) FROM {table} WHERE k = 1 GROUP BY k"]
+    return subprocess.run(cmd, capture_output=True).stdout.decode()
+
+
 def test_sum_overflow_across_row_groups_raises(mx, data):
-    """Every row group's partial sum fits, their total does not: the merge raises (the engine's int64 SUM; DuckDB widens to HUGEINT) instead of wrapping."""
-    cmd = [str(mx), "sql", "--stream", "always", "-t", f"ov={data['paths']['ov']}", "SELECT k, sum(v) FROM ov GROUP BY k"]
-    p = subprocess.run(cmd, capture_output=True)
-    out = (p.stdout + p.stderr).decode()
+    """Key 1 sums 3e18, 6e18, 9e18 in three row groups: each partial fits int64, the total (1.8e19) does not. Hashed groups run `PartAcc` across the
+    row groups; the merge raises instead of wrapping (DuckDB widens to HUGEINT and answers). Read whole, the one pass overflows the same way."""
+    out = _sum_k1(mx, data, "ov", "always")
     assert "passed the int64 range" in out and '"rows"' not in out, out[-300:]
+    cmd = [str(mx), "sql", "--stream", "always", "--group", "hashed", "-t", f"ov={data['paths']['ov']}", "SELECT sum(v) FROM ov GROUP BY k HAVING sum(v) < 0"]
+    assert "passed the int64 range" in subprocess.run(cmd, capture_output=True).stdout.decode()
+
+
+def test_sum_across_row_groups_that_fits_is_exact(mx, data):
+    """3e18 + 3e18 + 1 in three row groups merges to exactly 6000000000000000001."""
+    res = q(mx, data, "SELECT k, sum(v) FROM ovfit WHERE k = 1 GROUP BY k", ["ovfit"], extra=["--stream", "always", "--group", "hashed"])
+    assert [r[1] for r in res["rows"]] == [6000000000000000001] or [str(r[1]) for r in res["rows"]] == ["6000000000000000001"], res["rows"]
 
 
 @pytest.mark.parametrize("stream", ["never", "always"])
