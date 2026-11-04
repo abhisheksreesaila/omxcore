@@ -574,7 +574,7 @@ def test_concurrent_jobs() raises:
 
 
 def test_job_over_edited_frame() raises:
-    var t = big_table(30_000_000)
+    var t = big_table(4_000_000)
     var f = edited_frame(t)
     var vc = f.column("v")
     var want = Query(f).where(col("v") > -900).group_by(col("k"), groups=7).agg(sum(col("v")), count(), min_of(col("v"))).compute(CPU)
@@ -715,7 +715,7 @@ def test_cancel_latency() raises:
 
 def test_cancel_multiway() raises:
     """F-158: a three-table join as a job equals `sql`, and a cancel reaches it between the join's steps and tables."""
-    var t = big_table(30_000_000)
+    var t = big_table(30_000_000)                      # (30M rows: a whole run takes tens of ms, so at 4M the job finished before the cancel landed)
     var u = Table.empty()
     var uv = u.add_column("v", INT)
     var ug = u.add_column("grp", INT)

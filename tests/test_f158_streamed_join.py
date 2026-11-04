@@ -7,7 +7,7 @@ import subprocess
 import duckdb
 import pytest
 
-from mx_oracle import check, mx_binary
+from mx_oracle import check, mx_binary, run_mx
 
 
 @pytest.fixture(scope="session")
@@ -98,6 +98,20 @@ def test_ordered_row_queries_over_a_streamed_probe(mx, data):
         assert "chunk by chunk" in note(res, "join path"), res["notes"]
 
 
+@pytest.mark.parametrize("sql", [
+    "SELECT f.fid, d.name FROM facts f JOIN d1 d ON f.k = d.k ORDER BY f.g LIMIT 40",
+    "SELECT f.fid, d.name FROM facts f JOIN d1 d ON f.k = d.k ORDER BY f.g DESC LIMIT 7 OFFSET 5",
+    "SELECT f.fid, f.g FROM facts f JOIN d1 d ON f.k = d.k ORDER BY f.g",
+])
+def test_tied_order_keys_keep_the_same_rows_streamed_or_read_whole(mx, data, sql):
+    """`g` has 11 values over thousands of rows: which tied rows a LIMIT keeps, and their order, is the same as with the scan read whole."""
+    files = {t: data["paths"][t] for t in ["facts", "d1"]}
+    whole = run_mx(mx, ["sql", "--max-rows", "0", "--stream", "never", sql], files=files)
+    streamed = run_mx(mx, ["sql", "--max-rows", "0", "--stream", "always", sql], files=files)
+    assert "chunk by chunk" in note(streamed, "join path"), streamed["notes"]
+    assert streamed["rows"] == whole["rows"] and len(whole["rows"]) > 5
+
+
 def test_star_over_a_scan_probe_streams(mx, data):
     sql = "SELECT d2.gname, d1.name, count(*), sum(f.x) FROM facts f JOIN d1 ON f.k = d1.k JOIN d2 ON f.g = d2.g GROUP BY d2.gname, d1.name"
     res = q(mx, data, sql, ["facts", "d1", "d2"], extra=["--stream", "always"])
@@ -150,13 +164,11 @@ def _sum_k1(mx, data, table, stream):
     return subprocess.run(cmd, capture_output=True).stdout.decode()
 
 
-def test_sum_overflow_across_row_groups_raises(mx, data):
-    """Key 1 sums 3e18, 6e18, 9e18 in three row groups: each partial fits int64, the total (1.8e19) does not. Hashed groups run `PartAcc` across the
-    row groups; the merge raises instead of wrapping (DuckDB widens to HUGEINT and answers). Read whole, the one pass overflows the same way."""
-    out = _sum_k1(mx, data, "ov", "always")
-    assert "passed the int64 range" in out and '"rows"' not in out, out[-300:]
-    cmd = [str(mx), "sql", "--stream", "always", "--group", "hashed", "-t", f"ov={data['paths']['ov']}", "SELECT sum(v) FROM ov GROUP BY k HAVING sum(v) < 0"]
-    assert "passed the int64 range" in subprocess.run(cmd, capture_output=True).stdout.decode()
+def test_sum_past_int64_across_row_groups_is_exact_like_duckdb(mx, data):
+    """Key 1 sums 3e18, 6e18, 9e18 in three row groups: each partial fits int64, the total (1.8e19) does not. Since F-192 the sums are wide (DuckDB's HUGEINT):
+    the row groups' partials merge exactly, equal to DuckDB, and the hashed merge no longer raises."""
+    res = q(mx, data, "SELECT k, sum(v) FROM ov WHERE k = 1 GROUP BY k", ["ov"], extra=["--stream", "always", "--group", "hashed"])
+    assert [int(r[1]) for r in res["rows"]] == [18000000000000000000], res["rows"]
 
 
 def test_sum_across_row_groups_that_fits_is_exact(mx, data):
