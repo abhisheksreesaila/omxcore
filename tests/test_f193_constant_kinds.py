@@ -14,7 +14,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from mx_oracle import assert_equal, check, duck_kind, mx_binary
+from mx_oracle import assert_equal, check, duck_kind, mx_binary, run_mx
 from test_mojo_sql import got_rows, probe, run_probe  # noqa: F401  (probe is a fixture)
 
 NULLS = [f"CAST(NULL AS {t})" for t in ("BIGINT", "INTEGER", "DOUBLE", "VARCHAR", "BOOLEAN", "DATE", "DECIMAL(9,2)", "DECIMAL(18,4)")]
@@ -62,9 +62,20 @@ def test_the_ticket_example_next_to_a_column(mx, con, path):
     check(mx, "SELECT id, CAST(NULL AS DATE) AS m, CAST(NULL AS BIGINT) AS q FROM t", con, files={"t": path})
 
 
-def test_equal_looking_constants_of_two_types(mx, con):
-    res = check(mx, "SELECT 1 AS a, CAST(1 AS BIGINT) AS b, CAST(2.5 AS DECIMAL(9,3)) AS c, CAST(2.50 AS DECIMAL(9,2)) AS d", con)
-    assert [(c["kind"], c["scale"]) for c in res["columns"]] == [("INT", 0), ("INT", 0), ("DECIMAL", 3), ("DECIMAL", 2)]
+@pytest.mark.parametrize("q, kinds", [
+    ("SELECT CAST(NULL AS DECIMAL(9,2)) AS a, CAST(NULL AS DECIMAL(9,3)) AS b", [("DECIMAL", 2), ("DECIMAL", 3)]),
+    ("SELECT CAST(NULL AS DECIMAL(9,3)) AS a, CAST(NULL AS DOUBLE) AS b, CAST(NULL AS VARCHAR) AS c, CAST(NULL AS BOOLEAN) AS d",
+     [("DECIMAL", 3), ("FLOAT", 0), ("TEXT", 0), ("BOOL", 0)]),
+    ("SELECT id, CAST(NULL AS DECIMAL(9,2)) AS a, CAST(NULL AS DECIMAL(9,3)) AS b, CAST(NULL AS DATE) AS c FROM t",
+     [("INT", 0), ("DECIMAL", 2), ("DECIMAL", 3), ("DATE", 0)]),
+    ("SELECT CAST(0 AS DECIMAL(9,2)) AS a, CAST(0 AS DECIMAL(9,3)) AS b", [("DECIMAL", 2), ("DECIMAL", 3)]),
+    ("SELECT CAST(0 AS DECIMAL(9,3)) AS a, CAST(0 AS DECIMAL(9,2)) AS b, CAST(0 AS DOUBLE) AS c, 0 AS d", [("DECIMAL", 3), ("DECIMAL", 2), ("FLOAT", 0), ("INT", 0)]),
+    ("SELECT id, CAST(0 AS DECIMAL(9,2)) AS a, CAST(0 AS DECIMAL(9,3)) AS b, CAST(0 AS DOUBLE) AS c FROM t", [("INT", 0), ("DECIMAL", 2), ("DECIMAL", 3), ("FLOAT", 0)]),
+    ("SELECT k, sum(CAST(0 AS DECIMAL(9,2))) AS a, sum(CAST(0 AS DECIMAL(9,3))) AS b FROM t GROUP BY k", [("INT", 0), ("DECIMAL", 2), ("DECIMAL", 3)]),
+])
+def test_equal_looking_constants_of_two_types(mx, con, path, q, kinds):
+    res = check(mx, q, con, files={"t": path})
+    assert [(c["kind"], c["scale"]) for c in res["columns"]] == kinds
 
 
 def _lists(seed, n):
@@ -104,3 +115,28 @@ AGGREGATES = [
 @pytest.mark.parametrize("q", AGGREGATES)
 def test_constants_next_to_aggregates(mx, con, path, q):
     check(mx, q, con, files={"t": path})
+
+
+TYPED_ORDER_GROUP = [
+    "SELECT id, CAST(NULL AS DATE) AS m, CAST(NULL AS BIGINT) AS q FROM t ORDER BY id DESC",
+    "WITH c AS (SELECT id, CAST(NULL AS DATE) AS m, CAST(NULL AS BIGINT) AS q, CAST(0 AS DECIMAL(9,2)) AS a, CAST(0 AS DECIMAL(9,3)) AS b FROM t) "
+    "SELECT * FROM c",
+    "SELECT id, CAST(NULL AS DATE) AS m, CAST(NULL AS BIGINT) AS q, row_number() OVER (PARTITION BY CAST(NULL AS BIGINT) ORDER BY id) AS rn FROM t",
+    "SELECT id, CAST(0 AS DECIMAL(9,2)) AS a, CAST(0 AS DECIMAL(9,3)) AS b, sum(id) OVER (ORDER BY id) AS w FROM t",
+]
+
+
+@pytest.mark.parametrize("q", TYPED_ORDER_GROUP)
+def test_typed_constants_in_order_by_cte_window_and_group_by(mx, con, path, q):
+    check(mx, q, con, files={"t": path})
+
+
+@pytest.mark.parametrize("q, why", [
+    ("SELECT id, CAST(NULL AS DATE) AS m FROM t ORDER BY CAST(NULL AS BIGINT), id", "ORDER BY a constant NULL does nothing"),
+    ("SELECT k, count(*) AS n, CAST(NULL AS DATE) AS m FROM t GROUP BY k ORDER BY CAST(NULL AS BIGINT), k", "ORDER BY a constant NULL does nothing"),
+    ("SELECT k, CAST(NULL AS DATE) AS m FROM t GROUP BY k, CAST(NULL AS BIGINT)", "GROUP BY NULL cannot be typed"),
+])
+def test_a_typed_null_as_a_sort_or_group_key_is_refused_not_misread(mx, path, q, why):
+    """Refused on purpose (also before F-193): DuckDB accepts these, the engine says so instead of answering."""
+    res = run_mx(mx, ["sql", q], {"t": path}, expect_exit=1)
+    assert res["error"]["message"].startswith(why)
