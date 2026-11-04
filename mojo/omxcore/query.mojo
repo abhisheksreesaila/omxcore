@@ -41,7 +41,7 @@ from .kernels.pipeline_cpu import pipeline_keyed, pipeline_plain, E_OVERFLOW, IP
 from .kernels.pipeline_gpu import run_pipeline_gpu, _choose_mode, scratch_rows, int_word_program_ok, APPLE_GPU, HDR as GPU_HDR
 from max.gpu.host import DeviceContext, DeviceBuffer
 from .gpu import (DeviceTable, HAS_GPU, NO_GPU_MESSAGE, gpu_available, _ScanContext, _scan_context, _stage_load, _stage_range, _stage_data, _stage_valid,
-                  _pinned_prepare, gpu_budget, gpu_capacity, gpu_free_bytes, human_bytes, gpu_fail_piece, INJECTED_OOM, GPU_RETRY_FACTOR_PERCENT)
+                  _pinned_prepare, _res_open, _res_resident, _res_stage, gpu_budget, gpu_capacity, gpu_free_bytes, human_bytes, gpu_fail_piece, INJECTED_OOM, GPU_RETRY_FACTOR_PERCENT)
 from .holistic import (HolStates, HolSpec, HolResult, window_blocks, heap_offer, float_key, A_DISTINCT, A_PCT, A_TOPK, A_MEDIAN,
                        A_VAR_POP, A_VAR_SAMP, A_STDDEV_POP, A_STDDEV_SAMP, A_QEDGE, is_spread, spread_needs)
 from .joincore import JoinKeys, JoinSide, normalize_keys, join_pairs, select_rows, gather_join, JOIN_BUDGET_BYTES
@@ -519,11 +519,14 @@ struct Query(Movable):
             if not self.device.value().is_live():
                 raise Error("device GPU: the DeviceTable was released")
             use_gpu = True
-        elif device == AUTO and self.device and self.device.value().is_live() and self.table.rows() >= AUTO_GPU_MIN_ROWS:
-            if holistic:
-                fallback = "count_distinct, percentile, top_k, stddev and variance run on the CPU"
-            else:
-                use_gpu = True
+        elif device == AUTO and self.device and self.device.value().is_live():
+            if self.table.rows() >= AUTO_GPU_MIN_ROWS:
+                if holistic:
+                    fallback = "count_distinct, percentile, top_k, stddev and variance run on the CPU"
+                else:
+                    use_gpu = True
+            elif not self.device.value().is_resident():       # (F-196: a table over the budget says why it is not streamed)
+                fallback = "the table has " + String(self.table.rows()) + " rows, under AUTO's " + String(AUTO_GPU_MIN_ROWS) + " for the GPU"
         var t0 = perf_counter_ns()
         var nodes = self.nodes.copy()
         if self.framed:                                  # formulas inlined, merges remapped
@@ -548,37 +551,31 @@ struct Query(Movable):
         var done = False
         if use_gpu:
             comptime if HAS_GPU:
-                # F-189: does the working set fit? A table over the budget has no device copy: AUTO answers on the CPU, GPU
-                # uploads row ranges that fit; a resident table's launch needs its buffers (AUTO: the CPU if they do not fit
-                # or an earlier query ran out of memory and not much more is free now; GPU: a readable error)
+                # F-189: does the working set fit? A table over the budget has no device copy: both devices run it in pieces that
+                # fit (F-196: AUTO too, the rule above having picked the GPU); a resident table's launch needs its buffers (AUTO: the
+                # CPU if they do not fit or an earlier query ran out of memory and not much more is free now; GPU: a readable error)
                 var dt = self.device.value()
                 var ctx = dt.context()
                 var usable = gpu_budget(ctx)
-                var masked = len(self.overlay.mask) > 0
-                var fixed = _gpu_fixed_bytes(ctx, prog, (self.table.rows() + 7) // 8 + 8 if masked else 0)
-                var used = _gpu_columns_used(self.table, prog)
-                var want = fixed + _range_bytes(self.table.rows(), _count_true(used[0]), _count_true(used[1]), False)
+                var fixed = _gpu_fixed_bytes(ctx, prog, (self.table.rows() + 7) // 8 + 8 if len(self.overlay.mask) > 0 else 0)
                 if not dt.is_resident():
-                    if device == AUTO:
-                        use_gpu = False
-                        fallback = ("the query needs " + human_bytes(want) + " on the GPU (" + String(self.table.rows()) + " rows), over its budget of " +
-                                    human_bytes(usable) + ": AUTO answers on the CPU, compute(GPU) runs it in pieces that fit")
-                    else:
-                        pieced = True
+                    pieced = True
                 elif fixed > usable:
                     var why = "the query's buffers need " + human_bytes(fixed) + " (" + String(prog.groups) + " groups), over the GPU budget of " + human_bytes(usable)
                     if device == GPU and fixed > gpu_capacity(ctx):      # (not merely a GPU that other work fills right now: that one is the CPU's)
                         raise Error("device GPU: " + why)
                     use_gpu = False
                     fallback = why^
-                elif device == AUTO and dt.oom_free() > 0 and gpu_free_bytes(ctx) * 100 < dt.oom_free() * GPU_RETRY_FACTOR_PERCENT:
+                var free = gpu_free_bytes(ctx, dt.piece_bytes())
+                if use_gpu and device == AUTO and dt.oom_free() > 0 and free * 100 < dt.oom_free() * GPU_RETRY_FACTOR_PERCENT:
                     use_gpu = False
+                    pieced = False
                     fallback = ("an earlier query ran out of GPU memory with " + human_bytes(dt.oom_free()) + " free; AUTO stays on the CPU until " +
-                                human_bytes(dt.oom_free() // 100 * GPU_RETRY_FACTOR_PERCENT) + " is free (" + human_bytes(gpu_free_bytes(ctx)) + " now)")
+                                human_bytes(dt.oom_free() // 100 * GPU_RETRY_FACTOR_PERCENT) + " is free (" + human_bytes(free) + " now)")
         if use_gpu:
             comptime if HAS_GPU:
                 if pieced:
-                    r = _run_gpu_pieces(self.device.value(), self.table, prog, self.overlay.mask, fallback, job)
+                    r = _run_gpu_pieces(self.device.value(), self.table, prog, self.overlay.mask, device == GPU, fallback, job)
                     done = True
                 else:
                     var g = _run_gpu(self.device.value(), self.table, prog, self.overlay.mask, device == GPU, fallback)
@@ -2089,7 +2086,7 @@ def _adopt_ext(t: SharedTable, ext: List[Int], rows: Int):
 
 
 def _gpu_ranges(addr: Int, ctx: DeviceContext, t: SharedTable, ext: List[Int], p: Program, mask: List[UInt8], rows: Int,
-                mut fallback: String, piece_base: Int, job: JobCtl) raises -> QueryResult:
+                mut fallback: String, piece_base: Int, job: JobCtl, strict: Bool = True) raises -> QueryResult:
     """F-189: the program over rows [0, rows) of `t` (a whole table, or a scan's decoded row group whose values are in `ext`) in row
     ranges that fit the GPU budget, uploaded and run one after the other on the device `addr` (a `_ScanContext`) is on. Each
     range's partial is merged with `_merge_partial`, as the windows of the CPU's job runs and a scan's row groups are, so the
@@ -2150,7 +2147,7 @@ def _gpu_ranges(addr: Int, ctx: DeviceContext, t: SharedTable, ext: List[Int], p
                     data.append(_stage_data(addr, c))
                     valid.append(_stage_valid(addr, c))
                 var ms = _mask_slice(mask, r0, m)
-                got = _run_gpu_cols(ctx, data, valid, m, t, p, ms, True, why)
+                got = _run_gpu_cols(ctx, data, valid, m, t, p, ms, strict, why)
                 _ = ms^
                 _ = data^, valid^
             if got:
@@ -2185,15 +2182,162 @@ def _gpu_ranges(addr: Int, ctx: DeviceContext, t: SharedTable, ext: List[Int], p
     return acc^
 
 
-def _run_gpu_pieces(dt: DeviceTable, t: SharedTable, p: Program, mask: List[UInt8], mut fallback: String, job: JobCtl) raises -> QueryResult:
-    """`compute(GPU)` on a table over the GPU budget (no device copy): `_gpu_ranges` over all its rows on the DeviceTable's device."""
+def _run_gpu_pieces(dt: DeviceTable, t: SharedTable, p: Program, mask: List[UInt8], strict: Bool, mut fallback: String, job: JobCtl) raises -> QueryResult:
+    """A table over the GPU budget (no device copy), on `GPU` and on `AUTO` (F-196): the program over row-range pieces, each merged as
+    `_gpu_ranges` merges them. Unlike a scan's groups, the pieces are kept on the device between queries (`_Resident`, least
+    recently used out first, under the budget), cut the same way for queries of a similar shape (a power of two rows, so
+    what one query uploaded the next finds), and run resident-first, so a repeated query uploads only what was evicted. The
+    next piece uploads on a second stream while this one runs (two tasks: the kernel, and the next piece's copies). A piece the
+    device cannot hold runs on the CPU (`fallback` says why); the kernel declining the program raises on `GPU` and sends
+    the rest to the CPU on `AUTO`."""
     var ctx = dt.context()
-    var own = _ScanContext(ctx)
-    var r = _gpu_ranges(own.addr, ctx, t, List[Int](), p, mask, t.rows(), fallback, 0, job)
-    if r.gpu_pieces < r.pieces and _is_oom(fallback):
-        dt.remember_oom(gpu_free_bytes(ctx))
-    _ = own^                                                  # (the buffers live to here)
-    return r^
+    var res = _res_open(dt)
+    var avail = gpu_budget(ctx, dt.piece_bytes())
+    var rows = t.rows()
+    var masked = len(mask) > 0
+    var used = _gpu_columns_used(t, p)
+    var nd = _count_true(used[0])
+    var nv = _count_true(used[1])
+    var fixed = _gpu_fixed_bytes(ctx, p, 0)
+    var step = 64                                       # the most rows two pieces (one running, one arriving) fit beside the query's buffers
+    if fixed + _range_bytes(rows, nd, nv, masked) <= avail:
+        step = max(rows, 64)                            # (what the query reads fits whole: one piece, uploaded for this query)
+    while step * 2 <= rows and fixed + 2 * _range_bytes(step * 2, nd, nv, masked) <= avail:
+        step *= 2
+    var all_cpu = String()
+    if rows > step and fixed + 2 * _range_bytes(step, nd, nv, masked) > avail:
+        var why = ("the GPU budget of " + human_bytes(avail) + " leaves no room for 64 rows of the " + String(nd) +
+                   " columns this query reads, after its " + human_bytes(fixed) + " of buffers")
+        if strict and fixed + 2 * _range_bytes(64, nd, nv, masked) > gpu_capacity(ctx):
+            raise Error("device GPU: " + why)
+        all_cpu = OOM_PREFIX + "hold a piece: " + why
+    var limit = avail - fixed                           # what the resident pieces may take
+    var starts = List[Int]()
+    var lens = List[Int]()
+    var at = 0
+    while at < rows:
+        starts.append(at)
+        lens.append(min(step, rows - at))
+        at += step
+    var order = List[Int]()                             # pieces with something resident first: they upload least, and stay
+    for k in range(len(starts)):
+        if _res_resident(res, starts[k], lens[k], used[0], used[1]) > 0:
+            order.append(k)
+    for k in range(len(starts)):
+        if _res_resident(res, starts[k], lens[k], used[0], used[1]) == 0:
+            order.append(k)
+    var ops = _slot_ops(p)
+    var acc = _make_result(p, List[Float64](length=p.n_slots * p.groups, fill=0.0), List[Int64](length=p.groups, fill=0))
+    for sl in range(p.n_slots):
+        acc.slots[sl] = List[Int](length=p.groups, fill=slot_identity(ops[sl]))
+    var mask_addr = Int(mask.unsafe_ptr()) if masked else 0
+    var n = len(order)
+    var gpu_n = 0
+    var declined = String()                             # the kernel declined the program (AUTO): the other pieces run on the CPU
+    var data = List[Int]()                              # the device addresses of the piece about to run ...
+    var valid = List[Int]()
+    var staged = String()                               # ... or why it is not there
+    try:
+        for j in range(n):
+            job.check()
+            var r0 = starts[order[j]]
+            var m = lens[order[j]]
+            var why = String()
+            var got = Optional[QueryResult](None)
+            var next_data = List[Int]()
+            var next_valid = List[Int]()
+            var next_staged = String()
+            var ran = String()
+            if all_cpu.byte_length() == 0 and declined.byte_length() == 0 and len(data) == 0 and staged.byte_length() == 0:
+                try:                                    # (the first piece, or one whose turn came after a piece that did not stage the next)
+                    var s0 = _res_stage(res, t, used[0], used[1], r0, m, limit, gpu_fail_piece() == j + 1)
+                    data = s0[0].copy()
+                    valid = s0[1].copy()
+                except e:
+                    staged = String(e)
+            if all_cpu.byte_length() > 0:
+                why = all_cpu.copy()
+            elif declined.byte_length() > 0:
+                why = declined.copy()
+            elif staged.byte_length() > 0:
+                why = OOM_PREFIX + "hold a piece of " + String(m) + " rows: " + staged
+            if why.byte_length() == 0:
+                var ms = _mask_slice(mask, r0, m)
+                var prefetch = j + 1 < n
+                var cp = Int(UnsafePointer(to=ctx))
+                var tp = Int(UnsafePointer(to=t))
+                var pp = Int(UnsafePointer(to=p))
+                var up = Int(UnsafePointer(to=used))
+                var dp = Int(UnsafePointer(to=data))
+                var vp = Int(UnsafePointer(to=valid))
+                var msp = Int(UnsafePointer(to=ms))
+                var gp = Int(UnsafePointer(to=got))
+                var wp = Int(UnsafePointer(to=why))
+                var rp = Int(UnsafePointer(to=ran))
+                var ndp = Int(UnsafePointer(to=next_data))
+                var nvp = Int(UnsafePointer(to=next_valid))
+                var nsp = Int(UnsafePointer(to=next_staged))
+                var n0 = starts[order[j + 1]] if prefetch else 0
+                var nm = lens[order[j + 1]] if prefetch else 0
+                var fail_next = gpu_fail_piece() == j + 2
+                def both(i: Int) {imm}:
+                    if i == 0:
+                        try:
+                            Pointer[Optional[QueryResult], MutUntrackedOrigin](unsafe_from_address=gp)[] = _run_gpu_cols(
+                                Pointer[DeviceContext, MutUntrackedOrigin](unsafe_from_address=cp)[],
+                                Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=dp)[],
+                                Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=vp)[], m,
+                                Pointer[SharedTable, MutUntrackedOrigin](unsafe_from_address=tp)[],
+                                Pointer[Program, MutUntrackedOrigin](unsafe_from_address=pp)[],
+                                Pointer[List[UInt8], MutUntrackedOrigin](unsafe_from_address=msp)[], strict,
+                                Pointer[String, MutUntrackedOrigin](unsafe_from_address=wp)[])
+                        except e:
+                            Pointer[String, MutUntrackedOrigin](unsafe_from_address=rp)[] = String(e)
+                    else:
+                        try:
+                            ref u = Pointer[Tuple[List[Bool], List[Bool]], MutUntrackedOrigin](unsafe_from_address=up)[]
+                            var sn = _res_stage(res, Pointer[SharedTable, MutUntrackedOrigin](unsafe_from_address=tp)[], u[0], u[1], n0, nm, limit, fail_next)
+                            Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=ndp)[] = sn[0].copy()
+                            Pointer[List[Int], MutUntrackedOrigin](unsafe_from_address=nvp)[] = sn[1].copy()
+                        except e:
+                            Pointer[String, MutUntrackedOrigin](unsafe_from_address=nsp)[] = String(e)
+                par_n(both, 2 if prefetch else 1, 2 if prefetch else 1)
+                _ = len(data) + len(valid) + why.byte_length() + ran.byte_length() + len(next_data) + len(next_valid) + next_staged.byte_length() + len(ms) + len(used[0])    # (read by address in the tasks: alive to here)
+                if ran.byte_length() > 0:
+                    raise Error(ran)
+            if got:
+                _merge_partial(acc, got.value(), ops)
+                gpu_n += 1
+            else:
+                if why.byte_length() > 0 and not _is_oom(why) and all_cpu.byte_length() == 0:
+                    declined = why.copy()               # (the kernel said no: the rest does not upload)
+                if fallback.byte_length() == 0:
+                    fallback = why.copy()
+                _merge_partial(acc, _run_cpu(t, p, mask_addr, r0, r0 + m), ops)
+            job.advance(m)
+            data = next_data^
+            valid = next_valid^
+            staged = next_staged^
+    except e:
+        if String(e) != OVERFLOW_MESSAGE:
+            raise e^
+        var whole = _run_cpu(t, p, mask_addr, 0, rows)
+        whole.fallback_reason = "a partial total passed the int64 range; the CPU settled the whole"
+        whole.pieces = n
+        return whole^
+    for i in range(len(acc.kinds)):
+        if acc.kinds[i] == A_SUM:
+            acc.sums = acc.slots[acc.slot_of[i]].copy()
+            break
+    acc.device = GPU if gpu_n == n else CPU
+    acc.pieces = n
+    acc.gpu_pieces = gpu_n
+    acc.fallback_reason = fallback.copy()
+    if gpu_n == n:
+        dt.forget_oom()
+    elif _is_oom(fallback):
+        dt.remember_oom(gpu_free_bytes(ctx, dt.piece_bytes()))
+    return acc^
 
 
 # ── a frame's changed and appended rows, on the CPU ──────────────────────────────────────────────────
@@ -2537,11 +2681,8 @@ def _run_part_gpu(t: SharedTable, nodes: List[PlanNode], gm: List[UInt8], strict
         var usable = gpu_budget(ctx)
         var fixed = _gpu_fixed_bytes(ctx, p, len(gm))
         var need = fixed + _range_bytes(rows, t.columns(), t.columns(), False)
-        if need > usable:
-            if not strict:
-                fallback = "a row group of " + String(rows) + " rows needs " + human_bytes(need) + " on the GPU, over its budget of " + human_bytes(usable)
-                return None
-            return _gpu_ranges(ctx_addr, ctx, t, ext, p, gm, rows, fallback, -1, JobCtl())
+        if need > usable:                                 # (F-196: on AUTO too; a decline by the kernel sends the ranges to the CPU)
+            return _gpu_ranges(ctx_addr, ctx, t, ext, p, gm, rows, fallback, -1, JobCtl(), strict)
         try:
             if piece > 0 and gpu_fail_piece() == piece:
                 raise Error(INJECTED_OOM)
@@ -2701,19 +2842,11 @@ def _compute_scan(scan: ParquetScan, nodes: List[PlanNode], device: Int, orig: L
     var gown = _ScanContext(use_gpu)                          # frees the device context on every way out of this function
     var gctx = gown.addr
     if use_gpu and device == AUTO:
-        # F-189: AUTO keeps a file on the CPU when one row group of the columns it reads does not fit the GPU budget (GPU would cut
-        # the group into row ranges), or an earlier query on this file ran out of GPU memory and not much more is free now
+        # F-189: AUTO keeps a file on the CPU when an earlier query on it ran out of GPU memory and not much more is free now (F-196: a
+        # row group over the budget no longer does: its ranges run on the GPU as they do on `GPU`)
         comptime if HAS_GPU:
-            var ctx = _scan_context(gctx)
-            var usable = gpu_budget(ctx)
-            var biggest = 0
-            for g in range(scan.row_groups()):
-                biggest = max(biggest, scan.group_rows(g))
-            var need = _gpu_fixed_bytes(ctx, shape, (biggest + 7) // 8 + 8 if len(o.mask) > 0 else 0) + _range_bytes(biggest, len(used), len(used), False)
-            var free = gpu_free_bytes(ctx)
-            if need > usable:
-                why = "a row group of " + String(biggest) + " rows needs " + human_bytes(need) + " on the GPU, over its budget of " + human_bytes(usable) + ": AUTO answers on the CPU"
-            elif scan.gpu_oom_free() > 0 and free * 100 < scan.gpu_oom_free() * GPU_RETRY_FACTOR_PERCENT:
+            var free = gpu_free_bytes(_scan_context(gctx))
+            if scan.gpu_oom_free() > 0 and free * 100 < scan.gpu_oom_free() * GPU_RETRY_FACTOR_PERCENT:
                 why = ("an earlier query ran out of GPU memory with " + human_bytes(scan.gpu_oom_free()) + " free; AUTO stays on the CPU until " +
                        human_bytes(scan.gpu_oom_free() // 100 * GPU_RETRY_FACTOR_PERCENT) + " is free (" + human_bytes(free) + " now)")
             if why.byte_length() > 0:

@@ -138,13 +138,14 @@ def gpu_budget_override(device_id: Int = 0) raises -> Int:
     return mine if mine >= 0 else dflt
 
 
-def gpu_free_bytes(ctx: DeviceContext) raises -> Int:
+def gpu_free_bytes(ctx: DeviceContext, held: Int = 0) raises -> Int:
     """Free memory on the context's device, as the MAX runtime reports it, capped by the test override. A device whose
-    runtime does not report memory counts as unlimited."""
+    runtime does not report memory counts as unlimited. `held` (F-196): bytes omxcore itself keeps on the device (resident
+    pieces), which the runtime no longer counts as free but a query that may evict them can use."""
     comptime if HAS_GPU:
         var free = Int.MAX
         try:
-            free = Int(ctx.get_memory_info()[0])
+            free = Int(ctx.get_memory_info()[0]) + held
         except:
             pass
         var o = gpu_budget_override(Int(ctx.id()))
@@ -153,9 +154,9 @@ def gpu_free_bytes(ctx: DeviceContext) raises -> Int:
         raise Error(NO_GPU_MESSAGE)
 
 
-def gpu_budget(ctx: DeviceContext) raises -> Int:
+def gpu_budget(ctx: DeviceContext, held: Int = 0) raises -> Int:
     """What one query may hold on the device at once: GPU_USABLE_PERCENT of `gpu_free_bytes`."""
-    var free = gpu_free_bytes(ctx)
+    var free = gpu_free_bytes(ctx, held)
     return free // 100 * GPU_USABLE_PERCENT
 
 
@@ -223,6 +224,68 @@ struct _GpuMemory(Movable):
         self.valid = List[DeviceBuffer[DType.uint8]]()
 
 
+struct _Resident(Movable):
+    """F-196: the row-range pieces of a table over the GPU budget that stay on the device between queries, least recently
+    used out first when the budget is full, and the second stream that uploads the next piece while the first runs. Built
+    and used only inside `comptime if HAS_GPU`. One entry is one device buffer: a piece's values of one column, or its
+    validity bitmap, keyed by (first row, rows, column * 2 + 1 for a bitmap)."""
+    var ctx: DeviceContext                           # a second DeviceContext on the same device: its own stream, so copies and a kernel overlap
+    var r0: List[Int]
+    var rows: List[Int]
+    var key: List[Int]
+    var buf: List[DeviceBuffer[DType.uint8]]
+    var size: List[Int]
+    var used: List[Int]                              # the stage (one piece's upload) that last used the entry
+    var held: Int                                    # bytes of all the entries
+    var uploads: Int                                 # buffers copied up since the table was made (a test counts them)
+    var stage: Int
+
+    def __init__(out self, var ctx: DeviceContext):
+        self.ctx = ctx^
+        self.r0 = List[Int]()
+        self.rows = List[Int]()
+        self.key = List[Int]()
+        self.buf = List[DeviceBuffer[DType.uint8]]()
+        self.size = List[Int]()
+        self.used = List[Int]()
+        self.held = 0
+        self.uploads = 0
+        self.stage = 0
+
+    def find(self, r0: Int, rows: Int, key: Int) -> Int:
+        for i in range(len(self.key)):
+            if self.key[i] == key and self.r0[i] == r0 and self.rows[i] == rows:
+                return i
+        return -1
+
+    def drop(mut self, i: Int):
+        self.held -= self.size[i]
+        _ = self.buf.pop(i)
+        _ = self.r0.pop(i)
+        _ = self.rows.pop(i)
+        _ = self.key.pop(i)
+        _ = self.size.pop(i)
+        _ = self.used.pop(i)
+
+    def make_room(mut self, need: Int, limit: Int) raises:
+        """Evicts the least recently used pieces (all of a piece's buffers together, so a piece is whole or not there) until `need`
+        more bytes fit under `limit`. The pieces of this stage and the one before (the one a kernel is reading now) stay."""
+        while self.held + need > limit:
+            var at = -1
+            for i in range(len(self.used)):
+                if self.used[i] < self.stage - 1 and (at < 0 or self.used[i] < self.used[at]):
+                    at = i
+            if at < 0:
+                raise Error("no room for a piece of " + String(need) + " bytes under " + String(limit))
+            var r0 = self.r0[at]
+            var rows = self.rows[at]
+            var i = len(self.key) - 1
+            while i >= 0:
+                if self.r0[i] == r0 and self.rows[i] == rows:
+                    self.drop(i)
+                i -= 1
+
+
 struct _DeviceState(Movable):
     var table: SharedTable                           # the table this mirrors, held so its identity cannot be reused
     var rows: Int
@@ -234,6 +297,7 @@ struct _DeviceState(Movable):
     var resident: Bool                               # F-189: the columns are on the device (False: too big for the budget, queries upload row ranges)
     var need: Int                                    # the bytes a whole upload takes
     var oom_free: Int                                # the free bytes when a query last ran out of memory (0: none did); AUTO waits for 1.5x
+    var res: Int                                     # F-196: address of the _Resident (the pieces of an over-budget table kept between queries), 0: none
 
     def __init__(out self, table: SharedTable, rows: Int):
         self.table = table
@@ -243,12 +307,22 @@ struct _DeviceState(Movable):
         self.resident = False
         self.need = 0
         self.oom_free = 0
+        self.res = 0
         self.data_addr = List[Int]()
         self.valid_addr = List[Int]()
         self.gpu = 0
 
     def _free_gpu(mut self):
         comptime if HAS_GPU:
+            if self.res != 0:
+                var r = UnsafePointer[_Resident, MutAnyOrigin](unsafe_from_address=self.res)
+                try:
+                    r[].ctx.synchronize()
+                except:
+                    pass
+                _ = r.take_pointee()
+                r.free()
+                self.res = 0
             if self.gpu != 0:
                 var p = UnsafePointer[_GpuMemory, MutAnyOrigin](unsafe_from_address=self.gpu)
                 _ = p.take_pointee()
@@ -349,6 +423,28 @@ struct DeviceTable(ImplicitlyCopyable):
     def needed_bytes(self) -> Int:
         """The device bytes a whole upload of the table takes (what `bytes()` is once it is resident)."""
         return self._s[].need
+
+    def piece_uploads(self) -> Int:
+        """F-196: device buffers (a piece's column values or validity bitmap) uploaded for queries on a table over the budget, since
+        the handle was made. A query that finds its pieces still resident adds none for them."""
+        comptime if HAS_GPU:
+            if self._s[].res != 0:
+                return UnsafePointer[_Resident, MutAnyOrigin](unsafe_from_address=self._s[].res)[].uploads
+        return 0
+
+    def piece_buffers(self) -> Int:
+        """F-196: device buffers of pieces kept between queries now."""
+        comptime if HAS_GPU:
+            if self._s[].res != 0:
+                return len(UnsafePointer[_Resident, MutAnyOrigin](unsafe_from_address=self._s[].res)[].key)
+        return 0
+
+    def piece_bytes(self) -> Int:
+        """F-196: device bytes of those buffers (never more than the GPU budget less the query's own buffers)."""
+        comptime if HAS_GPU:
+            if self._s[].res != 0:
+                return UnsafePointer[_Resident, MutAnyOrigin](unsafe_from_address=self._s[].res)[].held
+        return 0
 
     def oom_free(self) -> Int:
         """Free device bytes when a query on this table last ran out of memory, 0 if none did (AUTO stays on the CPU until
@@ -577,6 +673,106 @@ def _stage_valid(addr: Int, c: Int) -> Int:
         return UnsafePointer[_ScanDevice, MutAnyOrigin](unsafe_from_address=addr)[].valid_addr[c]
     else:
         return 0
+
+
+def _res_open(dt: DeviceTable) raises -> Int:
+    """The address of the table's `_Resident`, made on first use with its second stream."""
+    comptime if HAS_GPU:
+        if dt._s[].res == 0:
+            var ctx = dt.context()
+            var mem = unsafe_alloc[_Resident](1)
+            mem.unsafe_write(_Resident(DeviceContext(device_id=Int(ctx.id()))))
+            dt._s[].res = Int(mem)
+        return dt._s[].res
+    else:
+        return 0
+
+
+def _res_resident(res: Int, r0: Int, rows: Int, data_used: List[Bool], valid_used: List[Bool]) -> Int:
+    """How many of the buffers a piece needs are on the device already."""
+    var n = 0
+    comptime if HAS_GPU:
+        ref m = UnsafePointer[_Resident, MutAnyOrigin](unsafe_from_address=res)[]
+        for c in range(len(data_used)):
+            if data_used[c] and m.find(r0, rows, c * 2) >= 0:
+                n += 1
+            if valid_used[c] and m.find(r0, rows, c * 2 + 1) >= 0:
+                n += 1
+    return n
+
+
+def _res_fill(res: Int, table: SharedTable, data_used: List[Bool], valid_used: List[Bool], r0: Int, rows: Int, limit: Int,
+              fail: Bool, mut data: List[Int], mut valid: List[Int], mut hosts: List[List[UInt8]]) raises:
+    """F-196: rows [r0, r0 + rows) of the columns a query reads, on the device: what is resident is reused, the rest is
+    copied up on the second stream (older entries leave first to keep the held bytes under `limit`), and the call waits for the
+    copies. It runs beside the kernel of the piece before, which is why that piece's entries are not evicted. `r0` is a
+    multiple of 8, so a bitmap slice starts on a byte; a bitmap goes up with 8 spare zero bytes (a kernel may read a word past
+    the last row). Returns the device addresses of the values and of the bitmaps (0: that column has none). `fail`: raise
+    as an out-of-memory would (MXFRAME_GPU_FAIL_PIECE)."""
+    comptime if HAS_GPU:
+        ref m = UnsafePointer[_Resident, MutAnyOrigin](unsafe_from_address=res)[]
+        m.stage += 1
+        if fail:
+            raise Error(INJECTED_OOM)
+        for c in range(table.columns()):
+            for kind in range(2):
+                var have = len(table._table[].cols[c].validity)
+                if kind == 0 and (not data_used[c] or rows <= 0):
+                    continue
+                if kind == 1 and (not valid_used[c] or have == 0):
+                    continue
+                var key = c * 2 + kind
+                var nb = (rows + 7) // 8
+                var size = 8 * rows if kind == 0 else nb + 8
+                var at = m.find(r0, rows, key)
+                if at < 0:
+                    m.make_room(size, limit)
+                    var b = m.ctx.enqueue_create_buffer[DType.uint8](size)
+                    if kind == 0:
+                        var src = Int(table.values(c).unsafe_ptr()) + 8 * r0
+                        m.ctx.enqueue_copy(dst_buf=b, src_ptr=UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=src))
+                    else:
+                        var host = List[UInt8](length=size, fill=0)
+                        var src = table._table[].cols[c].validity.unsafe_ptr()
+                        for i in range(min(nb, have - r0 // 8)):
+                            host[i] = src[r0 // 8 + i]
+                        m.ctx.enqueue_copy(dst_buf=b, src_ptr=host.unsafe_ptr())
+                        hosts.append(host^)
+                    m.r0.append(r0)
+                    m.rows.append(rows)
+                    m.key.append(key)
+                    m.buf.append(b^)
+                    m.size.append(size)
+                    m.used.append(m.stage)
+                    m.held += size
+                    m.uploads += 1
+                    at = len(m.key) - 1
+                m.used[at] = m.stage
+                if kind == 0:
+                    data[c] = Int(m.buf[at].unsafe_ptr())
+                else:
+                    valid[c] = Int(m.buf[at].unsafe_ptr())
+
+
+def _res_stage(res: Int, table: SharedTable, data_used: List[Bool], valid_used: List[Bool], r0: Int, rows: Int, limit: Int,
+               fail: Bool) raises -> Tuple[List[Int], List[Int]]:
+    """`_res_fill`, then the wait for its copies (also when it failed half way: the host copies must outlive them)."""
+    var data = List[Int](length=table.columns(), fill=0)
+    var valid = List[Int](length=table.columns(), fill=0)
+    var hosts = List[List[UInt8]]()                      # (kept to the end: the copies read them until the wait)
+    comptime if HAS_GPU:
+        ref m = UnsafePointer[_Resident, MutAnyOrigin](unsafe_from_address=res)[]
+        try:
+            _res_fill(res, table, data_used, valid_used, r0, rows, limit, fail, data, valid, hosts)
+        except e:
+            try:
+                m.ctx.synchronize()
+            except:
+                pass
+            raise e^
+        m.ctx.synchronize()
+    _ = hosts^
+    return (data^, valid^)
 
 
 struct _ScanContext(Movable):

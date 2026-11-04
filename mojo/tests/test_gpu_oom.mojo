@@ -4,7 +4,7 @@
 # and presence flag equal, not close). Skips cleanly with no GPU. Every test that sets a variable puts it back (`Env`
 # restores it when it goes out of scope, a failed test included). Modest allocations: GPU 0 is shared.
 from omxcore import (Table, SharedTable, Frame, Query, QueryResult, col, sum, count, mean, min_of, max_of, INT, DECIMAL, TEXT, write_parquet,
-                     scan_parquet, scan_csv, CsvOptions, ZSTD, CPU, GPU, AUTO, DeviceTable, gpu_available)
+                     scan_parquet, scan_csv, count_distinct, CsvOptions, ZSTD, CPU, GPU, AUTO, DeviceTable, gpu_available)
 from omxcore.gpu import gpu_budget_override, parse_size, GPU_BUDGET_ENV, GPU_FAIL_ENV
 from std.os import getenv, setenv, unsetenv
 
@@ -147,7 +147,9 @@ def test_a_table_under_the_budget_stays_resident_in_one_launch() raises:
     _ = b^
 
 
-def test_auto_answers_a_too_big_table_on_the_cpu_and_says_how_big() raises:
+def test_auto_streams_a_too_big_table_and_keeps_what_fits_resident() raises:
+    """F-196: AUTO runs a table over the budget on the GPU in pieces (the rule is rows and a program the kernel takes), and the
+    pieces that fit stay on the device: the second query uploads only what the first one's pieces left no room for."""
     var t = make_table(1_100_000, 3)
     var r = Env(GPU_BUDGET_ENV, "64M")
     var fits = DeviceTable(t)
@@ -156,14 +158,40 @@ def test_auto_answers_a_too_big_table_on_the_cpu_and_says_how_big() raises:
     fits.release()
     r.set("2M")
     var dt = DeviceTable(t)
+    var want = grouped(Query(t)).compute(CPU)
     var a = grouped(Query(t).on_device(dt)).compute(AUTO)
-    expect(a.device == CPU and a.pieces == 0, "AUTO: the CPU")
-    expect("budget of" in a.fallback_reason and "MB on the GPU" in a.fallback_reason and "1100000 rows" in a.fallback_reason,
-           "and why, with the sizes: `" + a.fallback_reason + "`")
-    same(a, grouped(Query(t)).compute(CPU), "AUTO over budget")
-    var g = grouped(Query(t).on_device(dt)).compute(GPU)
-    expect(g.device == GPU and g.pieces > 10, "compute(GPU) runs the same table in pieces: " + String(g.pieces))
-    same(g, a, "GPU pieces vs AUTO")
+    expect(a.device == GPU and a.fallback_reason == "" and a.pieces > 10 and a.gpu_pieces == a.pieces,
+           "AUTO: the GPU, in pieces: " + String(a.pieces) + " `" + a.fallback_reason + "`")
+    same(a, want, "AUTO over budget")
+    var up1 = dt.piece_uploads()
+    var held1 = dt.piece_buffers()
+    expect(up1 > 0 and up1 % a.pieces == 0, "every piece went up once: " + String(up1) + " buffers for " + String(a.pieces) + " pieces")
+    expect(held1 > 0 and held1 < up1, "some pieces stayed, not all: " + String(held1) + " of " + String(up1))
+    expect(dt.piece_bytes() <= 2 * 1024 * 1024 // 100 * 90, "and they fit the budget: " + String(dt.piece_bytes()))
+    var again = grouped(Query(t).on_device(dt)).compute(AUTO)
+    same(again, want, "second query")
+    expect(dt.piece_uploads() - up1 == up1 - held1,
+           "the second query uploads only what was evicted: " + String(dt.piece_uploads() - up1) + " of " + String(up1))
+    var held2 = dt.piece_buffers()
+    var third = grouped(Query(t).on_device(dt)).compute(GPU)
+    same(third, want, "third query, compute(GPU)")
+    expect(dt.piece_uploads() - up1 - (up1 - held1) == up1 - held2, "and so does the third: " + String(dt.piece_uploads()))
+    dt.release()
+    expect(dt.piece_buffers() == 0 and dt.piece_bytes() == 0, "release gives the pieces back")
+    _ = r^
+
+
+def test_auto_keeps_a_too_big_table_on_the_cpu_when_the_gpu_is_the_wrong_call() raises:
+    var t = make_table(1_100_000, 3)
+    var r = Env(GPU_BUDGET_ENV, "2M")
+    var dt = DeviceTable(t)
+    var h = Query(t).on_device(dt).group_by(col("k"), groups=8).agg(count_distinct(col("w"))).compute(AUTO)
+    expect(h.device == CPU and h.pieces == 0 and "count_distinct" in h.fallback_reason, "holistic: the CPU, and why: `" + h.fallback_reason + "`")
+    same(h, Query(t).group_by(col("k"), groups=8).agg(count_distinct(col("w"))).compute(CPU), "holistic over budget")
+    var tiny = make_table(5000, 3)
+    var small = DeviceTable(tiny)
+    var s = grouped(Query(tiny).on_device(small)).compute(AUTO)
+    same(s, grouped(Query(tiny)).compute(CPU), "a small table")
     dt.release()
     _ = r^
 
@@ -205,8 +233,7 @@ def test_the_gpu_scan_cuts_a_group_over_the_budget_into_ranges() raises:
     expect(g.device == GPU and g.fallback_reason == "", "GPU: each group in row ranges, on the GPU: `" + g.fallback_reason + "`")
     same(g, want, "groups over the budget")
     var a = grouped(Query(big).auto_gpu_ops(0)).compute(AUTO)
-    expect(a.device == CPU and "row group of 150000 rows needs" in a.fallback_reason and "budget of" in a.fallback_reason,
-           "AUTO: the CPU, naming the size: `" + a.fallback_reason + "`")
+    expect(a.device == GPU and a.fallback_reason == "", "AUTO: each group in row ranges too, on the GPU: `" + a.fallback_reason + "`")
     same(a, want, "AUTO scan over budget")
     _ = b^
 
@@ -230,7 +257,7 @@ def test_a_csv_scan_over_the_budget() raises:
     expect(g.device == GPU, "a CSV file's groups cut into ranges: `" + g.fallback_reason + "`")
     same(g, grouped(Query(t)).compute(CPU), "csv scan over budget")
     var auto = grouped(Query(scan).auto_gpu_ops(0)).compute(AUTO)
-    expect(auto.device == CPU and "budget of" in auto.fallback_reason, "AUTO: the CPU: `" + auto.fallback_reason + "`")
+    expect(auto.device == GPU and auto.fallback_reason == "", "AUTO: the GPU in ranges: `" + auto.fallback_reason + "`")
     same(auto, g, "csv AUTO")
     _ = b^
 
@@ -475,7 +502,8 @@ def main() raises:
     test_a_csv_scan_with_empty_cells_in_pieces()
     test_a_table_over_the_budget_runs_in_pieces()
     test_a_table_under_the_budget_stays_resident_in_one_launch()
-    test_auto_answers_a_too_big_table_on_the_cpu_and_says_how_big()
+    test_auto_streams_a_too_big_table_and_keeps_what_fits_resident()
+    test_auto_keeps_a_too_big_table_on_the_cpu_when_the_gpu_is_the_wrong_call()
     test_a_frames_edits_ride_along_with_every_piece()
     test_the_gpu_scan_cuts_a_group_over_the_budget_into_ranges()
     test_a_csv_scan_over_the_budget()
