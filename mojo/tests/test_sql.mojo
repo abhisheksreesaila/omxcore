@@ -201,11 +201,22 @@ def main() raises:
         streamed_frame = streamed_frame or "chunk by chunk" in n
     if not streamed_frame:
         fail("a Frame on the probe side streams")
+    var frows = sql(cat, "SELECT e.qty, e.region, r.w FROM edited e JOIN reg r ON e.region = r.region")      # F-158: a row query over the streamed Frame probe, in the frame's order
+    streamed_frame = False
+    for n in frows.notes:
+        streamed_frame = streamed_frame or "chunk by chunk" in n
+    if not streamed_frame:
+        fail("a row query over a Frame probe streams")
     var fb = Catalog()                                          # ... and equals the join over the baked frame (edit + append + removed row)
     fb.add_table("edited", f.bake().share())
     fb.add_table("reg", reg_t)
     var baked = sql(fb, "SELECT r.w, count(*), sum(e.qty) FROM edited e JOIN reg r ON e.region = r.region GROUP BY r.w ORDER BY r.w")
     check(rows_of(r.table), rows_of(baked.table), "a join over a frame equals the join over bake()")
+    var brows = sql(fb, "SELECT e.qty, e.region, r.w FROM edited e JOIN reg r ON e.region = r.region")
+    check(rows_of(frows.table), rows_of(brows.table), "a row query over a streamed Frame probe equals bake(), in the frame's order")
+    var ftop = sql(cat, "SELECT e.qty, r.w FROM edited e JOIN reg r ON e.region = r.region ORDER BY e.qty DESC LIMIT 3")
+    var btop = sql(fb, "SELECT e.qty, r.w FROM edited e JOIN reg r ON e.region = r.region ORDER BY e.qty DESC LIMIT 3")
+    check(rows_of(ftop.table), rows_of(btop.table), "a top-k over a streamed Frame probe equals bake()")
     var jt = sql(cat, "SELECT r.w, count(*), sum(e.qty) FROM orders e JOIN reg r ON e.region = r.region GROUP BY r.w ORDER BY r.w")
     var js = sql(cat, "SELECT r.w, count(*), sum(e.qty) FROM filed e JOIN reg r ON e.region = r.region GROUP BY r.w ORDER BY r.w")
     check(rows_of(js.table), rows_of(jt.table), "a join over a scan equals the join over the table")

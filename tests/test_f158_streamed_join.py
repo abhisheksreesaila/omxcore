@@ -74,6 +74,30 @@ def test_scan_probe_streams_and_equals_duckdb(mx, data, sql):
     q(mx, data, sql, ["facts", "d1"], extra=["--stream", "never"])
 
 
+ROWS = [
+    "SELECT f.fid, d.name, f.x FROM facts f JOIN d1 d ON f.k = d.k WHERE f.x > 400",
+    "SELECT f.fid, d.name, d.w, f.s FROM facts f LEFT JOIN d1 d ON f.k = d.k WHERE f.g = 3",
+    "SELECT f.fid, f.x FROM facts f WHERE f.k IN (SELECT k FROM d1 WHERE k < 900) AND f.x < -450",
+    "SELECT f.fid, d.name FROM facts f JOIN d1 d ON f.k = d.k",
+]
+
+
+@pytest.mark.parametrize("sql", ROWS)
+def test_row_queries_over_a_streamed_probe_equal_duckdb(mx, data, sql):
+    res = q(mx, data, sql, ["facts", "d1"], extra=["--stream", "always"])
+    assert "chunk by chunk" in note(res, "join path"), res["notes"]
+    assert any(n.startswith("sink: rows") for n in res["notes"]), res["notes"]
+
+
+def test_ordered_row_queries_over_a_streamed_probe(mx, data):
+    """ORDER BY ... LIMIT keeps the best rows of every chunk (per-worker heaps); ORDER BY alone sorts all the rows; ties broken by fid."""
+    for sql in ["SELECT f.fid, d.name, f.x FROM facts f JOIN d1 d ON f.k = d.k ORDER BY f.x DESC, f.fid LIMIT 25",
+                "SELECT f.fid, d.w FROM facts f JOIN d1 d ON f.k = d.k WHERE f.g < 4 ORDER BY d.w, f.fid"]:
+        res = check(mx, sql, data["con"], files={t: data["paths"][t] for t in ["facts", "d1"]}, ordered=True, extra=["--stream", "always"],
+                    duck_sql=sql.replace("ORDER BY f.x DESC, f.fid", "ORDER BY f.x DESC NULLS LAST, f.fid").replace("ORDER BY d.w, f.fid", "ORDER BY d.w NULLS LAST, f.fid"))
+        assert "chunk by chunk" in note(res, "join path"), res["notes"]
+
+
 def test_star_over_a_scan_probe_streams(mx, data):
     sql = "SELECT d2.gname, d1.name, count(*), sum(f.x) FROM facts f JOIN d1 ON f.k = d1.k JOIN d2 ON f.g = d2.g GROUP BY d2.gname, d1.name"
     res = q(mx, data, sql, ["facts", "d1", "d2"], extra=["--stream", "always"])

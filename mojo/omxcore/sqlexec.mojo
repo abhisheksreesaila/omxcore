@@ -1053,8 +1053,8 @@ def _star_valid(q: BoundQuery, jp: JoinPlan, s0: Int) -> Bool:
 
 def _can_stream(catalog: Catalog, q: BoundQuery, t: Int, allow: Bool) -> Bool:
     """Side `t` is a Parquet scan or a Frame (edits, appends, removes, merges): it can probe a fused join chunk by chunk (a row group, the shared rows, the changed
-    rows) without a copy of its rows being made. Not for a row query (its sink collects rows by chunk number)."""
-    if not allow or q.rows:
+    rows) without a copy of its rows being made, for an aggregate or a row query."""
+    if not allow:
         return False
     ref src = catalog.sources[q.sources[t]]
     return src.kind == SRC_SCAN or src.kind == SRC_FRAME
