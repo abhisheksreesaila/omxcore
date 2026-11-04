@@ -116,19 +116,15 @@ def test_the_gpu_keeps_declining_a_program_that_converts() raises:
     expect(r.floats(0)[0] == want, "AUTO answers on the CPU: " + String(want) + ", got " + String(r.floats(0)[0]))
 
 
-def test_a_sum_past_int64_still_raises() raises:
+def test_a_sum_past_int64_reads_as_a_double() raises:
     var t = Table.empty()
     var v = t.add_column("v", DECIMAL, scale=2)
     t.append(v, Int64.MAX)
     t.append(v, Int64.MAX)
     var cat = Catalog()
     cat.add_table("t", t^.share())
-    var raised = False
-    try:
-        _ = sql(cat, "SELECT sum(v) / 2.0 FROM t")
-    except e:
-        raised = String(e).find("passed the int64 range") >= 0
-    expect(raised, "an int64 sum that really overflows raises")
+    var r = sql(cat, "SELECT sum(v) / 2.0 FROM t")            # F-192: the total is kept in 128 bits, so its double is DuckDB's (MAX / 100)
+    expect(abs(r.table.get_float(0, 0) / (9.223372036854775807e16) - 1.0) < 1e-15, "an int64 sum that passes int64 reads as a double")
 
 
 def main() raises:
@@ -136,5 +132,5 @@ def main() raises:
     test_builder_float_arithmetic_rounds()
     test_a_big_decimal_sum_divided_is_a_double()
     test_the_gpu_keeps_declining_a_program_that_converts()
-    test_a_sum_past_int64_still_raises()
+    test_a_sum_past_int64_reads_as_a_double()
     print("ok")

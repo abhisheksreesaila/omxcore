@@ -958,10 +958,18 @@ struct Frame(Movable):
 
     # ── saving ──────────────────────────────────────────────────────────────────────────────────────
 
+    def refuse_wide(self) raises:
+        """F-192: a column holding totals past int64 is two words per value, which a Frame (its edits, its bake, its save) does not carry: say so
+        instead of dropping the upper words. (The constructor cannot raise; the first thing that reads or writes the cells does.)"""
+        for c in range(self.base.columns()):
+            if self.base.is_wide(c):
+                raise Error("column `" + self.base.name(c) + "` holds totals past int64 (128 bits), which a Frame cannot hold yet")
+
     def bake(self) raises -> Table:
         """A new table with this session's edits applied (removed rows gone, merges folded, session words added);
         formulas are not stored (their texts go in the document's metadata). Over a scan it is refused: the table
         would hold the whole file; `save(path)` streams it out instead."""
+        self.refuse_wide()
         if self.scan:
             raise Error("a Frame over a streamed file cannot be baked into memory: save it to a new file with `save(path)`")
         var t = Table.empty()
@@ -998,6 +1006,7 @@ struct Frame(Movable):
 
         `budget` (F-188): bytes of pages being compressed at once (bodies and compressed bytes); 0: STREAM_WRITE_BUDGET for a frame over a scan,
         WRITE_BUDGET for a table. The threads (as many as the build has) work inside it; the file is the same bytes for any budget."""
+        self.refuse_wide()
         if not self.scan:
             write_parquet(path, self.bake(), metadata, compression, DEFAULT_ROW_GROUP, job, budget=budget)
             return

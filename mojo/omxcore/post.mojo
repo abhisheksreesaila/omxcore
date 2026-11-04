@@ -11,13 +11,16 @@ column (its value converted to a double here, exactly as DuckDB casts it), so an
 integer-to-float conversion.
 """
 from .table import Table, SharedTable, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
-from .bind import (decimal_to_float, BoundQuery, BExpr, SqlSource, SortKey, B_COL, B_LIT, B_KEY, B_AGG, B_ADD, B_SUB, B_MUL, B_DIV, B_CMP, B_NEG, B_I2F)
+from .bind import (decimal_to_float, BoundQuery, BExpr, SqlSource, SortKey, B_COL, B_LIT, B_KEY, B_AGG, B_ADD, B_SUB, B_MUL, B_DIV, B_CMP, B_NEG, B_I2F, B_WLIT, F_SUM)
 from .plan import build_plan
 from .planner import RulePlanner, PlannerOptions, commas, Stats, plan_sinks
 from .sqlprog import DictAccess
 from .sqleval import ValCol, float_bits
 from .exec import _put_column, _inputs, make_stats
 from .rows import prepare_rows, execute_rows
+from .query import OVERFLOW_MESSAGE
+from .wide import wide_to_float
+from .postwide import WideRewrite, wide_prepass, fix_wide
 
 
 def _is_number(kind: Int) -> Bool:
@@ -56,7 +59,35 @@ def _shadow(mut q2: BoundQuery, mut sh: _Shadows, ncols: Int, operand: Int) -> I
 
 def run_post(q: BoundQuery, keys: List[ValCol], aggs: List[ValCol], dicts: DictAccess, opts: PlannerOptions, n: Int,
              mut notes: List[String]) raises -> Table:
-    """The result table of `q` from its `n` groups' key and aggregate values."""
+    """The result table of `q` from its `n` groups' key and aggregate values. F-192: the kernel's registers are int64, so a total past int64 (a wide
+    SUM, or an expression over totals that passes int64) runs the stage again with `postwide.mojo` taking the expressions that read totals; the first
+    try is the plain one, and only an int64 overflow (or a total that is already wide) asks for the second."""
+    var wide = False
+    for a in aggs:
+        if a.is_wide():
+            wide = True
+    for x in q.pexprs:                                               # (a constant past int64 is only ever read here)
+        if x.op == B_WLIT:
+            wide = True
+    if not wide:
+        var attempt = notes.copy()
+        var failed = False
+        var table = Table.empty()
+        try:
+            table = _run_post(q, keys, aggs, dicts, opts, n, attempt, False)
+        except e:
+            if String(e) != OVERFLOW_MESSAGE:
+                raise e^
+            failed = True
+        if not failed:
+            notes = attempt^
+            return table^
+        notes.append("stage after aggregation: a value passed int64; ran again in 128 bits")
+    return _run_post(q, keys, aggs, dicts, opts, n, notes, True)
+
+
+def _run_post(q: BoundQuery, keys: List[ValCol], aggs: List[ValCol], dicts: DictAccess, opts: PlannerOptions, n: Int,
+              mut notes: List[String], wide: Bool) raises -> Table:
     var nk = len(keys)
     var ncols = nk + len(aggs)
     var q2 = BoundQuery()
@@ -73,6 +104,14 @@ def run_post(q: BoundQuery, keys: List[ValCol], aggs: List[ValCol], dicts: DictA
             q2.rexprs[i].value = Int64(col)
             if q2.rexprs[i].kind == TEXT.value:
                 q2.rexprs[i].src = col
+    q2.where = q.having
+    q2.where_text = q.having_text
+    q2.routs = q.outputs.copy()
+    q2.rorder = q.order.copy()
+    var rw = WideRewrite(ncols)
+    if wide:
+        wide_prepass(q2, nk, keys, aggs, n, rw)
+    var nh = len(rw.hidden)
     var sh = _Shadows()
     for i in range(len(q2.rexprs)):                                  # numbers that meet a FLOAT are read as doubles
         var x = q2.rexprs[i].copy()
@@ -84,14 +123,10 @@ def run_post(q: BoundQuery, keys: List[ValCol], aggs: List[ValCol], dicts: DictA
         elif x.op == B_CMP and (q2.rexprs[x.a].kind == FLOAT.value or q2.rexprs[x.b].kind == FLOAT.value):
             float_ctx = True
         if float_ctx:
-            var a = _shadow(q2, sh, ncols, x.a)
-            var b = _shadow(q2, sh, ncols, x.b)
+            var a = _shadow(q2, sh, ncols + nh, x.a)
+            var b = _shadow(q2, sh, ncols + nh, x.b)
             q2.rexprs[i].a = a
             q2.rexprs[i].b = b
-    q2.where = q.having
-    q2.where_text = q.having_text
-    q2.routs = q.outputs.copy()
-    q2.rorder = q.order.copy()
     q2.out_names = q.out_names.copy()
     q2.out_text = q.out_text.copy()
     q2.order_text = q.order_text.copy()
@@ -103,12 +138,20 @@ def run_post(q: BoundQuery, keys: List[ValCol], aggs: List[ValCol], dicts: DictA
         _put_column(g, "k" + String(k), keys[k], dicts)
     for a in range(len(aggs)):
         _put_column(g, "a" + String(a), aggs[a], dicts)
+    for h in range(nh):
+        _put_column(g, "w" + String(h), rw.hidden[h], dicts)
     for s in range(len(sh.of_col)):
         var src_col = sh.of_col[s]
         var v = keys[src_col].copy() if src_col < nk else aggs[src_col - nk].copy()
         var f = ValCol(FLOAT.value, 0, v.n())
+        var of_sum = src_col >= nk and q.aggs[src_col - nk].func == F_SUM and not q.aggs[src_col - nk].hol      # F-192: DuckDB's SUM is a DECIMAL(38) / HUGEINT, cast by its own rule
         for i in range(v.n()):
-            f.v[i] = float_bits(decimal_to_float(v.v[i], v.scale)) if not v.is_null(i) else 0
+            if v.is_null(i):
+                f.v[i] = 0
+            elif of_sum:
+                f.v[i] = float_bits(wide_to_float(v.wide_at(i), v.scale))
+            else:
+                f.v[i] = float_bits(decimal_to_float(v.v[i], v.scale))
         f.nul = v.nul.copy()
         _put_column(g, "f" + String(s), f, dicts)
     if g.columns() == 0:                                             # no key and no aggregate (`SELECT 1 HAVING true`): the rows of a table with no column are none, so a column carries the groups
@@ -124,6 +167,8 @@ def run_post(q: BoundQuery, keys: List[ValCol], aggs: List[ValCol], dicts: DictA
     var scratch = List[String]()
     var stage = prepare_rows(src, q2, plan, dicts2, inp, scratch, False)
     var table = execute_rows(src, q2, plan, opts, dicts2, scratch, inp, stage^, True)
+    if wide:
+        fix_wide(table, q2, rw)
     var selected = n
     for note in scratch:
         if note.startswith("rows: ") and " rows selected" in note:

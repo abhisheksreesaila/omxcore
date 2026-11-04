@@ -1,6 +1,7 @@
 # F-157 (M8): FLOAT64 as a column kind, from Mojo with no Python: tables, Parquet, CSV, Query, Frame and SQL, with exact expected values
 # (sums of multiples of 0.25 are exact in any order). tests/test_mojo_float*.py compare many more queries with DuckDB on random doubles.
 from std.os import makedirs
+from omxcore.wide import wide_make
 from std.ffi import external_call
 from std.sys import CompilationTarget
 from omxcore import (float_text, Table, SharedTable, Frame, Catalog, Query, QueryResult, INT, DECIMAL, TEXT, FLOAT, F32_COLUMN, col, lit_float, lit_f32,
@@ -390,12 +391,13 @@ def test_float_text_is_the_shortest_that_reads_back() raises:
 
 def test_money_with_many_places_is_float_by_default_and_exact_on_request() raises:
     """fx.csv: rate has 6 places and qty is large. Read as DuckDB does (FLOAT) `sum(rate * qty)` answers; as an exact DECIMAL(6) the product
-    passes int64 and raises readably, while `sum(rate)` is exact."""
+    passes int64 and is kept in 128 bits (F-192), while `sum(rate)` is exact."""
     makedirs(DIR, exist_ok=True)
     var path = DIR + "fx.csv"
     var rng = Rng(3)
     var exact_total = Int64(0)
     var float_total = Float64(0.0)
+    var exact_product = Int128(0)
     with open(path, "w") as f:
         f.write("rate,qty\n")
         for _ in range(200_000):
@@ -403,6 +405,7 @@ def test_money_with_many_places_is_float_by_default_and_exact_on_request() raise
             var qty = rng.int(100_000, 1_000_000)
             exact_total += Int64(micro)
             float_total += Float64(micro) / 1.0e6 * Float64(qty)
+            exact_product += Int128(micro) * Int128(qty)
             f.write(String(micro // 1_000_000) + "." + String(1_000_000 + micro % 1_000_000)[byte=1:] + "," + String(qty) + "\n")
     var by_default = read_csv(path)
     expect(by_default.table.kind(0) == FLOAT, "6 places: FLOAT by default")
@@ -418,12 +421,9 @@ def test_money_with_many_places_is_float_by_default_and_exact_on_request() raise
     cat2.add_table("fx", exact.take_table().share())
     var s1 = sql(cat2, "SELECT sum(rate) FROM fx")
     expect(s1.table.get(0, 0) == exact_total, "the exact sum of the six-place rates, to the last digit")
-    var raised = False
-    try:
-        _ = sql(cat2, "SELECT sum(rate * qty) FROM fx")
-    except e:
-        raised = String(e).find("passed the int64 range") >= 0
-    expect(raised, "and the exact product sum raises readably (no int128 behind it)")
+    var p = sql(cat2, "SELECT sum(rate * qty) FROM fx")           # F-192: the product sum passes int64 and is kept in 128 bits, as DuckDB's DECIMAL(38)
+    expect(p.table.is_wide(0), "the exact product sum is a total past int64")
+    expect(wide_make(p.table.get(0, 0), p.table.get_high(0, 0)) == exact_product, "and it is the exact sum of the products, to the last digit")
 
 
 def test_float_text_of_powers_of_two() raises:
