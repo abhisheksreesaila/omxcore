@@ -376,6 +376,7 @@ struct BoundQuery(Movable):
     var resid: List[Int]
     var resid_text: List[String]
     var resid_mask: List[Int]
+    var is_side: Bool                # F-158: this row query delivers a join's build side: the rows it collects count against the join memory budget
     var rows: Bool                   # a row query: `routs` and `rorder` hold its select list and ORDER BY (expressions of `rexprs`)
     var distinct: Bool               # SELECT DISTINCT (bound as a group-by on the select list)
     var routs: List[Int]
@@ -412,6 +413,7 @@ struct BoundQuery(Movable):
         self.resid_text = List[String]()
         self.resid_mask = List[Int]()
         self.rows = False
+        self.is_side = False
         self.distinct = False
         self.routs = List[Int]()
         self.rorder = List[SortKey]()
@@ -597,6 +599,7 @@ struct _Binder(Movable):
     var alias_expr: List[Int]         # post-aggregate expression of each select item, by item (-1 while unbound)
     var n_stored: Int                 # the source's stored columns; the frame's formula columns follow them
     var formulas: List[Formula]
+    var formula_tab: List[Int]        # F-158: the table of FROM each formula column belongs to (formulas follow every table's stored columns)
     var distinct: Bool
     var tab_names: List[String]       # one per table of FROM (F-153)
     var tab_alias: List[String]
@@ -632,6 +635,7 @@ struct _Binder(Movable):
         self.alias_expr = List[Int]()
         self.n_stored = 0
         self.formulas = List[Formula]()
+        self.formula_tab = List[Int]()
 
     def take(deinit self) -> BoundQuery:
         return self.q^
@@ -658,7 +662,8 @@ struct _Binder(Movable):
         4 ambiguous between the two tables (a USING column is not: it means the first table's)."""
         ref x = self.st.exprs[ast]
         var lo = 0
-        var hi = len(self.src_names)
+        var hi = self.n_stored
+        var only_tab = -1                                         # a qualifier restricts the formula columns to its table too
         var left_only = self.is_semi_anti() and not self.in_on        # after a semi / anti join only the first table has columns
         if left_only:
             hi = self.tab_start[1]
@@ -687,6 +692,7 @@ struct _Binder(Movable):
                 return (-1, 1)
             lo = self.tab_start[tab]
             hi = lo + self.tab_cols[tab]
+            only_tab = tab
         elif self.inner_first and self.in_on and len(self.tab_start) > 1:
             # a subquery's condition: a bare name is the subquery's column when its table has one, else the outer query's
             var key1 = lower_ascii(x.text)
@@ -697,12 +703,15 @@ struct _Binder(Movable):
         var key = lower_ascii(x.text)
         var found = -1
         var found_tab = -1
+        var cands = List[Int]()
         for c in range(lo, hi):
+            cands.append(c)
+        for fi in range(len(self.formula_tab)):                   # the formula columns of the tables in scope
+            if (only_tab < 0 or self.formula_tab[fi] == only_tab) and not (left_only and self.formula_tab[fi] != 0):
+                cands.append(self.n_stored + fi)
+        for c in cands:
             if lower_ascii(self.src_names[c]) == key:
-                var t = 0
-                for u in range(len(self.tab_start)):
-                    if c >= self.tab_start[u]:
-                        t = u
+                var t = self.table_of(c)
                 if found >= 0:
                     if t == found_tab:
                         return (found, 3)
@@ -863,6 +872,9 @@ struct _Binder(Movable):
         return m
 
     def key_pair_check(self, lc: Int, rc: Int, line: Int, col: Int) raises:
+        if lc >= self.n_stored or rc >= self.n_stored:
+            raise sql_error(line, col, "a join key that is a frame's formula column (`" + self.src_names[lc if lc >= self.n_stored else rc] + "`) is not supported yet: join on the stored columns " +
+                            "(a formula column can be read, filtered and aggregated after the join)")
         var lk = self.src_kinds[lc]
         var rk = self.src_kinds[rc]
         var ok = (_is_numeric(lk) and _is_numeric(rk)) or (lk == rk and (lk == DATE.value or lk == BOOL.value or lk == TEXT.value or lk == FLOAT.value))
@@ -1031,6 +1043,8 @@ struct _Binder(Movable):
         return self.tab_alias[t] if self.tab_alias[t].byte_length() > 0 else self.tab_names[t]
 
     def table_of(self, col: Int) -> Int:
+        if col >= self.n_stored:
+            return self.formula_tab[col - self.n_stored]
         var t = 0
         for u in range(len(self.tab_start)):
             if col >= self.tab_start[u]:
@@ -1094,13 +1108,19 @@ struct _Binder(Movable):
         var nodes = self.formulas[fi].expr.nodes.copy()
         var fname = self.formulas[fi].name
         var fscale = self.formulas[fi].scale
+        var owner = self.formula_tab[fi]
         for n in nodes:
             if n.op == N_COL:
                 var found = -1
-                for c in range(len(self.src_names)):
+                for c in range(self.tab_start[owner], self.tab_start[owner] + self.tab_cols[owner]):    # the owner's stored columns, then its formulas
                     if self.src_names[c] == n.name:
                         found = c
                         break
+                if found < 0:
+                    for g in range(len(self.formula_tab)):
+                        if self.formula_tab[g] == owner and self.src_names[self.n_stored + g] == n.name:
+                            found = self.n_stored + g
+                            break
                 if found < 0:
                     raise self.err(ast, "formula `" + fname + "` reads column `" + n.name + "`, which is not there")
                 if found >= self.n_stored:
@@ -2507,8 +2527,6 @@ def bind_statement(catalog: Catalog, var st: SqlStatement, text: String) raises 
             raise sql_error(st.right_line, st.right_col, "table `" + st.right_table + "` not found" +
                             ((" (did you mean `" + hint + "`?)") if hint.byte_length() > 0 else
                              (" (the catalog has " + ", ".join(catalog.names()) + ")") if len(catalog.sources) > 0 else " (the catalog is empty)"))
-        if len(catalog.sources[src].overlay.formulas) > 0 or len(catalog.sources[src2].overlay.formulas) > 0:
-            raise sql_error(st.right_line, st.right_col, "a join over a frame's formula columns is not supported yet: bake the formulas first")
         var same = lower_ascii(catalog.sources[src].name) == lower_ascii(catalog.sources[src2].name)
         if same and not st.from_subquery and (st.table_alias.byte_length() == 0 or st.right_alias.byte_length() == 0 or lower_ascii(st.table_alias) == lower_ascii(st.right_alias)):
             raise sql_error(st.right_line, st.right_col, "joining `" + catalog.sources[src].name + "` with itself needs a different alias for each side (FROM t a JOIN t b ...)")
@@ -2524,8 +2542,6 @@ def bind_statement(catalog: Catalog, var st: SqlStatement, text: String) raises 
             raise sql_error(ex.line, ex.col, "table `" + ex.name + "` not found" +
                             ((" (did you mean `" + hint + "`?)") if hint.byte_length() > 0 else
                              (" (the catalog has " + ", ".join(catalog.names()) + ")") if len(catalog.sources) > 0 else " (the catalog is empty)"))
-        if len(catalog.sources[sx].overlay.formulas) > 0:
-            raise sql_error(ex.line, ex.col, "a join over a frame's formula columns is not supported yet: bake the formulas first")
         # every table of FROM needs its own name: the same table twice needs two aliases
         var names = List[String]()
         var aliases = List[String]()
@@ -2591,11 +2607,13 @@ def bind_statement(catalog: Catalog, var st: SqlStatement, text: String) raises 
     b.q.tab_alias = b.tab_alias.copy()
     b.q.tab_start = b.tab_start.copy()
     b.q.tab_cols = b.tab_cols.copy()
-    for f in catalog.sources[src].overlay.formulas:           # a frame's formula columns are columns too
-        b.formulas.append(f.copy())
-        b.src_names.append(f.name)
-        b.src_kinds.append(FLOAT.value if f.scale < 0 else DECIMAL.value if f.scale > 0 else INT.value)
-        b.src_scales.append(max(f.scale, 0))
+    for t in range(len(b.q.sources)):                         # a frame's formula columns are columns too (of its own table, after every table's stored columns)
+        for f in catalog.sources[b.q.sources[t]].overlay.formulas:
+            b.formulas.append(f.copy())
+            b.formula_tab.append(t)
+            b.src_names.append(f.name)
+            b.src_kinds.append(FLOAT.value if f.scale < 0 else DECIMAL.value if f.scale > 0 else INT.value)
+            b.src_scales.append(max(f.scale, 0))
     b.q.source = src
     b.q.text = text
     b.q.line = b.st.items[0].line
@@ -2623,7 +2641,13 @@ def bind_statement(catalog: Catalog, var st: SqlStatement, text: String) raises 
         if b.is_semi_anti():                                   # a semi / anti join returns the first table's columns only
             if only == 1:
                 raise sql_error(it.line, it.col, "unknown table or alias `" + it.alias + "` in `" + it.alias + ".*`: after a semi or anti join only the first table has columns")
+            var shown0 = List[Int]()
             for c in range(b.tab_start[0], b.tab_start[0] + b.tab_cols[0]):
+                shown0.append(c)
+            for g in range(len(b.formula_tab)):
+                if b.formula_tab[g] == 0:
+                    shown0.append(b.n_stored + g)
+            for c in shown0:
                 b.st.exprs.append(SqlExpr(X_COL, b.src_names[c], String(), -1, -1, -1, List[Int](), False, it.line, it.col))
                 items.append(SelectItem(len(b.st.exprs) - 1, String(), False, it.line, it.col))
             continue
@@ -2636,7 +2660,13 @@ def bind_statement(catalog: Catalog, var st: SqlStatement, text: String) raises 
         for t in range(len(b.tab_names)):
             if only >= 0 and t != only:
                 continue
+            var shown_t = List[Int]()
             for c in range(b.tab_start[t], b.tab_start[t] + b.tab_cols[t]):
+                shown_t.append(c)
+            for g in range(len(b.formula_tab)):
+                if b.formula_tab[g] == t:
+                    shown_t.append(b.n_stored + g)
+            for c in shown_t:
                 var skip = False
                 if only < 0 and t == 1:
                     for un in b.using_cols:
@@ -2857,6 +2887,7 @@ def copy_query(q: BoundQuery) -> BoundQuery:
     c.resid_text = q.resid_text.copy()
     c.resid_mask = q.resid_mask.copy()
     c.rows = q.rows
+    c.is_side = q.is_side
     c.distinct = q.distinct
     c.routs = q.routs.copy()
     c.rorder = q.rorder.copy()

@@ -214,11 +214,32 @@ big files stream automatically. 12 ms cold start, 21 MB, no Python.
   impossible; a lint catches the rest; a pre-commit hook refuses stale compiled kernels; a test fails if a kernel
   library is not committed; test runs and package builds never share files.
 
+### Joins over streamed files and edited frames (F-158)
+
+A Parquet scan or a Frame on the probe side of a fused join is never read into a table: each row group (a Frame: the shared
+rows, then the changed and appended ones, removed rows masked out) is joined as it arrives, its keys planned once from the
+build side and applied to every chunk, the build side's hash map shared by all workers. This holds for aggregates and for row
+queries (`ORDER BY ... LIMIT` keeps the best rows of each chunk in per-worker heaps), for inner, LEFT, SEMI and ANTI joins, and
+for a star of unique-key dimensions. The note `join path: fused: ... chunk by chunk` says so. Peak memory is the build side plus
+the row groups being decoded (up to min(threads, 8) at once, a worker each, for every scan aggregate), not the file: a 6M-row,
+6-column scan joined to a 1,000-row dimension peaked at 384 MB read whole and 75 MB streamed (`ru_maxrss` of a fresh `mx`
+process; not a timing). When the build keys repeat or are hashed, the join falls back to materializing the probe side.
+
+The build side is collected row by row and counted against the join's memory budget while it grows
+(`PlannerOptions.join_budget`, `mx --join-budget`): a build side past it raises "the build side of the join (t) has N rows of
+C columns so far, past the join's memory budget of ...", before it is allocated. A join that spills to disk is not built yet.
+
+A big GROUP BY over a scan merges each row group's partial in 256 hash partitions in parallel (1M groups: 1.85 s to 0.56 s on
+the day it was built; not re-measured), with exact int64 sums that raise on overflow across row groups. A Frame's formula
+columns are columns of a join too, on either side (`s.net`, `s.*`); a formula as a join key is refused by name. Tests:
+`tests/test_f158_streamed_join.py`, `mojo/tests/test_sql.mojo` (a Frame probe and a Frame build side equal the join over
+`bake()`).
+
 ## Still behind DuckDB (next)
 
 - Multi-table joins that write intermediate rows (TPC-H Q5, Q7, Q10: 2-4x) and one-to-many LEFT joins: F-161, a
   star-aware planner that probes every dimension in one pass, filters kept inside the join.
 - Full sorts and million-row outputs (~2x), and text functions that build new words over huge dictionaries (F-167).
-- Still to build: joins over streamed files (F-158), CTEs and correlated subqueries (F-159), then the gate: all 22
+- Still to build: the gate: all 22
   TPC-H queries through `mx` equal to DuckDB (F-162), and the quiet-machine scoreboard against DuckDB and Polars on
   CPU and GPU.

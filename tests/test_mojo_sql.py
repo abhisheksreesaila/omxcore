@@ -250,6 +250,8 @@ def expected_group(keys, ds, mode, kinds, con, rows):
         else:
             span = con.execute(f"select max({key}) - min({key}) from t").fetchone()[0]
             domain *= (span + 1) + 1
+    if mode == "scan" and domain > 65_536 and domain * ROW_GROUPS > 4 * rows:      # F-158: each row group is a chunk: the dense layout would be allocated and merged per chunk
+        return "hashed"
     return "dense" if domain <= 4_194_304 and (domain <= 65_536 or domain <= 4 * rows) else "hashed"
 
 
@@ -672,7 +674,9 @@ def test_a_scans_statistics_plan_like_the_table(probe, data, keys):
     for mode in ("table", "scan"):
         lines = [r[0] for r in run_probe(probe, sql, {"t": data["g8"].path}, mode=mode)["rows"]]
         plans.append(next(l for l in lines if l.startswith("  group:")))
-    assert plans[0] == plans[1], plans
+    if plans[0] != plans[1]:                      # F-158: the one difference allowed: a big domain over many row groups is hashed, not merged per chunk
+        strategy = lambda p: p.split(":")[1].split(" on ")[0].split(",")[0].strip()
+        assert (strategy(plans[0]) == "dense" and strategy(plans[1]) == "hashed" and "row groups" in plans[1]) or strategy(plans[0]) == strategy(plans[1]) == "hashed", plans
 
 
 def test_a_decimal_product_past_int64_raises(probe, data):

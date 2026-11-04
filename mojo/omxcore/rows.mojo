@@ -26,12 +26,13 @@ from .query import Program, MAGIC, SRC_WORDS, CTL_REG, OVERFLOW_MESSAGE, overflo
 from .kernels._fpenv import core_count
 from .kernels.pipeline_cpu import IP, LP, FP, BP, VEC, E_OVERFLOW, pipeline_keyed
 from .sql import sql_error
-from .bind import SqlSource, BoundQuery, SortKey, B_COL, B_LIT, SRC_FRAME, pow10_checked
+from .bind import SqlSource, BoundQuery, SortKey, B_COL, B_LIT, SRC_FRAME, SRC_SCAN, pow10_checked
+from .joincore import JOIN_BUDGET_BYTES, build_budget_error
 from .planner import PhysicalPlan, PlannerOptions, commas
 from .sqlprog import SqlProgram, DictAccess, lower_rows, bkey, collect_columns
 from .sqleval import ValCol
 from .kargs import KernelRun
-from .jfront import FusedJoin, front_spec, jf_front
+from .jfront import FusedJoin, ProbeStream, chunk_join, front_spec, jf_front
 from .holistic import float_key
 from .exec import (_put_column_owned, _table_addresses, _alias_lists, _Chunks, _open_chunks, _load_chunk, chunk_rows_total, _check_footer, _Inputs, _inputs, _gather,
                    _order_rows, _to_table)
@@ -614,12 +615,18 @@ def _finish_spilled(mut sp: SpillSort, q: BoundQuery, items: List[_Item], opts: 
     return table^
 
 
-def run_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOptions, dicts: DictAccess, mut notes: List[String],
+def run_rows(src0: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOptions, dicts: DictAccess, mut notes: List[String],
              inp: _Inputs, sp: SqlProgram, items: List[_Item], trust: Bool, fj: Optional[ArcPointer[FusedJoin]], stream: Bool = False) raises -> Table:
-    """Reads the chunks, collects the selected rows (ordered, cut) and makes the result table."""
-    var used = inp.used.copy()
-    var ch = _open_chunks(src, used)
+    """Reads the chunks, collects the selected rows (ordered, cut) and makes the result table. A streamed join's probe (F-158) arrives in the chunks of its own
+    source, each with its own join (keys from the chunk, the build sides' maps shared)."""
+    var ps: Optional[ArcPointer[ProbeStream]] = None
     if fj:
+        ps = fj.value()[].stream
+    var src = ps.value()[].src.copy() if ps else src0.copy()
+    var used = ps.value()[].used.copy() if ps else inp.used.copy()
+    var scan_mode = src.kind == SRC_SCAN if ps else inp.scan_mode
+    var ch = _open_chunks(src, used)
+    if fj and not ps:
         ch.override = fj.value()[].probe
     var cols = List[ValCol]()
     for it in items:
@@ -658,6 +665,9 @@ def run_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
             _check_footer(src, ch, i, chunk)
         ns_load += perf_counter_ns() - t_load
         chunks_read += 1
+        var fji = fj
+        if ps:
+            fji = ArcPointer(chunk_join(ps.value()[], chunk))
         var n_rows = chunk.rows()
         var step = n_rows
         if plan.early_stop:                                     # read the chunk in slices, so a LIMIT stops it early
@@ -675,7 +685,7 @@ def run_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
             var end = min(n_rows, at + step)
             if sorting and len(cols[0].v) > 0 and len(cols[0].v) + (end - at) > cap:
                 _spill_run(spill, cols, ords, rows_in, q, items, opts, dicts)
-            var rc = _run_rows(chunk, sp, ch.mask_addr, at, end, opts.threads, fj)
+            var rc = _run_rows(chunk, sp, ch.mask_addr, at, end, opts.threads, fji)
             if has_delta:
                 var is_d = ch.is_delta(i)
                 var rb = 0 if is_d else ch.row_base(i)
@@ -693,13 +703,16 @@ def run_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
                 else:
                     _append_gathered(cols[k], chunk, inp.pos[it.col], IP(unsafe_from_address=Int(rc.ids.unsafe_ptr())), rc.n)
             rows_in += rc.n
+            var budget = opts.join_budget if opts.join_budget > 0 else JOIN_BUDGET_BYTES
+            if q.is_side and rows_in * max(len(items), 1) * 8 > budget:
+                raise build_budget_error(src.name, rows_in, len(items), budget)
             opts.job.advance(end - at)
             at = end
     var ms_run = Float64(perf_counter_ns() - t_run) / 1e6
     if src.kind == SRC_FRAME:
         notes.append("ran: frame " + src.name + ": " + commas(src.table.rows()) + " shared rows (the changed ones masked out) + " +
                      commas(len(src.overlay.delta)) + " changed or appended rows")
-    elif inp.scan_mode:
+    elif scan_mode:
         notes.append("ran: scan " + src.name + ": " + String(chunks_read) + " of " + String(src.scan.value().row_groups()) + " row groups read (" +
                      String(len(used)) + (" column" if len(used) == 1 else " columns") + "), one chunk each" +
                      ((", + " + commas(len(src.overlay.delta)) + " changed or appended rows") if len(src.overlay.delta) > 0 else ""))
@@ -752,7 +765,7 @@ def run_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
         for e in q.routs:
             outs.append(_gather(cols[_item_of(items, q, e)], pick))
         table = _to_table(q, outs, dicts)
-    notes.append("time: " + ("decode " + _ms(Float64(ns_load) / 1e6) + " ms, " if inp.scan_mode else "") + "kernel " + _ms(ms_run - Float64(ns_load) / 1e6) +
+    notes.append("time: " + ("decode " + _ms(Float64(ns_load) / 1e6) + " ms, " if scan_mode else "") + "kernel " + _ms(ms_run - Float64(ns_load) / 1e6) +
                  " ms, order and output " + _ms(Float64(perf_counter_ns() - t_ord) / 1e6) + " ms")
     return table^
 
@@ -777,13 +790,18 @@ def _concat(a: ValCol, b: ValCol) -> ValCol:
     return out^
 
 
-def run_topk_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOptions, dicts: DictAccess, mut notes: List[String],
+def run_topk_rows(src0: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOptions, dicts: DictAccess, mut notes: List[String],
                   inp: _Inputs, sp: SqlProgram, items: List[_Item], trust: Bool, fj: Optional[ArcPointer[FusedJoin]]) raises -> Table:
     """ORDER BY with a small LIMIT: each chunk's kernel run keeps the best K = limit + offset rows in per-worker heaps; the candidates
     (at most workers x K) are merged with the best so far and cut to K again, so the rest of the rows are never materialized."""
-    var used = inp.used.copy()
-    var ch = _open_chunks(src, used)
+    var ps: Optional[ArcPointer[ProbeStream]] = None                # F-158: a streamed join's probe, as in run_rows
     if fj:
+        ps = fj.value()[].stream
+    var src = ps.value()[].src.copy() if ps else src0.copy()
+    var used = ps.value()[].used.copy() if ps else inp.used.copy()
+    var scan_mode = src.kind == SRC_SCAN if ps else inp.scan_mode
+    var ch = _open_chunks(src, used)
+    if fj and not ps:
         ch.override = fj.value()[].probe
     var K = plan.top_k
     var nk = len(q.rorder)
@@ -832,7 +850,10 @@ def run_topk_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: Plann
         scanned += chunk.rows()
         if chunk.rows() == 0:
             continue
-        var rc = _run_topk(chunk, sp, ch.mask_addr, K, key_slot, key_desc, key_nf, key_rank, opts.threads, fj)
+        var fji = fj
+        if ps:
+            fji = ArcPointer(chunk_join(ps.value()[], chunk))
+        var rc = _run_topk(chunk, sp, ch.mask_addr, K, key_slot, key_desc, key_nf, key_rank, opts.threads, fji)
         opts.job.advance(chunk.rows())
         if rc.n == 0:
             continue
@@ -896,7 +917,7 @@ def run_topk_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: Plann
     if src.kind == SRC_FRAME:
         notes.append("ran: frame " + src.name + ": " + commas(src.table.rows()) + " shared rows (the changed ones masked out) + " +
                      commas(len(src.overlay.delta)) + " changed or appended rows")
-    elif inp.scan_mode:
+    elif scan_mode:
         notes.append("ran: scan " + src.name + ": " + String(chunks_read) + " of " + String(src.scan.value().row_groups()) + " row groups read (" +
                      String(len(used)) + (" column" if len(used) == 1 else " columns") + "), one chunk each" +
                      ((", + " + commas(len(src.overlay.delta)) + " changed or appended rows") if len(src.overlay.delta) > 0 else ""))
@@ -914,7 +935,7 @@ def run_topk_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: Plann
         outs.append(_gather(best[_item_of(items, q, e)], pick))
     var t_out = perf_counter_ns()
     var table = _to_table(q, outs, dicts)
-    notes.append("time: " + ("decode " + _ms(Float64(ns_load) / 1e6) + " ms, " if inp.scan_mode else "") + "kernel and merge " + _ms(ms_run - Float64(ns_load) / 1e6) +
+    notes.append("time: " + ("decode " + _ms(Float64(ns_load) / 1e6) + " ms, " if scan_mode else "") + "kernel and merge " + _ms(ms_run - Float64(ns_load) / 1e6) +
                  " ms, output " + _ms(Float64(perf_counter_ns() - t_out) / 1e6) + " ms")
     return table^
 
