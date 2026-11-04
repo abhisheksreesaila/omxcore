@@ -7,6 +7,7 @@ exact: read it with a decimal parser, not a float one), a DATE as "yyyy-mm-dd", 
 """
 from .utf8 import utf8_seq_len
 from .table import Table, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
+from .wide import wide_text, wide_make
 from .floatfmt import float_text
 
 
@@ -127,6 +128,8 @@ def cell_json(t: Table, c: Int, r: Int) -> String:
         return "null"
     var k = t.kind(c).value
     var v = t.get(c, r)
+    if t.is_wide(c):                                            # F-192: a total past int64
+        return wide_text(wide_make(v, t.get_high(c, r)), t.scale(c))
     if k == INT.value:
         return String(v)
     if k == DECIMAL.value:
@@ -145,6 +148,8 @@ def cell_csv(t: Table, c: Int, r: Int) -> String:
         return String()
     var k = t.kind(c).value
     var v = t.get(c, r)
+    if t.is_wide(c):
+        return wide_text(wide_make(v, t.get_high(c, r)), t.scale(c))
     if k == INT.value:
         return String(v)
     if k == DECIMAL.value:
