@@ -1771,8 +1771,8 @@ def _run_star[P: Planner](q: BoundQuery, leaves: List[_Leaf], js: JoinStats, jp:
         var used = List[Int]()
         var pos = List[Int]()
         var kcs = List[List[Int]]()
-        for st in sstages:
-            kcs.append(st.pcols.copy())
+        for i in range(len(sstages)):                               # (an index loop: `for st in sstages` over this List crashes the compiler, docs/lessons.md)
+            kcs.append(sstages[i].pcols.copy())
         _stream_layout(psrc, vstage, vreal, kcs, used, pos)
         var ps = ArcPointer(ProbeStream(psrc.copy(), used^, pos^, sstages^, 0, True, vstage^, vreal^))
         var template = ArcPointer(stream_template(ps))
