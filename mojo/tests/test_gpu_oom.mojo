@@ -219,6 +219,75 @@ def test_a_frames_edits_ride_along_with_every_piece() raises:
     _ = b^
 
 
+def other(var q: Query) raises -> Query:
+    return q^.group_by(col("k"), groups=8).agg(sum(col("w")), count(), max_of(col("v")))
+
+
+def test_auto_on_a_frame_with_edits_appends_and_removes() raises:
+    """F-196: AUTO streams a frame over the budget; its edits, appends and removes ride along, with pieces resident from the
+    earlier queries and the frame changing between them."""
+    var b = budget("1M")
+    var t = make_table(1_100_000, 11)
+    var dt = DeviceTable(t)
+    var f = Frame(t)
+    var rng = Rng(5)
+    for round in range(3):
+        for _ in range(2000):
+            var r0 = rng.int(0, 1_099_999)
+            if f.alive(r0):
+                f.set(f.column("w"), r0, Int64(rng.int(-9000, 9000)))
+        for _ in range(300):
+            var row = rng.int(0, 1_099_999)
+            if f.alive(row):
+                f.remove(row)
+        for _ in range(10):
+            _ = f.append(["3", "123456", "77"])
+        var a = grouped(Query(f).on_device(dt)).compute(AUTO)
+        expect(a.device == GPU and a.fallback_reason == "" and a.pieces > 10, "round " + String(round) + ": `" + a.fallback_reason + "`")
+        same(a, grouped(Query(f)).compute(CPU), "frame round " + String(round))
+        same(other(Query(f).on_device(dt)).compute(AUTO), other(Query(f)).compute(CPU), "frame other, round " + String(round))
+    dt.release()
+    _ = b^
+
+
+def test_the_budget_shrinks_and_grows_between_queries() raises:
+    """The pieces the last query left are no longer in use when the next one starts: a smaller budget evicts them instead of
+    sending a piece to the CPU, and a bigger one cuts bigger pieces."""
+    var t = make_table(1_100_000, 12)
+    var want = grouped(Query(t)).compute(CPU)
+    var b = budget("2M")
+    var dt = DeviceTable(t)
+    same(grouped(Query(t).on_device(dt)).compute(AUTO), want, "2M")
+    for size in [String("400K"), String("300K"), String("3M")]:
+        b.set(size)
+        var a = grouped(Query(t).on_device(dt)).compute(AUTO)
+        expect(a.device == GPU and a.fallback_reason == "", size + ": all on the GPU: `" + a.fallback_reason + "`")
+        same(a, want, size)
+        expect(dt.piece_bytes() <= parse_size(size) // 100 * 90, size + ": held " + String(dt.piece_bytes()))
+    dt.release()
+    _ = b^
+
+
+def test_a_different_query_between_two_identical_ones() raises:
+    var t = make_table(1_100_000, 13)
+    var b = budget("2M")
+    var dt = DeviceTable(t)
+    var wg = grouped(Query(t)).compute(CPU)
+    var wo = other(Query(t)).compute(CPU)
+    same(grouped(Query(t).on_device(dt)).compute(AUTO), wg, "first")
+    var up1 = dt.piece_uploads()
+    var o = other(Query(t).on_device(dt)).compute(AUTO)
+    expect(o.device == GPU and o.fallback_reason == "", "the other shape: `" + o.fallback_reason + "`")
+    same(o, wo, "other")
+    var third = grouped(Query(t).on_device(dt)).compute(AUTO)
+    expect(third.device == GPU and third.fallback_reason == "", "third: `" + third.fallback_reason + "`")
+    same(third, wg, "third")
+    expect(dt.piece_bytes() <= 2 * 1024 * 1024 // 100 * 90, "held " + String(dt.piece_bytes()))
+    expect(up1 > 0, "the first query uploaded")
+    dt.release()
+    _ = b^
+
+
 def test_the_gpu_scan_cuts_a_group_over_the_budget_into_ranges() raises:
     var b = budget("1M")
     var t = make_table(ROWS, 5)
@@ -503,6 +572,9 @@ def main() raises:
     test_a_table_over_the_budget_runs_in_pieces()
     test_a_table_under_the_budget_stays_resident_in_one_launch()
     test_auto_streams_a_too_big_table_and_keeps_what_fits_resident()
+    test_auto_on_a_frame_with_edits_appends_and_removes()
+    test_the_budget_shrinks_and_grows_between_queries()
+    test_a_different_query_between_two_identical_ones()
     test_auto_keeps_a_too_big_table_on_the_cpu_when_the_gpu_is_the_wrong_call()
     test_a_frames_edits_ride_along_with_every_piece()
     test_the_gpu_scan_cuts_a_group_over_the_budget_into_ranges()

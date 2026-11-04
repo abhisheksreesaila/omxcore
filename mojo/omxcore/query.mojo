@@ -41,7 +41,7 @@ from .kernels.pipeline_cpu import pipeline_keyed, pipeline_plain, E_OVERFLOW, IP
 from .kernels.pipeline_gpu import run_pipeline_gpu, _choose_mode, scratch_rows, int_word_program_ok, APPLE_GPU, HDR as GPU_HDR
 from max.gpu.host import DeviceContext, DeviceBuffer
 from .gpu import (DeviceTable, HAS_GPU, NO_GPU_MESSAGE, gpu_available, _ScanContext, _scan_context, _stage_load, _stage_range, _stage_data, _stage_valid,
-                  _pinned_prepare, _res_open, _res_resident, _res_stage, gpu_budget, gpu_capacity, gpu_free_bytes, human_bytes, gpu_fail_piece, INJECTED_OOM, GPU_RETRY_FACTOR_PERCENT)
+                  _pinned_prepare, _res_open, _res_begin, _res_resident, _res_stage, gpu_budget, gpu_capacity, gpu_free_bytes, human_bytes, gpu_fail_piece, INJECTED_OOM, GPU_RETRY_FACTOR_PERCENT)
 from .holistic import (HolStates, HolSpec, HolResult, window_blocks, heap_offer, float_key, A_DISTINCT, A_PCT, A_TOPK, A_MEDIAN,
                        A_VAR_POP, A_VAR_SAMP, A_STDDEV_POP, A_STDDEV_SAMP, A_QEDGE, is_spread, spread_needs)
 from .joincore import JoinKeys, JoinSide, normalize_keys, join_pairs, select_rows, gather_join, JOIN_BUDGET_BYTES
@@ -2193,6 +2193,7 @@ def _run_gpu_pieces(dt: DeviceTable, t: SharedTable, p: Program, mask: List[UInt
     the rest to the CPU on `AUTO`."""
     var ctx = dt.context()
     var res = _res_open(dt)
+    _res_begin(res)
     var avail = gpu_budget(ctx, dt.piece_bytes())
     var rows = t.rows()
     var masked = len(mask) > 0
@@ -2212,7 +2213,7 @@ def _run_gpu_pieces(dt: DeviceTable, t: SharedTable, p: Program, mask: List[UInt
         if strict and fixed + 2 * _range_bytes(64, nd, nv, masked) > gpu_capacity(ctx):
             raise Error("device GPU: " + why)
         all_cpu = OOM_PREFIX + "hold a piece: " + why
-    var limit = avail - fixed                           # what the resident pieces may take
+    var limit = avail - fixed - ((step // 8 + 16) if masked else 0)       # what the resident pieces may take (a frame's mask slice is uploaded beside them)
     var starts = List[Int]()
     var lens = List[Int]()
     var at = 0

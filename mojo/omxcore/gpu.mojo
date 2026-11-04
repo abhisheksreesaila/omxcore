@@ -334,7 +334,9 @@ struct _DeviceState(Movable):
 
 
 struct DeviceTable(ImplicitlyCopyable):
-    """The columns of a `SharedTable` on the GPU, uploaded once and shared by every session that holds a copy."""
+    """The columns of a `SharedTable` on the GPU, uploaded once and shared by every session that holds a copy. F-196: a query on a
+    table over the budget also updates this handle's residency state (the pieces kept between queries, their counters), so the
+    queries on one `DeviceTable` run from one thread at a time, as the app's already do."""
     var _s: ArcPointer[_DeviceState]
 
     def __init__(out self, table: SharedTable) raises:
@@ -686,6 +688,12 @@ def _res_open(dt: DeviceTable) raises -> Int:
         return dt._s[].res
     else:
         return 0
+
+
+def _res_begin(res: Int):
+    """A new query: the pieces the last one used are no longer in use (its last two stay protected only while its own kernel runs)."""
+    comptime if HAS_GPU:
+        UnsafePointer[_Resident, MutAnyOrigin](unsafe_from_address=res)[].stage += 2
 
 
 def _res_resident(res: Int, r0: Int, rows: Int, data_used: List[Bool], valid_used: List[Bool]) -> Int:
