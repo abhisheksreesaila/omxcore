@@ -332,8 +332,6 @@ struct PartAcc(Movable):
         var op = order.unsafe_ptr()
         var sp = start.unsafe_ptr()
         var W = max(1, min(threads if threads > 0 else core_count(), np))
-        var next = List[Int](length=1, fill=0)
-        var nextp = next.unsafe_ptr()
 
         def fold_parts(w: Int) {imm}:
             for p in range(w, np, W):
@@ -344,6 +342,8 @@ struct PartAcc(Movable):
                         return
 
         par_n(fold_parts, W, W)
+        _ = order^                                                    # (the closure read them through addresses: alive until the workers are done)
+        _ = start^
         if bad[0] != 0:
             raise Error(OVERFLOW_MESSAGE)
 
