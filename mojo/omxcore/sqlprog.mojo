@@ -237,7 +237,7 @@ struct SqlProgram(Movable):
 def bkey(rexprs: List[BExpr], e: Int) -> String:
     """A string that is equal for equal row-level expressions: to tell which aggregates read the same argument."""
     ref x = rexprs[e]
-    var s = String(x.op) + ":" + String(x.value) + ":" + x.text
+    var s = String(x.op) + ":" + String(x.value) + ":" + x.text + ":" + String(x.kind) + "." + String(x.scale)   # F-193: the type is part of the key
     if x.a >= 0:
         s += "(" + bkey(rexprs, x.a)
         if x.b >= 0:

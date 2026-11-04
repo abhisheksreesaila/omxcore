@@ -20,6 +20,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 import gen  # noqa: E402
+sys.path.insert(0, os.path.join(ROOT, "scripts"))
+import scratch as _scratch  # noqa: E402
 
 ENGINES = ["duckdb", "mx", "polars"]
 TIE = 1e-6          # sort values this close (relative) may come out in either order
@@ -174,7 +176,7 @@ def main():
     name = a.name or f"random-sf{a.sf}{'-shuffled' if a.shuffle else ''}"
     os.environ["MXBENCH_DEVICE"] = a.device
     engines = sorted(a.engines.split(","), key=lambda e: e != "duckdb")     # the reference first
-    tmp = tempfile.mkdtemp(prefix="mxrand-")
+    tmp = tempfile.mkdtemp(prefix="mxrand-", dir=_scratch.root())
     rows = []
     for seed in range(a.seed0, a.seed0 + a.n):
         spec = gen.make(seed, st)

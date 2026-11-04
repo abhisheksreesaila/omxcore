@@ -27,10 +27,9 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def _import_mxframe():
     """`import omxcore` from THIS checkout (the repo root is the package; a worktree may have another name)."""
-    import hashlib
-    import tempfile
-    shim = Path(tempfile.gettempdir()) / f"mxframe-shim-{hashlib.sha1(str(ROOT).encode()).hexdigest()[:10]}"
-    shim.mkdir(exist_ok=True)
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import scratch
+    shim = scratch.shim_dir(ROOT)
     link = shim / "omxcore"
     if not link.exists():
         link.symlink_to(ROOT)
