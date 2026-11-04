@@ -2,7 +2,7 @@
 # planner's notes (which path ran), EXPLAIN and the error messages. (tests/test_mojo_sql.py compares many more queries with
 # DuckDB on generated data.)
 from std.sys import argv
-from omxcore import (Table, SharedTable, Frame, Catalog, PlannerOptions, GROUP_HASHED, GROUP_DENSE, sql, sql_with, SqlResult, INT, DECIMAL, TEXT,
+from omxcore import (Table, SharedTable, Frame, Catalog, PlannerOptions, GROUP_HASHED, GROUP_DENSE, BUILD_LEFT, BUILD_RIGHT, sql, sql_with, SqlResult, INT, DECIMAL, TEXT,
                      DATE, BOOL, FLOAT, write_parquet, scan_parquet, ZSTD, Planner, RulePlanner, PhysicalPlan, Stats, BoundQuery)
 
 
@@ -228,6 +228,29 @@ def main() raises:
     check(rows_of(r.table), "east 140.45 7 3 3\nNorth 5.99 2 3 1\nWest -68.75 52 3 4\nNULL 1.00 3 3 1\n", "formula columns")
     r = sql(cat, "SELECT sum(net) FROM sheet WHERE half > 1 AND net IS NOT NULL")
     check(rows_of(r.table), "72.19\n", "a formula in WHERE")
+
+    # F-158: a Frame on the BUILD side: its formula columns, edits (qty 3 -> 100), an append and a removed row are seen, equal to the join over bake()
+    var bq = "SELECT count(*), sum(o.price), sum(s.net), sum(s.half) FROM orders o JOIN sheet s ON o.qty = s.qty"
+    var bopts = PlannerOptions()
+    bopts.build_side = BUILD_RIGHT                              # the Frame builds the hash table
+    r = sql(cat, bq, bopts)
+    has_note(r, "join build side: s (")
+    var sb = Catalog()
+    sb.add_table("orders", orders())
+    sb.add_table("sheet", ff.bake().share())
+    var sbr = sql(sb, "SELECT count(*), sum(o.price), sum(s.price - s.qty), sum(s.qty // 2) FROM orders o JOIN sheet s ON o.qty = s.qty", bopts)   # (bake() keeps no formulas: they are written out)
+    check(rows_of(r.table), rows_of(sbr.table), "a join with a Frame build side (formulas) equals the join over bake()")
+    check(rows_of(r.table), "8 198.19 166.19 14\n", "a Frame build side with formula columns")
+    try:                                                        # a formula column as a join key is refused by name
+        _ = sql(cat, "SELECT count(*) FROM orders o JOIN sheet s ON o.qty = s.half", bopts)
+        fail("a formula as a join key should raise")
+    except e:
+        check(String(e), "SQL error at line 1, column 53: a join key that is a frame's formula column (`half`) is not supported yet: join on the stored columns (a formula column can be read, filtered and aggregated after the join)", "formula join key")
+    r = sql(cat, "SELECT s.* FROM orders o JOIN sheet s ON o.qty = s.qty WHERE o.qty = 5", bopts)             # s.* holds the formula columns too
+    check(String(r.table.columns()), "8", "s.* of a Frame in a join: 5 stored + 3 formula columns")
+    bopts.build_side = BUILD_LEFT                               # ... and as the probe side the same answer
+    r = sql(cat, bq, bopts)
+    check(rows_of(r.table), rows_of(sbr.table), "the same join with the Frame on the probe side")
 
     # errors say what and where
     try:
