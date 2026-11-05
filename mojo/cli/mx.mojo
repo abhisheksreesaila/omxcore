@@ -9,7 +9,7 @@
 from std.sys import argv, exit
 from std.time import perf_counter_ns
 from std.os.path import dirname, isdir
-from omxcore import (Catalog, PlannerOptions, GROUP_AUTO, GROUP_DENSE, GROUP_HASHED, BUILD_LEFT, BUILD_RIGHT, sql, SqlResult, Table, SharedTable, read_csv, CsvOptions,
+from omxcore import (Catalog, PlannerOptions, CPU, GPU, GROUP_AUTO, GROUP_DENSE, GROUP_HASHED, BUILD_LEFT, BUILD_RIGHT, sql, SqlResult, Table, SharedTable, read_csv, CsvOptions,
                      read_parquet, scan_parquet, write_parquet, sql_to_parquet, ZSTD, parse_query, query_files, TEXT, INT, DECIMAL, DATE, BOOL, FLOAT)
 from omxcore.output import (json_string, columns_json, rows_json, rows_json_one, row_jsonl, csv_header, csv_row, cell_json, kind_text)
 from omxcore.parquet import physical_memory, DEFAULT_ROW_GROUP
@@ -17,7 +17,7 @@ from omxcore.parquet import physical_memory, DEFAULT_ROW_GROUP
 comptime USAGE = ("usage: mx sql \"<SQL>\" [-t name=path ...] [-f query.sql] [--format json|jsonl|csv|parquet] [--out file] [--max-rows N] [--device cpu|gpu|auto]\n"
                   "       mx explain [--analyze] \"<SQL>\" [-t name=path ...] [--format text|json]\n"
                   "       mx schema <file> [--rows N]\n"
-                  "advanced: --group auto|dense|hashed  --dense-limit N  --threads N  --stream auto|always|never (Parquet: stream row groups; auto streams a file over a quarter of memory)  --memory BYTES (the memory auto compares with)  --join auto|materialize (a join with unique build keys is fused into the pipeline; materialize writes its rows first)  --order written|P,P,P (the order to join three or more tables in: the written one, or the tables' positions in FROM, 0 first; default: the planner's)  --build left|right (the side of each hash join the table is built on; default: the smaller)  --join-budget BYTES (the bytes of joined values a materialized join may take)  --sort-budget BYTES (the bytes of rows a sort holds in memory: past it ORDER BY sorts runs on disk and merges them; with --format parquet --out the merged rows go straight into the file)  --spill-dir DIR (where the runs go; default TMPDIR or /tmp)  --row-group-rows N (rows of each Parquet row group written)")
+                  "advanced: --group auto|dense|hashed  --dense-limit N  --threads N  --stream auto|always|never (Parquet: stream row groups; auto streams a file over a quarter of memory)  --memory BYTES (the memory auto compares with)  --join auto|materialize (a join with unique build keys is fused into the pipeline; materialize writes its rows first)  --order written|P,P,P (the order to join three or more tables in: the written one, or the tables' positions in FROM, 0 first; default: the planner's)  --build left|right (the side of each hash join the table is built on; default: the smaller)  --join-budget BYTES (the bytes of joined values a materialized join may take)  --sort-budget BYTES (the bytes of rows a sort holds in memory: past it ORDER BY sorts runs on disk and merges them; with --format parquet --out the merged rows go straight into the file)  --spill-dir DIR (where the runs go; default TMPDIR or /tmp)  --gpu-min-rows N (the rows --device auto needs to use the GPU; default 1000000)  --row-group-rows N (rows of each Parquet row group written)")
 
 
 # ── errors ───────────────────────────────────────────────────────────────────────────────────────────
@@ -84,6 +84,7 @@ struct Args(Movable):
     var build: String
     var join_budget: Int
     var sort_budget: Int
+    var gpu_min_rows: Int
     var sort_run_rows: Int
     var spill_dir: String
     var row_group_rows: Int
@@ -108,6 +109,7 @@ struct Args(Movable):
         self.build = "auto"
         self.join_budget = 0
         self.sort_budget = 0
+        self.gpu_min_rows = -1
         self.sort_run_rows = 0
         self.spill_dir = String()
         self.row_group_rows = 0
@@ -135,7 +137,7 @@ def parse_args(first: Int) raises -> Args:
     while i < len(all):
         var arg = String(all[i])
         var takes = arg == "-t" or arg == "--table" or arg == "--format" or arg == "--out" or arg == "--max-rows" or arg == "--device" or \
-                    arg == "--group" or arg == "--dense-limit" or arg == "--threads" or arg == "--stream" or arg == "--join" or arg == "--order" or arg == "--build" or arg == "--join-budget" or arg == "--sort-budget" or arg == "--sort-run-rows" or arg == "--spill-dir" or arg == "--row-group-rows" or arg == "--memory" or arg == "--rows" or arg == "-f" or arg == "--file"
+                    arg == "--group" or arg == "--dense-limit" or arg == "--threads" or arg == "--stream" or arg == "--join" or arg == "--order" or arg == "--build" or arg == "--join-budget" or arg == "--sort-budget" or arg == "--gpu-min-rows" or arg == "--sort-run-rows" or arg == "--spill-dir" or arg == "--row-group-rows" or arg == "--memory" or arg == "--rows" or arg == "-f" or arg == "--file"
         if takes:
             if i + 1 >= len(all):
                 _ = usage_error(arg + " needs a value")
@@ -173,6 +175,8 @@ def parse_args(first: Int) raises -> Args:
                 a.build = v
             elif arg == "--sort-budget":
                 a.sort_budget = parse_int("--sort-budget", v)
+            elif arg == "--gpu-min-rows":
+                a.gpu_min_rows = parse_int("--gpu-min-rows", v)
             elif arg == "--sort-run-rows":
                 a.sort_run_rows = parse_int("--sort-run-rows", v)
             elif arg == "--spill-dir":
@@ -273,6 +277,12 @@ def options_of(args: Args) raises -> PlannerOptions:
         o.build_side = BUILD_RIGHT
     o.join_budget = args.join_budget
     o.sort_budget = args.sort_budget
+    if args.device == "cpu":
+        o.device = CPU
+    elif args.device == "gpu":
+        o.device = GPU
+    if args.gpu_min_rows >= 0:
+        o.gpu_min_rows = args.gpu_min_rows
     o.sort_run_rows = args.sort_run_rows
     o.spill_dir = args.spill_dir
     return o^
@@ -362,8 +372,6 @@ def cmd_sql(args: Args) raises:
     var text = query_text(args, "mx sql")
     var cat = Catalog()
     var notes = List[String]()
-    if args.device == "gpu":
-        notes.append("device: --device gpu asked for; SQL runs on the CPU in this version")
     var r = SqlResult()
     try:
         open_tables(cat, args, text, notes)
@@ -398,7 +406,7 @@ def cmd_sql(args: Args) raises:
         return
     var rows = rows_json(r.table, 0 if to_file else shown)
     print('{"columns":' + columns_json(r.table) + ',"rows":' + rows + ',"row_count":' + String(total) + ',"truncated":' +
-          ("true" if shown < total else "false") + ',"ms":' + String(r.ms) + ',"device":"cpu","notes":' + notes_json(notes) +
+          ("true" if shown < total else "false") + ',"ms":' + String(r.ms) + ',"device":"' + ("gpu" if r.device == GPU else "cpu") + '","notes":' + notes_json(notes) +
           (',"out":' + json_string(args.out) if to_file else "") + "}")
 
 
