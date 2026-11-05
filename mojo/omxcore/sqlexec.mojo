@@ -36,7 +36,7 @@ from .joincore import JoinKeys, JoinSide, KeyPlan, make_key_plan, column_ndv, no
 from .kernels.hashjoin_cpu import hj_build, JoinMap, PM_SEMI, PM_ANTI, PM_ANTI_NA, PM_NONE
 from .kargs import KernelRun
 from .winsql import plan_windows, finish_windows, point_wide_columns, fix_wide_columns, WIN_TABLE
-from .jfront import EXPAND_MAX_REP, FusedJoin, StageData, StreamStage, ProbeStream, chunk_join, stream_template, front_spec, jf_front
+from .jfront import EXPAND_MAX_REP, pred_reads_probe_only, FusedJoin, StageData, StreamStage, ProbeStream, chunk_join, stream_template, front_spec, jf_front
 from std.memory import ArcPointer
 from .rows import RowStage, prepare_rows, execute_rows, _Item
 from .sink import ResultSink                  # F-167
@@ -788,6 +788,8 @@ def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
         if fj:
             ch.override = fj.value()[].probe
     var delta_rows = len(lsrc.overlay.delta)
+    if fj and not ps and fj.value()[].pred_first and sp.p.pred_reg >= 0 and pred_reads_probe_only(sp.p, fj.value()[].n_probe_cols):
+        notes.append("probe filter first: the filter reads only the probe table's columns, so each block of 1,024 rows is filtered before the probe and only the rows that pass are probed")
     var t_run = perf_counter_ns()
     var ns_load = 0
     opts.job.stage(STAGE_AGGREGATE)
@@ -1202,13 +1204,18 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
     var right = _plain_side(catalog, q, 1, rneed)
     var lrows = 0
     var rrows = 0
+    var pf0 = False                                                  # F-161: side t's selective filter is left to the pipeline, which runs it before the probe
+    var pf1 = False
     if str0:
         lrows = catalog.sources[q.sources[0]].rows()                 # (its rows before the filter: the side is not read to count them)
     elif may0:
         lrows = _count_side[P](catalog, q, 0, planner, opts, trust)
-        if lrows * DEFER_PASS_DEN < catalog.sources[q.sources[0]].table.rows():      # a selective filter: writing the few rows that pass beats probing them all
-            may0 = False
-            left = _join_side[P](catalog, q, 0, lneed, planner, opts, trust)
+        if lrows * DEFER_PASS_DEN < catalog.sources[q.sources[0]].table.rows():      # a selective filter: writing the few rows that pass beats probing them all ...
+            if len(q.conj_x) == 0:
+                pf0 = True                                       # ... unless the pipeline runs the filter first and probes only those rows (F-161): nothing is written
+            else:
+                may0 = False
+                left = _join_side[P](catalog, q, 0, lneed, planner, opts, trust)
     else:
         left = _join_side[P](catalog, q, 0, lneed, planner, opts, trust)
         lrows = left.table.rows()
@@ -1217,8 +1224,11 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
     elif may1:
         rrows = _count_side[P](catalog, q, 1, planner, opts, trust)
         if rrows * DEFER_PASS_DEN < catalog.sources[q.sources[1]].table.rows():
-            may1 = False
-            right = _join_side[P](catalog, q, 1, rneed, planner, opts, trust)
+            if len(q.conj_x) == 0:
+                pf1 = True
+            else:
+                may1 = False
+                right = _join_side[P](catalog, q, 1, rneed, planner, opts, trust)
     else:
         right = _join_side[P](catalog, q, 1, rneed, planner, opts, trust)
         rrows = right.table.rows()
@@ -1400,7 +1410,9 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
         var pt = right.table if left_builds else left.table
         var bt = left.table if left_builds else right.table
         _prefill_ranges(cat2.sources[0], jq, pt, bt, vprobe, vreal)
-        var fj = ArcPointer(FusedJoin(pt, bt, vprobe^, vreal^, ArcPointer(m^), keys^, fmode))
+        var fjv = FusedJoin(pt, bt, vprobe^, vreal^, ArcPointer(m^), keys^, fmode)
+        fjv.pred_first = defer_probe >= 0 and (pf0 if defer_probe == 0 else pf1)          # F-161: the selective probe filter runs before the probe
+        var fj = ArcPointer(fjv^)
         if semi_anti:
             res.notes.append("join path: fused: " + commas(np) + " probe rows are " +
                              ("kept when their key is present in the build side" if kind == 2 else "dropped when their key is present in the build side" if kind == 3 else "kept when their key is absent from the list") +

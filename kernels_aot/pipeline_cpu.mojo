@@ -882,6 +882,7 @@ struct Prog(Copyable, Movable):
     var n_body: Int
     var n_aggs: Int
     var pred_reg: Int
+    var pred_first: Bool   # F-161 (header word 8): a fused run's predicate reads only the probe table's columns: it runs before the front stage, which probes the rows that pass
     var nl: Int      # partial lanes per (agg, group)
     var ovf: LP      # set to 1 by any integer sum (OP_AGG_ISUM) that passes int64; the caller's flag cell
 
@@ -905,6 +906,7 @@ struct Prog(Copyable, Movable):
         self.n_body = Int(code[4])
         self.n_aggs = Int(code[5])
         self.pred_reg = Int(code[6])
+        self.pred_first = Int(code[8]) != 0
         if not has_gids:
             self.nl = W
         elif n_groups <= LANE_GROUPS:       # a function of the group count alone: the order in which a
@@ -1342,6 +1344,7 @@ def morsel_rows(ws_arg: Int) -> Int:
     return MORSEL if rep <= 1 else max(MORSEL // rep, VEC)
 
 
+comptime FRONT_PRESEL = 1 << 41          # a front stage's `n` argument: `sel` already lists the rows to probe (the predicate ran first, Prog.pred_first); the count is in the low 32 bits
 comptime FRONT_MORE_SHIFT = 40           # a fused front stage's return value: the rows kept in the low 32 bits; above FRONT_MORE_SHIFT a bit says the block has
 comptime FRONT_COUNT_MASK = (1 << 32) - 1   # more rounds (the front is called again with the same arguments and puts out the next rows)
 
@@ -1366,6 +1369,7 @@ def _process_range[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
         var i0 = pos
         while i0 < stop:
             var n = min(VEC, stop - i0)
+            var first_round = True
             var more = True       # a front stage that expands a row to several partners (F-161) hands a block out in rounds: it sets the FRONT_MORE bit and is called again
             while more:
                 more = False
@@ -1373,12 +1377,25 @@ def _process_range[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
                 var use_sel = False
                 var bcols = cols
                 comptime if fused:
-                    nsel = front(k, i0, n, sel, ws)
+                    var pre = p.pred_first and p.pred_reg >= 0       # the predicate (probe columns only) runs on the whole block, the front stage probes the rows that pass
+                    if pre and not first_round:
+                        nsel = front(k, i0, n, sel, ws)               # (a later round of the same block: the rows are the front stage's own)
+                    elif pre:
+                        _run_ops(p, regs, cols, p.n_pro, p.n_pred, i0, sel, False, n)
+                        var pr0 = regs + p.pred_reg * VEC
+                        var kk0 = 0
+                        for i in range(n):
+                            sel[kk0] = Int32(i)
+                            kk0 += 1 if pr0[i] != 0.0 else 0
+                        nsel = front(k, i0, kk0 | FRONT_PRESEL, sel, ws) if kk0 > 0 else 0
+                    else:
+                        nsel = front(k, i0, n, sel, ws)
+                    first_round = False
                     more = (nsel >> FRONT_MORE_SHIFT) != 0
                     nsel = nsel & FRONT_COUNT_MASK
                     bcols = LP(unsafe_from_address=Int(ws))
                     use_sel = nsel < n
-                    if nsel > 0 and p.pred_reg >= 0:
+                    if nsel > 0 and p.pred_reg >= 0 and not pre:
                         _run_ops(p, regs, bcols, p.n_pro, p.n_pred, i0, sel, use_sel, nsel)
                         var pr = regs + p.pred_reg * VEC
                         var kk = 0

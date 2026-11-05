@@ -35,8 +35,16 @@ def data(tmp_path_factory):
     con.execute("create table bigc as select i as id, i % 9 as seg, ((i % 1000) * 0.5)::double as w from range(200000) r(i)")
     con.execute("create table bigo as select i as oid, (i * 7) % 3000 as cust, ((i % 977) * 0.1)::decimal(12,1) as price, i % 5 as pri from range(150000) r(i)")   # 50 orders per customer
     con.execute("create table bigo2 as select i as oid, (i * 7) % 70001 as cust, ((i % 977) * 0.1)::decimal(12,1) as price from range(120000) r(i)")                # 1 or 2 per customer
+    # a fact table of 300,000 rows (a probe side the engine counts first) and a dimension with unique keys, a small table with repeated keys
+    con.execute("""create table bigf as select i as fid, case when i % 97 = 0 then null else (i * 37) % 6000 end as k, i % 11 as g,
+        case when i % 50 = 0 then null else (i * 13) % 1000 end as x, date '2020-01-01' + (i % 400)::int as dt,
+        case when i % 9 = 8 then null else (['apple','Banana','cherry','date','elder','fig','grape','kiwi'])[1 + i % 8] end as s,
+        ((i % 700) * 0.01)::decimal(10,2) as m from range(300000) r(i)""")
+    con.execute("create table dimk as select i as k, 'name' || (i % 40) as name, (i % 17) as seg, (i * 0.5)::decimal(10,1) as w from range(5000) r(i)")
+    con.execute("create table repg as select i % 11 as g, i as rid, (i % 6) as v from range(2000) r(i)")                                         # 11 keys, about 180 rows each
+    con.execute("create table repg2 as select i % 11 as g, i as rid, (i % 6) as v from range(300) r(i)")                                         # 11 keys, about 27 rows each
     paths = {}
-    for t, rg in [("cust", 700), ("orders", 3000), ("skew", 2500), ("nothing", 100), ("bigc", 50000), ("bigo", 40000), ("bigo2", 40000)]:
+    for t, rg in [("cust", 700), ("orders", 3000), ("skew", 2500), ("nothing", 100), ("bigc", 50000), ("bigo", 40000), ("bigo2", 40000), ("bigf", 100000), ("dimk", 2000), ("repg", 500), ("repg2", 100)]:
         paths[t] = d / f"{t}.parquet"
         con.execute(f"copy {t} to '{paths[t]}' (format parquet, row_group_size {rg})")
     return {"con": con, "paths": paths}
@@ -142,3 +150,46 @@ MANY_GROUPS = [
 def test_many_groups_and_staged_morsels(mx, data, sql, group):
     res = q(mx, data, sql, ["bigc", "bigo", "bigo2"], extra=[*BUILD_RIGHT, "--group", group])
     assert "expanded to its partners" in note(res, "join path"), res["notes"]
+
+
+FIRST = "probe filter first"
+SELECTIVE = [
+    "SELECT d.name, count(*), sum(f.x), sum(f.m) FROM bigf f JOIN dimk d ON f.k = d.k WHERE f.x < 50 GROUP BY d.name",
+    "SELECT d.seg, f.g, count(*), min(f.dt), max(d.w) FROM bigf f JOIN dimk d ON f.k = d.k WHERE f.x < 50 AND f.g > 2 GROUP BY d.seg, f.g",
+    "SELECT count(*), sum(f.x) FROM bigf f JOIN dimk d ON f.k = d.k WHERE f.s LIKE 'ap%' AND f.dt > date '2020-06-01' AND f.x > 900",
+    "SELECT d.seg, count(*) FROM bigf f JOIN dimk d ON f.k = d.k WHERE f.x IS NULL OR f.x > 985 GROUP BY d.seg",
+    "SELECT count(*), count(d.k), sum(f.x) FROM bigf f LEFT JOIN dimk d ON f.k = d.k WHERE f.x < 40",
+    "SELECT f.g, count(*), sum(r.v), sum(f.x) FROM bigf f JOIN repg2 r ON f.g = r.g WHERE f.x < 20 GROUP BY f.g",
+    "SELECT count(*), sum(r.v) FROM bigf f LEFT JOIN repg2 r ON f.g = r.g WHERE f.x < 20 AND f.s = 'kiwi'",
+    "SELECT count(*), sum(f.x) FROM bigf f WHERE f.k IN (SELECT k FROM dimk WHERE seg < 5) AND f.x < 30",
+    "SELECT count(*), sum(f.x) FROM bigf f WHERE NOT EXISTS (SELECT 1 FROM dimk d WHERE d.k = f.k) AND f.x < 30",
+]
+
+
+@pytest.mark.parametrize("sql", SELECTIVE)
+def test_a_selective_probe_filter_runs_before_the_probe(mx, data, sql):
+    res = q(mx, data, sql, ["bigf", "dimk", "repg2"], extra=BUILD_RIGHT)
+    assert note(res, "join probe filter").endswith("no filtered copy of it is written"), res["notes"]
+    assert FIRST in " ".join(res["notes"]), res["notes"]
+    no_note(res, "join path: materialized")
+
+
+@pytest.mark.parametrize("threads", ["1", "3"])
+def test_probe_filter_first_with_other_thread_counts(mx, data, threads):
+    q(mx, data, SELECTIVE[0], ["bigf", "dimk"], extra=["--threads", threads])
+    q(mx, data, SELECTIVE[5], ["bigf", "repg2"], extra=["--threads", threads, *BUILD_RIGHT])
+
+
+def test_a_filter_that_most_rows_pass_keeps_the_filter_after_the_probe(mx, data):
+    res = q(mx, data, "SELECT d.name, count(*), sum(f.x) FROM bigf f JOIN dimk d ON f.k = d.k WHERE f.x < 900 GROUP BY d.name", ["bigf", "dimk"])
+    assert "join probe filter" in " ".join(res["notes"]), res["notes"]
+    assert FIRST not in " ".join(res["notes"]), res["notes"]
+
+
+def test_a_filter_across_both_tables_is_not_moved_before_the_probe(mx, data):
+    res = q(mx, data, "SELECT d.name, count(*) FROM bigf f JOIN dimk d ON f.k = d.k WHERE f.x < 50 AND f.x > d.seg GROUP BY d.name", ["bigf", "dimk"])
+    assert FIRST not in " ".join(res["notes"]), res["notes"]
+
+
+def test_forced_materialized_with_a_selective_filter(mx, data):
+    q(mx, data, SELECTIVE[0], ["bigf", "dimk"], extra=["--join", "materialize"])

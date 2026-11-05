@@ -1009,10 +1009,10 @@ def hj_probe_left_block(v: MapView, keys: LP, ok: BP, has_ok: Bool, i0: Int, sel
         i += g
 
 
-def hj_probe_block_rep(v: MapView, keys: LP, ok: BP, has_ok: Bool, i0: Int, n: Int, act: IP, st: IP, cnt: IP, left: Bool) -> Int:
-    """The fused form for a map whose keys repeat (F-161): for the block rows 0 .. n (row = i0 + j) look the key up. A row with partners becomes an entry
+def hj_probe_block_rep(v: MapView, keys: LP, ok: BP, has_ok: Bool, i0: Int, sel: IP, n: Int, act: IP, st: IP, cnt: IP, left: Bool) -> Int:
+    """The fused form for a map whose keys repeat (F-161): for the block rows `sel[0..n)` (row = i0 + sel[j]) look the key up. A row with partners becomes an entry
     of the active list: `act[e]` its block row, `st[e]` the offset of its first build row in the map's row array (`v.r`), `cnt[e]` how many. With `left`,
-    a row without a partner (or a usable key) is an entry with `cnt[e] = 0`. The entries are in block-row order. Returns how many entries."""
+    a row without a partner (or a usable key) is an entry with `cnt[e] = 0`. The entries are in `sel` order. Returns how many entries."""
     var eoff = LP(unsafe_from_address=v.eoff)
     var nact = 0
     var i = 0
@@ -1020,16 +1020,16 @@ def hj_probe_block_rep(v: MapView, keys: LP, ok: BP, has_ok: Bool, i0: Int, n: I
         var g = min(GROUP, n - i)
         if v.mode != MODE_EMPTY:
             for j in range(g):
-                if (not has_ok) or ok[i0 + i + j] != 0:
-                    _prefetch_key(v.mode, v.lo, v.hi, 0, False, v.u, v.s, v.ent, eoff, v.pbits, v.bitmap, keys[i0 + i + j])
+                if (not has_ok) or ok[i0 + Int(sel[i + j])] != 0:
+                    _prefetch_key(v.mode, v.lo, v.hi, 0, False, v.u, v.s, v.ent, eoff, v.pbits, v.bitmap, keys[i0 + Int(sel[i + j])])
         for j in range(g):
-            var row = i0 + i + j
+            var row = i0 + Int(sel[i + j])
             var start = 0
             var count = 0
             if (not has_ok) or ok[row] != 0:
                 _lookup(v.mode, False, v.lo, v.hi, v.u, v.s, v.ent, eoff, v.pbits, v.bitmap, keys[row], start, count)
             if count > 0 or left:
-                act[nact] = Int32(i + j)
+                act[nact] = sel[i + j]
                 st[nact] = Int32(start)
                 cnt[nact] = Int32(count)
                 nact += 1
