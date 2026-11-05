@@ -10,6 +10,7 @@ import math
 from fractions import Fraction
 
 import duckdb
+from conftest import oracle_connection
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -154,7 +155,7 @@ def make_hard_file(path, n=60_000):
 def hard(tmp_path_factory):
     path = tmp_path_factory.mktemp("spread-hard") / "hard.parquet"
     make_hard_file(path)
-    con = duckdb.connect()
+    con = oracle_connection()
     con.execute(f"create table t as select * from read_parquet('{path}')")
     return path, con
 
@@ -255,7 +256,7 @@ def test_nan_and_infinity_as_in_duckdb(probe, tmp_path):
     path = tmp_path / "n.parquet"
     pq.write_table(pa.table({"k": pa.array([1, 2, 3, 3], pa.int64()),
                              "f": pa.array([float("nan"), float("inf"), 2.0, 4.0], pa.float64())}), path)
-    con = duckdb.connect()
+    con = oracle_connection()
     con.execute(f"create table t as select * from read_parquet('{path}')")
     sql = "SELECT k, stddev(f), stddev_pop(f), variance(f), var_pop(f) FROM t WHERE k < 3 GROUP BY k"
     res = run_probe(probe, sql, {"t": path})
@@ -267,7 +268,7 @@ def test_nan_and_infinity_as_in_duckdb(probe, tmp_path):
         res = run_probe(probe, f"SELECT {fn}(f) FROM t", {"t": p}, expect_error=True)
         assert res["error"].startswith(f"{'stddev_samp' if fn == 'stddev' else fn} is out of range"), res
         with pytest.raises(duckdb.OutOfRangeException):
-            duckdb.connect().execute(f"select {fn}(f) from read_parquet('{p}')")
+            oracle_connection().execute(f"select {fn}(f) from read_parquet('{p}')")
 
 
 def test_1e15_plus_1_2_3_over_100k_rows_equals_exact_arithmetic(probe, tmp_path):

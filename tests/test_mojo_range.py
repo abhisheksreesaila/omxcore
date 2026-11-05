@@ -27,6 +27,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import duckdb
+from conftest import oracle_connection
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -89,7 +90,7 @@ def make_arrow(seed):
 
 
 def duck_over(path):
-    con = duckdb.connect()
+    con = oracle_connection()
     con.execute("set threads=1")
     con.execute(f"create table src as select row_number() over () - 1 as rid, * from read_parquet('{path}')")
     return con

@@ -14,6 +14,7 @@ import subprocess
 from pathlib import Path
 
 import duckdb
+from conftest import oracle_connection
 import pyarrow.parquet as pq
 import pytest
 
@@ -41,7 +42,7 @@ QUERIES = [
 
 def make_data(path_parquet, path_csv):
     rng = random.Random(167)
-    con = duckdb.connect()
+    con = oracle_connection()
     con.execute("create table t (id bigint, k1 int, txt varchar, f double, d decimal(9,2), dt date, b boolean)")
     specials = ["'nan'::double", "-0.0", "0.0", "'inf'::double", "'-inf'::double", "1.5", "-2.25"]
     rows = []
@@ -110,7 +111,7 @@ def test_csv_scan_equals_duckdb(env, run_rows):
     ]
     for sql, duck in queries:
         extra = ["--stream", "always", "--sort-run-rows", str(run_rows), "--spill-dir", str(env["spill"])]
-        con = duckdb.connect()
+        con = oracle_connection()
         con.execute(f"create view t as select * from read_csv('{env['csv']}', header=true, types={{'id': 'BIGINT', 'k1': 'INTEGER', 'txt': 'VARCHAR', 'd': 'DECIMAL(9,2)'}})")
         res = check(env["mx"], sql, con, files={"t": env["csv"]}, duck_sql=duck, ordered=True, extra=extra)
         assert spilled_runs(res) is not None, res["notes"]

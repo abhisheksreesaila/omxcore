@@ -1,6 +1,7 @@
 """F-091: lag / lead keep NULL as NULL, keep the input dtype, and fill with the default like DuckDB.
 Expected values come from DuckDB itself."""
 import duckdb
+from conftest import oracle_connection
 import pyarrow as pa
 import pytest
 
@@ -23,7 +24,7 @@ def _table():
 
 
 def _duck(t, sql):
-    con = duckdb.connect()
+    con = oracle_connection()
     con.register("t", t)
     return con.execute(f"SELECT {sql} AS r FROM t ORDER BY id").to_arrow_table().column("r")
 

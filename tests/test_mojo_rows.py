@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 import pytest
+from conftest import oracle_connection
 
 from mx_oracle import duck_kind, mx_binary, run_mx, typed_rows
 from test_mojo_sql import Dataset, data, probe, run_probe, got_rows, ROW_GROUPS, COLS  # noqa: F401  (fixtures)
@@ -352,7 +353,7 @@ def test_a_float_column_is_selected_ordered_and_distinct(mx, tmp_path):
     ids = list(range(len(vals)))
     path = tmp_path / "f.parquet"
     pq.write_table(pa.table({"id": ids, "f": pa.array(vals, pa.float64())}), path, row_group_size=900)
-    con = duckdb.connect(config={"threads": 1})   # F-198: one thread (see test_mojo_window.py)
+    con = oracle_connection()
     for sql, duck, keys in [
         ("SELECT * FROM t", None, None),
         ("SELECT f, id FROM t ORDER BY f, id", "SELECT f, id FROM t ORDER BY f NULLS LAST, id", [0, 1]),
