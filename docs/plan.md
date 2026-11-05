@@ -1674,12 +1674,14 @@ Needs: F-155, F-156 · Size: L
 - [x] scalar subqueries (empty → NULL; more than one row raises); correlated subqueries decorrelated into join + aggregate or EXISTS with extra conditions (Q2, Q17, Q20, Q21, Q22 shapes); unsupported forms raise by name
 - [x] UNION ALL (dictionaries merged); equal to DuckDB per form × empty inner × NULLs in the correlated column
 
-## F-160 M8 (core primitives) + plugin: named views and a versioned result cache; Explore mode built on them outside the core [todo]
+## F-160 M8 (core primitives) + plugin: named views and a versioned result cache; Explore mode built on them outside the core [done 2026-11-05, clean steps deferred]
 Needs: F-158, F-159 · Size: M · core: `catalog.view` and a result cache keyed by plan + input versions, generic for any app; omxplorer's Explore pipeline is glue in its own repo (or a plugin module), not core code
-- [ ] `catalog.view(name, sql | Query)`; steps read earlier steps by name; `catalog.preview(name, rows=100)` pushes LIMIT down
-- [ ] step cache keyed by canonical plan text + input versions (frame `edits`, file size and mtime, upstream keys); LRU by bytes; an upstream edit invalidates exactly the steps below it (tested by counting kernel runs)
+- [x] `catalog.view(name, sql | Query)`; steps read earlier steps by name; `catalog.preview(name, rows=100)` pushes LIMIT down
+- [x] step cache keyed by canonical plan text + input versions (frame `edits`, file size and mtime, upstream keys); LRU by bytes; an upstream edit invalidates exactly the steps below it (tested by counting kernel runs)
 - [ ] clean steps as SQL over dictionaries (no per-row work); `COPY (query) TO 'f.parquet'` through `ParquetWriter`
 
+- Built: `Catalog.view(name, sql | Query)`, `preview(cat, name, rows)` (LIMIT inside the view's query; engine reports "stopped early"), result cache keyed by canonical plan text + input versions (table identity, frame edits, file size+mtime, upstream keys; LRU by bytes, 256 MiB default, shared across catalog copies; wide results refused like `register_result`), `COPY (query) TO 'f.parquet' [(FORMAT, COMPRESSION, ROW_GROUP_SIZE)]`; SQL text writers moved to exprsql.mojo. Tests: mojo/tests/test_views.mojo, tests/test_mx_copy.py (15, vs DuckDB); TPC-H gate 22/22; mojo suite ok (GPU files skipped, shared GPUs). Not measured.
+- Review: round 1 NEEDS WORK (stale Query(frame) view, wide totals cached as int64, bytes, preview proof, concurrency test, ROW_GROUP_SIZE 0) → fixed; round 2 PASS bar the COPY oracles using bare duckdb.connect (fixed in main). Open, minor: two Frames over one base with equal edit counts share a key (as `add_frame` already does).
 ## F-161 M8: join speed: m:n inside the fused probe, radix-partitioned probe, runtime join filters [todo]
 Needs: F-155 · Size: L · engine-first; F-058's losses are joins
 - [ ] one-to-many expansion inside the front stage (no materialized pairs for aggregates over m:n joins), a LEFT join with repeated build keys included (F-154 review, bench154: customer LEFT JOIN orders GROUP BY nation runs 34 ms and the top-10 per customer 42 ms, both on the `materialized: 1,500,000 pairs (unmatched rows included)` path, vs DuckDB 13 and 28; every fused or presence-only case beats DuckDB)

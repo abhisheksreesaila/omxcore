@@ -1,10 +1,10 @@
 """F-160: `COPY (query) TO 'file.parquet'` through the real `mx sql`: the file holds the rows DuckDB gives for the query (kinds, scales and values), the answer is
 the one row `Count`, the options reach the writer (codec, row group size), and what it cannot write is refused by name.
 """
-import duckdb
 import pyarrow.parquet as pq
 import pytest
 
+from conftest import oracle_connection
 from mx_oracle import assert_equal, duck_kind, mx_binary, run_mx
 
 
@@ -16,7 +16,7 @@ def mx():
 @pytest.fixture(scope="module")
 def world(tmp_path_factory):
     d = tmp_path_factory.mktemp("copy")
-    con = duckdb.connect()
+    con = oracle_connection()
     con.execute("""create table t as select i::BIGINT as id,
         case when i % 11 = 0 then null else (i % 7)::BIGINT end as k,
         case when i % 13 = 0 then null else ((i * 37) % 50 - 10)::BIGINT end as v,
@@ -40,7 +40,7 @@ def copy_equals_duckdb(mx, world, name, query, extra_files=None, ordered=True, o
     cur = con.execute(query)
     want = cur.fetchall()
     assert res["columns"][0]["name"] == "Count" and res["rows"] == [[len(want)]], res
-    back = duckdb.connect()
+    back = oracle_connection()
     got_cur = back.execute(f"select * from read_parquet('{out}')")
     got = got_cur.fetchall()
     for a, b in zip(got_cur.description, cur.description):
@@ -65,7 +65,7 @@ def test_cte_join_and_a_file_named_in_from(mx, world):
     out = world["dir"] / "fromfile.parquet"
     res = run_mx(mx, ["sql", f"COPY (SELECT count(*) AS n, sum(v) AS sv FROM '{f}' WHERE id < 100) TO '{out}'"])
     assert res["rows"] == [[1]]
-    assert duckdb.connect().execute(f"select n, sv from read_parquet('{out}')").fetchall() == world["con"].execute("select count(*), sum(v) from t where id < 100").fetchall()
+    assert oracle_connection().execute(f"select n, sv from read_parquet('{out}')").fetchall() == world["con"].execute("select count(*), sum(v) from t where id < 100").fetchall()
 
 
 def test_parentheses_and_quotes_inside_the_query(mx, world):
@@ -86,7 +86,7 @@ def test_an_empty_result_writes_an_empty_file(mx, world):
     out = world["dir"] / "empty.parquet"
     res = run_mx(mx, ["sql", f"COPY (SELECT id, s FROM t WHERE id < 0) TO '{out}'"], {"t": world["t"]})
     assert res["rows"] == [[0]]
-    assert duckdb.connect().execute(f"select count(*) from read_parquet('{out}')").fetchall() == [(0,)]
+    assert oracle_connection().execute(f"select count(*) from read_parquet('{out}')").fetchall() == [(0,)]
 
 
 @pytest.mark.parametrize("sql,message", [
