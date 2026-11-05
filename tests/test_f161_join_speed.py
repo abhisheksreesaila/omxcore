@@ -263,3 +263,61 @@ def test_runtime_join_filter_with_other_thread_counts(mx, data, threads):
 def test_a_dense_direct_array_has_no_filter(mx, data):
     res = q(mx, data, "SELECT d.name, count(*) FROM bigf f JOIN dimk d ON f.k = d.k GROUP BY d.name", ["bigf", "dimk"])
     assert FILTER not in note(res, "join build side"), res["notes"]
+
+
+# ── random queries: every one equal to DuckDB, whichever path the engine takes ──────────────────────────────────────
+
+def _random_world(seed):
+    import random
+    rnd = random.Random(seed)
+    nl, nr = rnd.choice([3000, 9000, 70000]), rnd.choice([800, 2500, 20000])
+    keys = rnd.choice([5, 60, 900, 4000])
+    skew = rnd.random() < 0.3
+    if not skew:
+        nr = min(rnd.randint(2 * keys, 12 * keys), 40000)       # 2 to 12 rows of a key: repeated, under the expansion limit
+    con = oracle_connection()
+    kexpr = f"case when i % {rnd.choice([7, 23, 101])} = 0 then null else (i * {rnd.choice([3, 7, 13])}) % {keys} end"
+    con.execute(f"""create table lt as select i as id, {kexpr} as k, i % {rnd.choice([3, 11, 40])} as g,
+        case when i % 17 = 0 then null else (i * 31) % 500 end as x, ((i % 90) * 0.5)::decimal(8,1) as m,
+        case when i % 5 = 4 then null else (['a','bb','Ccc','dd'])[1 + i % 4] end as s, date '2020-01-01' + (i % 300)::int as d from range({nl}) r(i)""")
+    rk = f"case when i % 3 = 0 then 7 else (i * 11) % {keys} end" if skew else f"case when i % 19 = 0 then null else (i * 11) % {keys} end"
+    con.execute(f"""create table rt as select i as rid, {rk} as k, i % 6 as v, case when i % 13 = 0 then null else (i * 17) % 300 end as y,
+        ((i % 70) * 0.25)::decimal(8,2) as w, case when i % 4 = 3 then null else (['p','qq','r'])[1 + i % 3] end as t from range({nr}) r(i)""")
+    return rnd, con, skew
+
+
+def _random_query(rnd):
+    kind = rnd.choice(["JOIN", "LEFT JOIN"])
+    lf = rnd.choice(["", "WHERE l.x < 60", "WHERE l.x < 400 AND l.g > 0", "WHERE l.s LIKE '%c%'", "WHERE l.d > date '2020-09-01'", "WHERE l.x IS NULL OR l.m > 40"])
+    rf = rnd.choice(["", "AND r.y < 100", "AND r.t = 'qq'", "AND r.w > 5"]) if kind == "LEFT JOIN" else ""
+    rw = rnd.choice(["", "r.y < 100", "r.v > 2", "r.t IS NOT NULL"]) if kind == "JOIN" else ""
+    where = lf
+    if rw:
+        where = (where + " AND " if where else "WHERE ") + rw
+    aggs = rnd.sample(["count(*)", "count(r.rid)", "sum(l.x)", "sum(r.y)", "sum(l.m)", "sum(r.w)", "min(r.w)", "max(l.d)", "min(l.x)", "max(r.y)", "avg(l.m)", "count(l.s)", "sum(r.v * l.g)"], rnd.randint(1, 4))
+    group = rnd.choice(["", "l.g", "r.v", "l.g, r.v", "l.id", "r.t", "l.s, r.t"])
+    sel = (group + ", " if group else "") + ", ".join(aggs)
+    sql = f"SELECT {sel} FROM lt l {kind} rt r ON l.k = r.k {rf} {where}" + (f" GROUP BY {group}" if group else "")
+    return sql
+
+
+@pytest.mark.parametrize("seed", range(24))
+def test_random_aggregates_over_repeated_keys_equal_duckdb(mx, tmp_path, seed):
+    rnd, con, skew = _random_world(seed)
+    files = {}
+    for t in ("lt", "rt"):
+        files[t] = tmp_path / f"{t}.parquet"
+        con.execute(f"copy {t} to '{files[t]}' (format parquet, row_group_size {rnd.choice([1000, 8000])})")
+    paths = {"l": files["lt"], "r": files["rt"]}
+    expanded = 0
+    for _ in range(14):
+        sql = _random_query(rnd)
+        extra = list(rnd.choice([[], ["--build", "right"], ["--build", "left"], ["--threads", "1"], ["--threads", "3", "--build", "right"], ["--group", "hashed"], ["--join", "materialize"], ["--stream", "always"]]))
+        try:
+            res = check(mx, sql.replace(" lt l ", " l ").replace(" rt r ", " r "), con, files=paths, duck_sql=sql, extra=extra)
+        except AssertionError as e:
+            if skew and "memory budget" in str(e):      # a hot key (over the expansion limit) is materialized, and 100 million pairs pass the budget: refused readably, as before F-161
+                continue
+            raise
+        expanded += "expanded to its partners" in " ".join(res["notes"])
+    assert skew or expanded >= 1, "none of the 14 random queries took the expanding path: the generator no longer reaches it"
