@@ -1699,6 +1699,13 @@ Needs: F-155 · Size: L · engine-first; F-058's losses are joins
 
 - Review: PASS (round expansion counts each partner once, LEFT unmatched once, NULL keys, morsel bound, no weakened tests, kernel hashes match). Minor, open: the outer-join / join tests pick the expected path by SQL text (`"count(" in sql`); give the parametrization an explicit path field.
 
+## F-202 Multi-way joins at DuckDB speed: Q7, Q10, Q5, Q3, Q8, Q12, Q13, Q2 (continues F-161; track B of the join-speed work)
+Needs: F-161 · Size: L · engine-first; baseline docs/bench/2026-11-05-gate.md (SF10 cpu, ms omxcore vs DuckDB: Q7 1644 vs 110, Q10 1756 vs 284, Q5 551 vs 79, Q3 327 vs 101, Q8 305 vs 86, Q12 343 vs 94, Q13 1399 vs 479, Q2 138 vs 30)
+- [ ] each of the eight queries equal to DuckDB at SF1 and SF10 (tests/test_mx_tpch_gate.py 22 of 22) and faster after than before, with the causes found by `mx sql` EXPLAIN / notes, not guessed
+- [ ] every fix is general: the shapes it covers are tested on non-TPC-H SQL (random / shuffled worlds, NULL keys, empty sides, duplicate keys, LEFT joins) equal to DuckDB (tests/test_mx_random_gate.py, test_f161_join_speed.py, test_f158_streamed_join.py, the join files)
+- [ ] a scoreboard run (`gate_scoreboard.py --sf 1,10 --devices cpu --repeats 3 --random 0 --queries 2,3,5,7,8,10,12,13`) before and after each fix, with the load noted; results in the ticket
+- Boundary: track A (subqueries to semi / anti joins: Q18, Q21, Q22, Q20, Q17, Q4; subq.mojo) is another developer's; edits here stay in multi-way planning and execution.
+
 ## F-199 `mojo/tests/test_views.mojo` segfaults about 3 runs in 150 (String._add in a job thread) [done 2026-11-05] (found 2026-11-05 by the F-161 developer, on main after F-160)
 - [x] find the race (F-160's shared view cache behind a spin lock, `two_jobs_share_the_cache`, or the job thread's string notes) and fix the cause; test_views passes 300 runs in a row
 - Built: `ResultCache`'s entries and counters were plain fields changed through `mut self` by two job threads under a spin lock; the compiler may keep them in registers across the lock (a no-SQL repro crashed ~6%). The guarded state now lives in a heap block reached through a pointer taken after the lock (as job.mojo / fan.mojo do); lessons line. Test `two_jobs_share_the_cache_round_after_round` (400 rounds: old engine fails 54/60, new 0); 300 serial + 12x100 parallel runs, 0 crashes.
