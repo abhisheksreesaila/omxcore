@@ -2890,9 +2890,8 @@ struct ParquetScan(Copyable, Movable):
         """Builds TEXT column `c`'s file-wide dictionary (once)."""
         if self.schema.kind(c) != TEXT or self.dictionary_loaded(c):
             return
-        ref info = self._info[]
         # F-175: a background job and its caller may ask for the same dictionary at once: one builds it, the other waits for it
-        var lock = Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=Int(info.build_lock.unsafe_ptr()))
+        var lock = Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=Int(self._info[].build_lock.unsafe_ptr()))
         while True:
             var free = Int64(0)
             if Atomic[Scalar[DType.int64]].compare_exchange(lock, free, 1):
@@ -2900,6 +2899,9 @@ struct ParquetScan(Copyable, Movable):
             comptime if THREADS:
                 _ = external_call["sched_yield", Int32]()      # the other thread is building: give it the core
         try:
+            # F-200: the state the lock guards (`dicts`, `widx`) is reached through a pointer made after the lock is taken, not through a
+            # `ref` the compiler may treat as nobody else's (the F-199 lesson, as in viewcache.mojo / job.mojo)
+            ref info = Pointer[_ScanInfo, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=self._info[])))[]
             if Atomic[Scalar[DType.int64]].load(Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=Int(info.loaded.unsafe_ptr())) + c) == 0:
                 info.check_unchanged()
                 info.widx[c].col = Int(info.dicts.cols.unsafe_ptr() + c)
