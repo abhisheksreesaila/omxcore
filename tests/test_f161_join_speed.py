@@ -43,9 +43,13 @@ def data(tmp_path_factory):
     con.execute("create table dimk as select i as k, 'name' || (i % 40) as name, (i % 17) as seg, (i * 0.5)::decimal(10,1) as w from range(5000) r(i)")
     con.execute("create table repg as select i % 11 as g, i as rid, (i % 6) as v from range(2000) r(i)")                                         # 11 keys, about 180 rows each
     con.execute("create table repg2 as select i % 11 as g, i as rid, (i % 6) as v from range(300) r(i)")                                         # 11 keys, about 27 rows each
+    # sparse keys: a direct array (a range of at most 8 values a key, past 2^20) of which 1 value in 6 or 8 is present (the runtime join filter's case)
+    con.execute("create table probes as select i as pid, case when i % 89 = 0 then null else (i * 7919) % 1200000 end as k, i % 13 as g, (i % 1000) as x from range(300000) r(i)")
+    con.execute("create table sparse as select (i * 6)::bigint as k, 'n' || (i % 30) as name, (i % 7) as seg, (i * 0.25)::decimal(10,2) as w from range(200000) r(i)")
+    con.execute("create table sparse_rep as select ((i % 70000) * 16)::bigint as k, i as rid, (i % 5) as v from range(140000) r(i)")
     con.execute("create table smallg as select i as g, 'grp' || (i % 4) as gname from range(11) r(i)")
     paths = {}
-    for t, rg in [("cust", 700), ("orders", 3000), ("skew", 2500), ("nothing", 100), ("bigc", 50000), ("bigo", 40000), ("bigo2", 40000), ("bigf", 100000), ("dimk", 2000), ("repg", 500), ("repg2", 100), ("smallg", 100)]:
+    for t, rg in [("cust", 700), ("orders", 3000), ("skew", 2500), ("nothing", 100), ("bigc", 50000), ("bigo", 40000), ("bigo2", 40000), ("bigf", 100000), ("dimk", 2000), ("repg", 500), ("repg2", 100), ("smallg", 100), ("probes", 100000), ("sparse", 4000), ("sparse_rep", 4000)]:
         paths[t] = d / f"{t}.parquet"
         con.execute(f"copy {t} to '{paths[t]}' (format parquet, row_group_size {rg})")
     return {"con": con, "paths": paths}
@@ -227,3 +231,35 @@ def test_tpch_q12_and_q14_expand_in_the_front_stage():
         out = run_mx(mx, ["sql", "--max-rows", "0", qs[n]], files)
         joined = " ".join(out["notes"])
         assert "expanded to its partners" in joined and "join path: materialized" not in joined, out["notes"]
+
+
+FILTER = "runtime join filter"
+SPARSE = [
+    ("SELECT s.name, count(*), sum(p.x), sum(s.w) FROM probes p JOIN sparse s ON p.k = s.k GROUP BY s.name", "join path: fused"),
+    ("SELECT count(*), sum(p.x) FROM probes p JOIN sparse s ON p.k = s.k WHERE p.g < 6", "join path: fused"),
+    ("SELECT s.seg, count(*), count(p.pid), sum(p.x) FROM sparse s LEFT JOIN probes p ON s.k = p.k GROUP BY s.seg", "join path: fused"),
+    ("SELECT r.v, count(*), sum(p.x) FROM probes p JOIN sparse_rep r ON p.k = r.k GROUP BY r.v", "join path: fused"),
+    ("SELECT r.v, count(*), count(p.pid) FROM sparse_rep r LEFT JOIN probes p ON r.k = p.k GROUP BY r.v", "join path: fused"),
+    ("SELECT p.pid, s.name FROM probes p JOIN sparse s ON p.k = s.k WHERE p.pid < 100000", "join path: fused"),
+    ("SELECT p.pid, r.rid FROM probes p JOIN sparse_rep r ON p.k = r.k WHERE p.pid < 100000", "join path: materialized"),
+    ("SELECT count(*), sum(p.x) FROM probes p WHERE p.k IN (SELECT k FROM sparse)", "join path: fused"),
+]
+
+
+@pytest.mark.parametrize("sql,path", SPARSE)
+def test_a_sparse_direct_array_has_a_runtime_join_filter(mx, data, sql, path):
+    res = q(mx, data, sql, ["probes", "sparse", "sparse_rep"], extra=BUILD_RIGHT)
+    assert note(res, "join path").startswith(path), res["notes"]
+    if "IN (SELECT" not in sql:                                     # (a semi join builds presence marks only: no filter bitmap)
+        assert FILTER in note(res, "join build side"), res["notes"]
+
+
+@pytest.mark.parametrize("threads", ["1", "3"])
+def test_runtime_join_filter_with_other_thread_counts(mx, data, threads):
+    q(mx, data, SPARSE[0][0], ["probes", "sparse"], extra=["--threads", threads])
+    q(mx, data, SPARSE[3][0], ["probes", "sparse_rep"], extra=["--threads", threads])
+
+
+def test_a_dense_direct_array_has_no_filter(mx, data):
+    res = q(mx, data, "SELECT d.name, count(*) FROM bigf f JOIN dimk d ON f.k = d.k GROUP BY d.name", ["bigf", "dimk"])
+    assert FILTER not in note(res, "join build side"), res["notes"]
