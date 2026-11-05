@@ -3,6 +3,7 @@ partition, NULL its own partition, +-inf their own). Expected values come from D
 import struct
 
 import duckdb
+from conftest import oracle_connection
 import pyarrow as pa
 import pytest
 
@@ -23,7 +24,7 @@ def _table(keys, key_type=pa.float64(), k2=None, v=None):
 
 
 def _duck(t, select):
-    con = duckdb.connect()
+    con = oracle_connection()
     con.register("t", t)
     return con.execute(f"SELECT {select} AS r FROM t ORDER BY id").fetch_arrow_table().column("r").to_pylist()
 

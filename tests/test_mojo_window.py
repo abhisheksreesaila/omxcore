@@ -12,6 +12,7 @@ import math
 from collections import Counter
 
 import pytest
+from conftest import oracle_connection
 
 from mx_oracle import duck_kind, run_mx, typed_rows
 from test_mojo_sql import Dataset, data, probe, run_probe, got_rows  # noqa: F401  (fixtures)
@@ -196,6 +197,19 @@ def test_a_million_rows_in_a_million_partitions_and_in_one(mx, probe, data, mode
     check(mode, data["g1m"], mx, probe, q[1])
 
 
+@pytest.mark.parametrize("mode", ["table", "frame"])
+def test_the_oracle_runs_on_one_thread(data, mode):
+    """F-198: a DuckDB 1.5.1 connection with threads > 1 stalled for good inside `execute()` (the main thread spinning in
+    `StreamQueryResult::WaitForTask` while every worker slept) on a 1.2M-row `rank() OVER (ORDER BY x DESC NULLS FIRST)` on a loaded
+    machine; four of four processes stalled in round two. Oracles connect through `conftest.oracle_connection`, one thread."""
+    assert data["g10k"].oracle(mode).execute("select current_setting('threads')").fetchone() == (1,)
+
+
+def test_the_oracle_helper_gives_one_thread_and_keeps_other_settings():
+    con = oracle_connection(config={"memory_limit": "1GB"})
+    assert con.execute("select current_setting('threads'), current_setting('memory_limit')").fetchone() == (1, "953.6 MiB")
+
+
 def test_threads_do_not_change_a_window_result(mx, data):
     """1 thread and 8 threads give the same rows, bit for bit (a FLOAT sum included)."""
     ds = data["g10k"]
@@ -291,7 +305,7 @@ def specials(tmp_path_factory):
     """3,000 rows of DOUBLEs with NaN, inf, -inf, -0.0, 0.0 and NULL among ordinary values, in 12 groups."""
     import duckdb
     d = tmp_path_factory.mktemp("specials")
-    con = duckdb.connect()
+    con = oracle_connection()
     con.execute("set threads=1")
     con.execute("select setseed(0.5)")
     con.execute("""create table t as select i::BIGINT as id, (i % 12)::BIGINT as g,
@@ -341,7 +355,7 @@ FUZZ_QUERIES = 30
 def _fuzz_table(directory, seed):
     import duckdb
     path = directory / f"fuzz{seed}.parquet"
-    con = duckdb.connect()
+    con = oracle_connection()
     con.execute("set threads=1")
     con.execute(f"select setseed({seed / 100})")
     con.execute(f"""create table t as select i::bigint id,

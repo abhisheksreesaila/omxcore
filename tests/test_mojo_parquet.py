@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 import duckdb
+from conftest import oracle_connection
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -60,7 +61,7 @@ def test_pyarrow_and_duckdb_read_what_mojo_wrote(writer, tmp_path, codec, n, gro
             assert int(g["revenue"].scaleb(2)) == w["revenue"]          # the exact scaled integer
         assert (g["day"] - __import__("datetime").date(1970, 1, 1)).days == w["day"]
     assert len(got) == n
-    con = duckdb.connect()
+    con = oracle_connection()
     s = con.execute(f"SELECT count(*), sum(qty), count(revenue), count(region), sum(CASE WHEN paid THEN 1 ELSE 0 END) "
                     f"FROM read_parquet('{path}')").fetchone()
     assert s[0] == n
@@ -169,7 +170,7 @@ def test_mojo_reads_what_pyarrow_wrote(dumper, tmp_path, opts):
 def test_mojo_reads_what_duckdb_wrote(dumper, tmp_path):
     t = sample(3000, seed=9)
     path = tmp_path / "d.parquet"
-    con = duckdb.connect()
+    con = oracle_connection()
     con.register("t", t)
     con.execute(f"COPY t TO '{path}' (FORMAT parquet)")
     back = pq.read_table(path)            # DuckDB's own types for the same values (its timestamps, decimals)
@@ -556,7 +557,7 @@ def test_all_null_text_without_words_in_row_groups_of_8(edge_writer, tmp_path):
     assert t.column("id").to_pylist() == list(range(13))
     assert t.column("name").to_pylist() == [None] * 13
     assert t.schema.field("name").type == pa.string()
-    con = duckdb.connect()
+    con = oracle_connection()
     assert con.execute(f"SELECT count(*), count(name) FROM read_parquet('{path}')").fetchone() == (13, 0)
 
 
@@ -647,7 +648,7 @@ def check_against_duckdb(path, res, query):
     words = res["words"].split("|")
     cents = "CAST(revenue * 100 AS BIGINT)"
     day = "(CAST(day AS DATE) - DATE '1970-01-01')"
-    con = duckdb.connect()
+    con = oracle_connection()
     src = f"read_parquet('{path}')"
     if query == "by_region":
         rows = con.execute(f"SELECT region, sum({cents}), count(*), count(revenue), min(cost), max(cost), min({cents}), max({cents}) "
@@ -731,7 +732,7 @@ def test_streamed_query_equals_read_parquet_on_duckdb_files(prober, tmp_path, co
     src = tmp_path / "src.parquet"
     pq.write_table(scan_table(), src)
     path = tmp_path / "t.parquet"
-    duckdb.connect().execute(f"COPY (SELECT * FROM read_parquet('{src}')) TO '{path}' "
+    oracle_connection().execute(f"COPY (SELECT * FROM read_parquet('{src}')) TO '{path}' "
                              f"(FORMAT parquet, ROW_GROUP_SIZE {SCAN_GROUP}, COMPRESSION {'uncompressed' if codec == 'none' else codec})")
     assert pq.read_metadata(path).num_row_groups == 9
     for q in SCAN_QUERIES:
@@ -1331,7 +1332,7 @@ def test_an_edited_streamed_file_equals_an_outside_replay_and_its_memory_stays_b
     assert saved.num_rows == len(cost_all)
     assert np.array_equal(saved.column("cost").to_numpy(), cost_all)
     assert json.loads(saved.schema.metadata[b"omx"]) == {"edited": True}
-    con = duckdb.connect()
+    con = oracle_connection()
     rows_db = con.execute(f"SELECT region, sum(cost), count(*) FROM read_parquet('{out}') GROUP BY region").fetchall()
     assert {r: (int(s), n) for r, s, n in rows_db} == want
     assert saved.column("region").to_pylist()[-50:] == ["Appended"] * 50

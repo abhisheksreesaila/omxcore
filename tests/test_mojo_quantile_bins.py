@@ -14,6 +14,7 @@ import math
 from decimal import Decimal
 
 import duckdb
+from conftest import oracle_connection
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -122,7 +123,7 @@ def test_distinct_values_and_an_n_that_divides_the_rows_are_ntile(probe, tmp_pat
     path = tmp_path / "distinct.parquet"
     values = [(i * 7919) % 1000 for i in range(1000)]               # a permutation of 0 .. 999
     pq.write_table(pa.table({"x": pa.array(values, pa.int64())}), path)
-    con = duckdb.connect()
+    con = oracle_connection()
     con.execute(f"create table t as select * from read_parquet('{path}')")
     for n in (2, 4, 8, 10, 20):
         res = run_probe(probe, f"SELECT x, quantile_bin(x, {n}) FROM t GROUP BY x, quantile_bin(x, {n})", {"t": path})
@@ -157,7 +158,7 @@ def test_float_columns_with_nan_and_negative_zero(probe, tmp_path):
     path = tmp_path / "floats.parquet"
     vals = [float(i % 37) * 0.25 - 3.0 for i in range(500)] + [float("nan")] * 30 + [0.0, -0.0] * 5 + [None] * 12
     pq.write_table(pa.table({"f": pa.array(vals, pa.float64()), "v": pa.array(list(range(len(vals))), pa.int64())}), path)
-    con = duckdb.connect()
+    con = oracle_connection()
     con.execute(f"create table t as select * from read_parquet('{path}')")
     for n in (3, 10):
         edges = edges_by_the_rule(con, "f", "TRUE", n)

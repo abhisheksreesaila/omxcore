@@ -26,6 +26,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import duckdb
+from conftest import oracle_connection
 import pyarrow.parquet as pq
 import pytest
 
@@ -198,20 +199,18 @@ class Dataset:
         self.path = directory / f"{name}.parquet"
         self.edits_path = directory / f"{name}.edits"
         group_rows = -(-n // ROW_GROUPS)
-        con = duckdb.connect()
+        con = oracle_connection()
         make_source(con, n, groups, seed)
         table = con.execute("select * exclude (rid) from src order by rid").to_arrow_table()
         pq.write_table(table, self.path, row_group_size=group_rows)
         self.nostats = directory / f"{name}.nostats.parquet"
         pq.write_table(table, self.nostats, row_group_size=group_rows, write_statistics=False)
-        self.table = duckdb.connect()
+        self.table = oracle_connection()
         self.table.execute(f"create table t as select * from read_parquet('{self.path}')")
-        self.table.execute("set threads=4")
-        self.edited = duckdb.connect()
+        self.edited = oracle_connection()
         self.edited.execute(f"create table src as select row_number() over () - 1 as rid, * from read_parquet('{self.path}')")
         self.edits_path.write_text(make_edits(self.edited, n, groups, seed + 1))
         self.edited.execute("create view t as select * exclude (rid) from src")
-        self.edited.execute("set threads=4")
 
     def oracle(self, mode):
         return self.edited if mode in ("frame", "framescan") else self.table
@@ -765,7 +764,7 @@ def lying(tmp_path_factory):
     (d / "lie_both.parquet").write_bytes(bytes(raw[:start]) + bytes(nulls) + bytes(raw[-8:]))
     m = pq.ParquetFile(d / "lie_both.parquet").metadata
     assert m.row_group(3).column(2).statistics.null_count == 0 and m.row_group(3).column(0).statistics.max == 9
-    return {"honest": honest, "lie_max": d / "lie_max.parquet", "lie_both": d / "lie_both.parquet", "con": duckdb.connect()}
+    return {"honest": honest, "lie_max": d / "lie_max.parquet", "lie_both": d / "lie_both.parquet", "con": oracle_connection()}
 
 
 LIES = [      # (the query, whether `lie_max` makes it run again, whether `lie_both` does)

@@ -759,6 +759,30 @@ correlated subquery in one condition; `*` in a query with a correlated subquery 
 `EXPLAIN` of a compound query **runs the steps before the last statement** (their columns are what the last one is planned from) and shows them, then the last statement's plan; `EXPLAIN ANALYZE` adds its actuals.
 **Costs**: every step's result is a materialized table (a derived table or CTE of N rows costs N rows of memory until the query ends); `D` is built from the whole inner side (no semi-join reduction by the outer keys).
 
+### Named views, previews, the result cache and COPY (F-160, `viewcache.mojo`, `viewkey.mojo`, `sqlquery.mojo`)
+
+Generic primitives any app builds a step pipeline on (omxplorer's Explore mode is glue over them, in its own repo; the core knows no app concept).
+
+```mojo
+cat.view("big", "SELECT region, qty FROM orders WHERE qty >= 5")            # a view from SQL text
+cat.view("totals", "SELECT region, sum(qty) AS q FROM big GROUP BY region")   # reads the view before it, by name
+cat.view("kept", Query(orders).where(col("qty") > lit(2)))                   # a view from a Query: its table, Frame (edits) or scan, its wheres and windows
+var r = sql(cat, "SELECT region, q FROM totals ORDER BY q DESC")              # a view is read like a table, anywhere in FROM
+var p = preview(cat, "totals", 100)                                           # the first 100 rows of one step; SqlResult, notes say "preview totals: LIMIT 100 pushed ..."
+cat.view_runs(); cat.view_hits(); cat.set_cache_budget(64 << 20); cat.clear_cache()
+var w = sql(cat, "COPY (SELECT region, q FROM totals ORDER BY q) TO 'out.parquet' (FORMAT PARQUET, COMPRESSION snappy, ROW_GROUP_SIZE 64)")   # w.table: one row, Count
+```
+
+| Piece | What it does |
+|---|---|
+| `Catalog.view(name, Query)` | a view made from a builder `Query` (generic over `ViewSource`, which `Query` implements). The Query's data joins the catalog under an internal name (`__src0`, ...); the view is `SELECT * [, window functions] FROM it [WHERE ...]`. A `group_by` / aggregate Query raises (write it as SQL) |
+| `preview(cat, name, rows=100)` | runs the view's query with the LIMIT inside it (`... LIMIT n`; a view that has its own LIMIT / OFFSET is wrapped as `SELECT * FROM (...) LIMIT n`): a scan stops early, a sort keeps a top-N. The views it reads come from the cache. Not kept itself and not counted in `view_runs`. Mojo has no extension methods, so it is a function, not `cat.preview` |
+| result cache | a view read finds its result under a key: its canonical plan text (tokens, so spacing and comments do not matter) + the version of every input it names: a table's identity, a Frame's edit counter at `add_frame`, a Parquet scan's file size and mtime, a file named in the text (size, mtime), and the key of every view upstream. Same key, same answer, nothing runs (`step: view v: read from the cache (N rows)`). An edit (`add_frame` again) changes the keys of the views that read the frame, and of the views below them, and of no other: exactly those run again. Tested by counting runs (`view_runs()`), not time |
+| bounds | by bytes (8 bytes + a validity byte a value, plus dictionary words), 256 MiB by default, least recently used first; a result larger than the whole budget is not kept; `set_cache_budget(0)` turns it off. A catalog and its copies (a query's working copy, a job's) share one cache, behind a spin lock held only while the lists change. The entry holds the tables its key names by address, so a dead table's address is never reused under a live key |
+| `COPY (query) TO 'f.parquet' [(FORMAT PARQUET, COMPRESSION zstd\|snappy\|uncompressed, ROW_GROUP_SIZE n)]` | `sql_to_parquet` for the query (an ORDER BY bigger than the sort budget streams into the file; atomic rename). The answer is one row, `Count`. Parquet only: another FORMAT, or a file name not ending `.parquet`, raises by name; the folder must exist. Works in `mx sql` (the files named inside the query are opened as for any query) |
+
+**Limits.** The key finds names by reading tokens, so a column named like a source adds that source as an input (a result recomputed, never a stale one). A frame's version is its `edits` at the time it was added to the catalog: the catalog has to be given the edited frame again (`add_frame`), as it always did. Keys are rebuilt per read (a lex of the view text and of the views above it): linear in the chain, exponential only in a chain where every view reads two earlier ones that each read two. Not done: Explore's clean steps as SQL over dictionaries (a column-level rewrite, per-word not per-row, is its own ticket).
+
 ### The `mx` command line (F-151, for agents)
 
 `mx` is the SQL of section 8 as one native program, built by `pixi run bash scripts/build_mx.sh` into `build/mx` (no Python in it; the script checks that). A cold `mx sql` on a small

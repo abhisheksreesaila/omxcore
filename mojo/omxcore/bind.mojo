@@ -22,6 +22,8 @@ from .sqlfn import (TFn, CaseTables, parse_text, ascii_case, tf_kind, char_count
                     DP_DAY, DP_EPOCH, TF_LOWER, TF_UPPER, TF_TRIM, TF_SUBSTR, TF_LENGTH, TF_STARTS, TF_ENDS, TF_CONTAINS, TF_LIKE, TF_STRPOS, TF_LEFT, TF_RIGHT,
                     TF_REVERSE, TF_REPLACE)
 from .frame import _text_less
+from .viewcache import ResultCache
+from std.memory import ArcPointer
 
 comptime K_NULL = 6          # the type of a bare NULL literal
 
@@ -72,17 +74,29 @@ struct SqlSource(Copyable, Movable):
         return self.table.rows()
 
 
+trait ViewSource:
+    """F-160: something a catalog view can be made from besides SQL text (`Query` is one): the SQL over a source called `source`, and that source."""
+
+    def view_sql(self, source: String) raises -> String:
+        ...
+
+    def view_source(self, name: String) -> SqlSource:
+        ...
+
+
 struct Catalog(Movable):
     """The named sources a query may read. `add_table`, `add_frame` and `add_scan` register one under a name
     (case does not matter); a frame is snapshotted when added: add it again after more edits."""
     var sources: List[SqlSource]
     var view_names: List[String]     # F-159: named views, see `view`
     var view_sql: List[String]
+    var cache: ArcPointer[ResultCache]   # F-160: the results of the views, shared by every copy of the catalog (see viewcache.mojo)
 
     def __init__(out self):
         self.sources = List[SqlSource]()
         self.view_names = List[String]()
         self.view_sql = List[String]()
+        self.cache = ArcPointer(ResultCache())
 
     def copy(self) -> Catalog:
         """A catalog of the same sources (tables and scans are shared handles, a frame's snapshot is copied): what a background job (F-175) works on."""
@@ -91,6 +105,7 @@ struct Catalog(Movable):
             out.sources.append(s.copy())
         out.view_names = self.view_names.copy()
         out.view_sql = self.view_sql.copy()
+        out.cache = self.cache
         return out^
 
     def view(mut self, name: String, query: String) raises:
@@ -105,6 +120,30 @@ struct Catalog(Movable):
                 return
         self.view_names.append(name)
         self.view_sql.append(query)
+
+    def view[Q: ViewSource](mut self, name: String, query: Q) raises:
+        """F-160: a named view made from a `Query` (its table, frame or scan, its `where`s and window functions) instead of SQL text: the plan's data joins the
+        catalog under an internal name and the view reads it. A `group_by` / aggregate Query raises (write it as SQL)."""
+        var vi = self.view_index(name)
+        var hidden = "__src" + String(vi if vi >= 0 else len(self.view_names))
+        var text = query.view_sql(hidden)
+        self._put(query.view_source(hidden))
+        self.view(name, text)
+
+    def set_cache_budget(mut self, bytes: Int):
+        """F-160: the bytes of view results the catalog's cache keeps (least recently used go first; 0 keeps none; the default is 256 MiB)."""
+        self.cache[].set_budget(bytes)
+
+    def clear_cache(mut self):
+        self.cache[].clear()
+
+    def view_runs(self) -> Int:
+        """F-160: how many times a view's SQL has really run (a read served from the cache is not a run): what tests count."""
+        return self.cache[].runs
+
+    def view_hits(self) -> Int:
+        """F-160: how many reads of a view were served from the cache."""
+        return self.cache[].hits
 
     def view_index(self, name: String) -> Int:
         var key = lower_ascii(name)
@@ -124,6 +163,7 @@ struct Catalog(Movable):
         for k in range(i):
             out.view_names.append(self.view_names[k])
             out.view_sql.append(self.view_sql[k])
+        out.cache = self.cache
         return out^
 
     def row_count(self, name: String) -> Int:

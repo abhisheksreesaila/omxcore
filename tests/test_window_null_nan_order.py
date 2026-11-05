@@ -1,6 +1,7 @@
 """F-084: window functions treat NULL, NaN and DESC order like DuckDB. Expected values come from
 DuckDB itself, over several partitions, float32 and float64, with and without ORDER BY."""
 import duckdb
+from conftest import oracle_connection
 import pyarrow as pa
 import pytest
 
@@ -20,7 +21,7 @@ def _table(typ):
 
 
 def _duck(t, select):
-    con = duckdb.connect()
+    con = oracle_connection()
     con.register("t", t)
     return con.execute(f"SELECT {select} AS r FROM t ORDER BY id").to_arrow_table().column("r").to_pylist()
 
