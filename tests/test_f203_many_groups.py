@@ -84,6 +84,16 @@ QUERIES = [
     "select nul, sum(a) from t group by nul having sum(a) > count(*) * 15000 order by nul",
     "select nul, sum(a) from t group by nul having sum(d) is null order by nul",
     "select nul, count(distinct a) from t group by nul having count(distinct a) > 3 order by nul",
+    # HAVING shapes the partial slots decide directly: every operator, a constant on the left, NULL totals, AND
+    "select nul, sum(d) from t group by nul having 200 < sum(d) order by nul",
+    "select nul, sum(d) from t group by nul having sum(d) <= 100.5 order by nul",
+    "select nul, count(*) c from t group by nul having count(*) = 1 order by nul",
+    "select nul, count(*) c from t group by nul having count(*) <> 2 order by nul limit 30",
+    "select nul, count(d) from t group by nul having count(d) < 1 order by nul",
+    "select nul, sum(d), max(d) from t group by nul having sum(d) > 10 and max(d) <= 49 and count(*) >= 2 order by nul",
+    "select uid, sum(wide) from t group by uid having sum(wide) >= 3000000000000000.00 and count(*) > 2 order by uid",
+    "select txt, min(a), max(a) from t group by txt having min(a) > 100 and max(a) < 19900 order by txt",
+    "select skew, sum(a) from t group by skew having sum(a) = 12345 order by skew",
     # 128-bit sums
     "select skew, sum(wide) s from t group by skew having sum(wide) > 90000000000000000.00 order by skew",
     "select uid, sum(wide) s from t group by uid having sum(wide) > 1000000000000000.00 order by uid",
@@ -120,3 +130,11 @@ def test_random_worlds(mx, tmp_path, seed):
                 f"select uid, sum(a) s from t group by uid order by s desc, uid limit {rnd.randrange(1, 50)}",
                 f"select skew, sum(wide) from t group by skew having sum(wide) > {cut}000000000000.00 order by skew"):
         check(mx, sql, con, {"t": str(path)}, ordered=True)
+
+
+def test_simple_having_is_decided_on_the_partial_slots(mx, world):
+    """`aggregate <op> constant` HAVING keeps the survivors before any group's columns are built (a note says so); another shape runs as before."""
+    res = run_mx(mx, ["sql", "--max-rows", "0", "select uid from t group by uid having sum(a) > 30000"], world["files"])
+    assert any(n.startswith("having: ") and "(decided on the groups' partial slots" in n for n in res["notes"]), res["notes"]
+    res = run_mx(mx, ["sql", "--max-rows", "0", "select uid from t group by uid having sum(a) > count(*) * 10000"], world["files"])
+    assert not any("partial slots" in n for n in res["notes"]), res["notes"]
