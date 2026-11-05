@@ -18,7 +18,8 @@ from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, D
 from .frame import NULL_EDIT, text_ranks, _radix_order
 from .job import JobCtl, STAGE_PLAN, STAGE_AGGREGATE, STAGE_FINISH      # F-175
 from .query import (Program, QueryResult, _run_cpu, _run_cpu_job, _run_mat, _key_from_reg0, _make_result, _merge_partial, _identity_partial, _ScanMask, _group_mask,
-                    OVERFLOW_MESSAGE, overflow_message, CPU, MAGIC, A_MIN, A_MAX, A_FSUM, MORSEL_ROWS, JOB_RANGE_ROWS, WINDOW_BYTES, SRC_WORDS, fold_float, slot_identity)
+                    OVERFLOW_MESSAGE, overflow_message, CPU, GPU, AUTO, MAGIC, DT_F64, OP_LOAD_CONST, OP_LOADI, OP_IADD, OP_ISUB, OP_IMUL, OP_AND, OP_OR, OP_NOT, OP_SELECT,
+                    OP_ISNULL, OP_IDIV, OP_IMOD, OP_IMIN, OP_IMAX, OP_ICMP, OP_AGG_ISUM, OP_AGG_IMIN, OP_AGG_IMAX, OP_F2I, _run_gpu, _run_gpu_pieces, A_MIN, A_MAX, A_FSUM, MORSEL_ROWS, JOB_RANGE_ROWS, WINDOW_BYTES, SRC_WORDS, fold_float, slot_identity)
 from .kernels._fpenv import core_count, par_n
 from .kernels.pipeline_cpu import IP, LP, FP, BP, VEC, E_OVERFLOW, _no_front, _no_keys, pipeline_keyed
 from .kernels.hashagg_cpu import hash_aggregate
@@ -38,6 +39,7 @@ from .kargs import KernelRun
 from .winsql import plan_windows, finish_windows, point_wide_columns, fix_wide_columns, WIN_TABLE
 from .jfront import FusedJoin, StageData, StreamStage, ProbeStream, chunk_join, stream_template, front_spec, jf_front
 from std.memory import ArcPointer
+from .gpu import DeviceTable, HAS_GPU, gpu_available
 from .rows import RowStage, prepare_rows, execute_rows, _Item
 from .sink import ResultSink                  # F-167
 from .parquet import write_parquet, ZSTD, DEFAULT_ROW_GROUP
@@ -543,8 +545,141 @@ def _run_dense_fused(t: SharedTable, sp: SqlProgram, mask_addr: Int, threads: In
     return _make_result(p, run.out_vals, run.out_cnt)
 
 
+# ── F-191: the device ─────────────────────────────────────────────────────────────────────────────────────────
+
+struct _Gpu(Movable):
+    """Where a single-table aggregate runs: the decision made before it runs (`use`, or `why` it does not), and what happened (`ran`)."""
+    var asked: Int                   # PlannerOptions.device
+    var use: Bool                    # the builder's GPU programs run this query's aggregate stage on the GPU
+    var why: String                  # the CPU: the reason
+    var dt: Optional[DeviceTable]
+    var uploaded: Bool               # the table was uploaded for this query (no DeviceTable was attached)
+    var ran: Bool
+    var declined: String             # the GPU was tried and the CPU answered: why
+
+    def __init__(out self, asked: Int):
+        self.asked = asked
+        self.use = False
+        self.why = String()
+        self.dt = None
+        self.uploaded = False
+        self.ran = False
+        self.declined = String()
+
+    def on_cpu(self) -> Bool:
+        return not self.ran
+
+    def reason(self) -> String:
+        """Why the CPU answered (empty when the GPU did or the CPU was asked for)."""
+        if self.ran or self.asked == CPU:
+            return String()
+        return self.declined if self.declined.byte_length() > 0 else self.why
+
+    def note(self) -> String:
+        var who = String("GPU asked for") if self.asked == GPU else String("AUTO")
+        if self.ran:
+            return "device: GPU (" + who + (", the table uploaded for this query" if self.uploaded else ", the attached DeviceTable") + ")"
+        if self.asked == CPU:
+            return "device: CPU (device CPU was asked for)"
+        return "device: CPU (" + who + (": " if self.asked == AUTO else "; ") + self.reason() + ")"
+
+
+comptime OP_LT = 20      # (query.mojo has no names for the kernel's float compares OP_LT .. OP_NE, 20 .. 25; SQL tests its 0 / 1 predicate registers with them,
+comptime OP_NE = 25      #  and no other float value reaches the program: a FLOAT column and I2F are declined above)
+
+
+def _gpu_op_ok(op: Int) -> Bool:
+    """The integer instructions the builder's GPU kernel runs with the CPU's meaning (kernels_aot/pipeline_gpu.mojo)."""
+    return (op == OP_LOAD_CONST or op == OP_LOADI or op == OP_IADD or op == OP_ISUB or op == OP_IMUL or op == OP_AND or op == OP_OR or op == OP_NOT or
+            op == OP_SELECT or op == OP_ISNULL or op == OP_IDIV or op == OP_IMOD or op == OP_IMIN or op == OP_IMAX or op == OP_ICMP or
+            op == OP_AGG_ISUM or op == OP_AGG_IMIN or op == OP_AGG_IMAX or (op >= OP_LT and op <= OP_NE) or op == OP_F2I)
+
+
+def _bad_op(ins: List[Int32]) -> Int:
+    """The first instruction in `ins` the GPU kernel does not run (-1: none)."""
+    for i in range(len(ins) // 5):
+        if not _gpu_op_ok(Int(ins[i * 5])):
+            return Int(ins[i * 5])
+    return -1
+
+
+def _gpu_blocker(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, two_pass: Bool, fj: Bool) -> String:
+    """Why the GPU programs cannot run this query's aggregate stage ("" when they can)."""
+    if q.rows:
+        return "a query without aggregates runs on the CPU"
+    if fj:
+        return "a join runs on the CPU"
+    if src.kind != SRC_TABLE:
+        return "a " + ("frame" if src.kind == SRC_FRAME else "Parquet or CSV scan") + " runs on the CPU (the GPU runs a table)"
+    if plan.group == G_HASHED:
+        return "hashed groups run on the CPU (the GPU kernel takes no groups or dense groups)"
+    if sp.p.mat or two_pass:
+        return "count(DISTINCT), median, quantiles and min / max of TEXT run on the CPU"
+    if sp.p.has_float or sp.p.repro:
+        return "a FLOAT column or float arithmetic runs on the CPU (a float64 sum has one defined order there)"
+    for d in sp.p.dtypes:
+        if Int(d) == DT_F64:
+            return "a FLOAT column runs on the CPU"
+    var bad = max(_bad_op(sp.p.pred), max(_bad_op(sp.p.body), _bad_op(sp.p.aggs)))
+    if bad >= 0:
+        return "the program uses an instruction the GPU kernel does not run (opcode " + String(bad) + ": text, dates, IN lists, casts or float arithmetic)"
+    return String()
+
+
+def _pick_device(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, opts: PlannerOptions, two_pass: Bool, fj: Bool) -> _Gpu:
+    """CPU never touches the GPU. AUTO runs on the CPU unless the table has `opts.gpu_min_rows` rows (the builder's rule) and the GPU programs run the
+    query. GPU runs what the programs run. Everything else is the CPU with the reason."""
+    var g = _Gpu(opts.device)
+    if opts.device == CPU:
+        return g^
+    if opts.device == AUTO and src.kind == SRC_TABLE and src.rows() < opts.gpu_min_rows:
+        g.why = "the table has " + String(src.rows()) + " rows, under the " + String(opts.gpu_min_rows) + " AUTO runs on the GPU"
+        return g^
+    var blocker = _gpu_blocker(src, q, plan, sp, two_pass, fj)
+    if blocker.byte_length() > 0:
+        g.why = blocker^
+        return g^
+    comptime if HAS_GPU:
+        if not gpu_available():
+            g.why = "no GPU found"
+            return g^
+        g.use = True
+    else:
+        g.why = "no GPU on this build"
+    return g^
+
+
+def _gpu_open(src: SqlSource, opts: PlannerOptions, mut g: _Gpu) raises:
+    """The device copy of the table: the attached one, else the table is uploaded for this query. A table that does not fit stays unresident (it runs in pieces)."""
+    if opts.device_table and opts.device_table.value().is_live() and opts.device_table.value().mirrors(src.table):
+        g.dt = opts.device_table.value()
+    else:
+        g.dt = DeviceTable(src.table)
+        g.uploaded = True
+
+
+def _gpu_chunk(chunk: SharedTable, sp: SqlProgram, mut g: _Gpu, job: JobCtl) raises -> Optional[QueryResult]:
+    """The program over the chunk on the GPU, or None (the CPU answers; `g.declined` says why). Same program, same answer."""
+    comptime if HAS_GPU:
+        var fb = String()
+        var dt = g.dt.value()
+        var none = List[UInt8]()
+        var r = QueryResult()
+        if dt.is_resident():
+            var got = _run_gpu(dt, chunk, sp.p, none, False, fb)
+            if not got:
+                g.declined = fb^
+                return None
+            r = got.take()
+        else:
+            r = _run_gpu_pieces(dt, chunk, sp.p, none, False, fb, job)
+        g.ran = True
+        return r^
+    return None
+
+
 def _fold(sp: SqlProgram, plan: PhysicalPlan, chunk: SharedTable, mask_addr: Int, mut hs: HolStates, ops: List[Int], threads: Int,
-          mut pacc: PartAcc, mut dense_acc: QueryResult, fj: Optional[ArcPointer[FusedJoin]], job: JobCtl = JobCtl()) raises:
+          mut pacc: PartAcc, mut dense_acc: QueryResult, fj: Optional[ArcPointer[FusedJoin]], mut gpu: _Gpu, job: JobCtl = JobCtl()) raises:
     """Runs the program over one chunk and folds its partial result into the accumulator. `job` (F-175) moves by the chunk's rows."""
     var n = chunk.rows()
     var exact = job.active() and not sp.p.repro
@@ -582,7 +717,12 @@ def _fold(sp: SqlProgram, plan: PhysicalPlan, chunk: SharedTable, mask_addr: Int
     elif sp.p.mat:
         r = _run_mat(chunk, sp.p, mask_addr, hs, 0, 0, job)
     else:
-        r = _run_cpu_job(chunk, sp.p, mask_addr, threads, job)              # (row ranges for a big table: a cancel is seen between them)
+        var on_gpu = _gpu_chunk(chunk, sp, gpu, job) if gpu.dt else Optional[QueryResult](None)    # F-191
+        if on_gpu:
+            r = on_gpu.take()
+            job.advance(n)
+        else:
+            r = _run_cpu_job(chunk, sp.p, mask_addr, threads, job)          # (row ranges for a big table: a cancel is seen between them)
     _merge_partial(dense_acc, r, ops)
 
 
@@ -758,11 +898,10 @@ def _kernel_notes(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, dicts: Dict
                      " dictionary words in " + _ms(Float64(sp.p.text_ns) / 1e6) + " ms (each text function ran once per word, never per row)")
     if plan.group == G_HASHED and plan.holistic:
         notes.append("holistic: a second pass maps each row to its group for count(DISTINCT), median, quantile_disc and min / max of TEXT")
-    notes.append("device: CPU (SQL runs on the CPU)")
 
 
 def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOptions, dicts: DictAccess,
-             mut notes: List[String], inp: _Inputs, var sp: SqlProgram, trust: Bool = True, fj: Optional[ArcPointer[FusedJoin]] = None) raises -> Table:
+             mut notes: List[String], inp: _Inputs, var sp: SqlProgram, mut gpu: _Gpu, trust: Bool = True, fj: Optional[ArcPointer[FusedJoin]] = None) raises -> Table:
     var used = inp.used.copy()
     var scan_mode = inp.scan_mode
     var two_pass = plan.group == G_HASHED and plan.holistic
@@ -788,6 +927,8 @@ def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
         if fj:
             ch.override = fj.value()[].probe
     var delta_rows = len(lsrc.overlay.delta)
+    if gpu.use:                                                       # F-191
+        _gpu_open(src, opts, gpu)
     var t_run = perf_counter_ns()
     var ns_load = 0
     opts.job.stage(STAGE_AGGREGATE)
@@ -814,7 +955,7 @@ def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
         var fji = fj
         if ps:                                                         # this chunk's own join: its keys, the build sides' maps shared
             fji = ArcPointer(chunk_join(ps.value()[], chunk))
-        _fold(sp, plan, chunk, ch.mask_addr, hs, ops, threads, pacc, dense_acc, fji, opts.job)
+        _fold(sp, plan, chunk, ch.mask_addr, hs, ops, threads, pacc, dense_acc, fji, gpu, opts.job)
     if sp.guard_slot >= 0 and dense_acc.counts[sp.guard_slot] > 0:
         raise Error(LIE + String(dense_acc.counts[sp.guard_slot]) + (" row lies" if dense_acc.counts[sp.guard_slot] == 1 else " rows lie") +
                     " outside the range of a group key that the footer gave")
@@ -2041,7 +2182,10 @@ def _run_sql_once[P: Planner](mut catalog: Catalog, q0: BoundQuery, planner: P, 
     else:
         sp = _lower(src, q, plan, dicts, inp, PHASE_PLAIN if (plan.group == G_HASHED and plan.holistic) else PHASE_ALL)
         _kernel_notes(src, q, plan, dicts, inp, sp, res.notes)
+    var gpu = _pick_device(src, q, plan, sp, opts, plan.group == G_HASHED and plan.holistic, Bool(fj))        # F-191
     if q.explain != EXPLAIN_NONE:
+        gpu.ran = gpu.use
+        res.notes.append(gpu.note())
         res.explain = _explain_text(lp, res.notes)
         var t = Table.empty()
         var c = t.add_column("plan", TEXT)
@@ -2056,7 +2200,7 @@ def _run_sql_once[P: Planner](mut catalog: Catalog, q0: BoundQuery, planner: P, 
         res.table = execute_rows(src, q, plan, opts, dicts, notes, inp, stage^, trust, fj, True)
     else:
         try:
-            res.table = _execute(src, q, plan, opts, dicts, notes, inp, sp^, trust, fj)
+            res.table = _execute(src, q, plan, opts, dicts, notes, inp, sp^, gpu, trust, fj)
         except e:
             if String(e) != OVERFLOW_MESSAGE or not _sums_integers(q):
                 raise e^
@@ -2069,7 +2213,10 @@ def _run_sql_once[P: Planner](mut catalog: Catalog, q0: BoundQuery, planner: P, 
                 sp_wide = _lower(src, q, plan, dicts, inp, PHASE_PLAIN if (plan.group == G_HASHED and plan.holistic) else PHASE_ALL, True)
             except lowering:                                                  # (the split sums need more registers than the query has: the error is the total's)
                 raise Error(OVERFLOW_MESSAGE)
-            res.table = _execute(src, q, plan, opts, dicts, notes, inp, sp_wide^, trust, fj)
+            res.table = _execute(src, q, plan, opts, dicts, notes, inp, sp_wide^, gpu, trust, fj)
+    notes.append(gpu.note())
+    res.device = GPU if gpu.ran else CPU
+    res.fallback_reason = gpu.reason()
     res.notes = notes^
     res.explain = _explain_text(lp, res.notes)
     res.ms = Float64(perf_counter_ns() - t0) / 1e6
@@ -2172,13 +2319,31 @@ def _run_sql_resolved[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: 
     opts.job.stage(STAGE_PLAN)
     if q.explain == EXPLAIN_ANALYZE:
         return _explain_analyze(catalog, q, planner, opts)
+    var r: SqlResult
     try:
-        return _run_sql_once(catalog, q, planner, opts, True, String())
+        r = _run_sql_once(catalog, q, planner, opts, True, String())
     except e:
         var msg = String(e)
         if not msg.startswith(LIE):
             raise e^
-        return _run_sql_once(catalog, q, planner, opts, False, String(msg[byte=LIE.byte_length():]))
+        r = _run_sql_once(catalog, q, planner, opts, False, String(msg[byte=LIE.byte_length():]))
+    _device_note(r, opts)
+    return r^
+
+
+def _device_note(mut r: SqlResult, opts: PlannerOptions):
+    """F-191: a statement the single-table path did not run (a join, a multi-way join) still says which device ran it."""
+    for n in r.notes:
+        if n.startswith("device: "):                      # (a join's aggregate stage reports its own: the device it ran on is the result's)
+            if n.startswith("device: GPU"):
+                r.device = GPU
+            return
+    if opts.device == CPU:
+        r.notes.append("device: CPU (device CPU was asked for)")
+        return
+    var why = String("joins run on the CPU (the GPU runs single-table aggregates)")
+    r.notes.append("device: CPU (" + ("GPU asked for; " if opts.device == GPU else "AUTO: ") + why + ")")
+    r.fallback_reason = why^
 
 
 def _explain_analyze[P: Planner](mut catalog: Catalog, q0: BoundQuery, planner: P, opts: PlannerOptions) raises -> SqlResult:

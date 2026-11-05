@@ -1799,7 +1799,9 @@ def _finish_holistic(mut r: QueryResult, mut hs: HolStates) raises:
 # ── running on the GPU ───────────────────────────────────────────────────────────────────────────────
 
 def _reg_fields(op: Int) -> Int:
-    """Which of an instruction's operands d, a, b name registers: bit 0 = d, bit 1 = a, bit 2 = b."""
+    """Which of an instruction's operands d, a, b, c name registers: bit 0 = d, bit 1 = a, bit 2 = b, bit 3 = c."""
+    if op == OP_SELECT:
+        return 15                                         # d = a ? b : c, all four are registers (F-191: c was left unrenumbered, a read past the registers)
     if op == OP_LOAD_CONST or op == OP_LOADI or op == OP_ISNULL:
         return 1
     if op == OP_F2I or op == OP_NOT:
@@ -1819,7 +1821,7 @@ def _compact_registers(pred_reg: Int, mut code: List[Int32]) -> Tuple[Int, Int]:
         used[pred_reg] = True
     for i in range(len(code) // 5):
         var f = _reg_fields(Int(code[i * 5]))
-        for k in range(3):
+        for k in range(4):
             if (f >> k) & 1 != 0:
                 used[Int(code[i * 5 + 1 + k])] = True
     var map = List[Int32](length=MAX_REGS, fill=0)
@@ -1830,7 +1832,7 @@ def _compact_registers(pred_reg: Int, mut code: List[Int32]) -> Tuple[Int, Int]:
             n += 1
     for i in range(len(code) // 5):
         var f = _reg_fields(Int(code[i * 5]))
-        for k in range(3):
+        for k in range(4):
             if (f >> k) & 1 != 0:
                 code[i * 5 + 1 + k] = map[Int(code[i * 5 + 1 + k])]
     return (n, Int(map[pred_reg]) if pred_reg >= 0 else -1)
