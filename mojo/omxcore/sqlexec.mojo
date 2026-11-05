@@ -27,7 +27,7 @@ from .holistic import (HolStates, HolSpec, HolResult, A_DISTINCT, A_PCT, A_MEDIA
                            float_key)
 from .sql import sql_error, parse_sql, SqlStatement, EXPLAIN_NONE, EXPLAIN_ANALYZE
 from .bind import (copy_query, Catalog, SqlSource, BoundQuery, SortKey, bind_sql, bind_statement, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, F_COUNT_STAR,
-                   F_COUNT, F_SUM, F_MIN, F_MAX, F_AVG, F_COUNT_DISTINCT, F_MEDIAN, F_STDDEV_SAMP, F_STDDEV_POP, F_VAR_SAMP, F_VAR_POP, F_QEDGE, B_QBIN, B_LIT, B_AGG,
+                   F_COUNT, F_SUM, F_MIN, F_MAX, F_AVG, F_COUNT_DISTINCT, F_MEDIAN, F_STDDEV_SAMP, F_STDDEV_POP, F_VAR_SAMP, F_VAR_POP, F_QEDGE, B_QBIN, B_LIT, B_AGG, B_AND, B_CMP,
                    BExpr, AggSpec, KeySpec, pow10_checked)
 from .plan import LogicalPlan, build_plan, executable
 from .post import run_post
@@ -44,6 +44,7 @@ from .rows import RowStage, prepare_rows, execute_rows, _Item
 from .sink import ResultSink                  # F-167
 from .parquet import write_parquet, ZSTD, DEFAULT_ROW_GROUP
 from std.memory.alloc import unsafe_alloc
+from std.ffi import external_call
 from .sqlprog import lower_rows
 from .planner import (plan_sinks, Planner, RulePlanner, PlannerOptions, PhysicalPlan, Stats, ColStat, G_NONE, G_DENSE, G_HASHED, commas, JoinStats, JoinPlan,
                       BUILD_AUTO, BUILD_LEFT, BUILD_RIGHT)
@@ -306,32 +307,52 @@ struct PartAcc(Movable):
         return out^
 
 
+comptime COPY_BLOCK = 131072                  # groups per copy task
+
+
 def _hashed_result(run: KernelRun, res_r: Int, n_slots: Int, nkw: Int) -> Partial:
     """The groups hash_aggregate found, from the addresses it left in the run's result region (the run is a parameter: alive here)."""
     var res = run.i64(res_r)
     var out = Partial()
     var g = Int(res[0])
     var stride = max(g, 1)
-    var vals = UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=Int(res[1]))
-    var cnt = UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=Int(res[2]))
-    for s in range(n_slots):
-        var col = List[Int]()
-        col.reserve(g)
-        for x in range(g):
-            col.append(Int(vals[s * stride + x]))
-        out.slots.append(col^)
-    for x in range(g):
-        out.counts.append(Int(cnt[x]))
+    var vals_a = Int(res[1])
+    var cnt_a = Int(res[2])
+    var kw_a = List[Int]()
     for k in range(nkw):
-        var kp = UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=Int(res[3 + k]))
-        var col = List[Int64]()
-        col.reserve(g)
-        for x in range(g):
-            col.append(kp[x])
-        out.kw.append(col^)
-        kp.free()
-    vals.free()
-    cnt.free()
+        kw_a.append(Int(res[3 + k]))
+    # F-203: the groups' words are copied as blocks by several threads (the first touch of 15M groups' pages is most of the time), not appended one by one
+    var dst = List[Int]()
+    var src = List[Int]()
+    for s in range(n_slots):
+        out.slots.append(List[Int](unsafe_uninit_length=g))
+        dst.append(Int(out.slots[s].unsafe_ptr()))
+        src.append(vals_a + s * stride * 8)
+    out.counts = List[Int](unsafe_uninit_length=g)
+    dst.append(Int(out.counts.unsafe_ptr()))
+    src.append(cnt_a)
+    for k in range(nkw):
+        out.kw.append(List[Int64](unsafe_uninit_length=g))
+        dst.append(Int(out.kw[k].unsafe_ptr()))
+        src.append(kw_a[k])
+    var nblk = (g + COPY_BLOCK - 1) // COPY_BLOCK
+    var ncol = len(dst)
+    var dp = dst.unsafe_ptr()
+    var sp = src.unsafe_ptr()
+
+    def copy_block(i: Int) {imm}:
+        var c = i % ncol
+        var at = (i // ncol) * COPY_BLOCK
+        _ = external_call["memcpy", Int](dp[c] + at * 8, sp[c] + at * 8, min(COPY_BLOCK, g - at) * 8)
+
+    if nblk > 0:
+        par_n(copy_block, nblk * ncol, min(core_count(), nblk * ncol))
+    _ = dst^
+    _ = src^
+    for k in range(nkw):
+        UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=kw_a[k]).free()
+    UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=vals_a).free()
+    UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=cnt_a).free()
     return out^
 
 
@@ -384,13 +405,103 @@ def _explain_text(lp: LogicalPlan, notes: List[String]) -> String:
     return out^
 
 
+struct _Cond(Copyable, Movable):
+    """F-203: one `aggregate <op> constant` conjunct of HAVING, read straight off the groups' partial slots."""
+    var slot: Int                    # the accumulator slot holding the value (-1: the group's row count)
+    var nul: Int                     # the slot counting NULL arguments (-1: none)
+    var code: Int                    # B_CMP's code: 20 <, 21 <=, 22 >, 23 >=, 24 =, 25 <>
+    var lit: Int64
+    var hi: Int                      # a SUM's slot of upper halves (F-192; the total is hi * 2^32 + the slot), -1 for none
+
+    def __init__(out self, slot: Int, nul: Int, code: Int, lit: Int64, hi: Int):
+        self.slot = slot
+        self.nul = nul
+        self.code = code
+        self.lit = lit
+        self.hi = hi
+
+
+def _conds(q: BoundQuery, sp: SqlProgram, at: Int, mut out: List[_Cond]) -> Bool:
+    """HAVING as a conjunction of `integer or decimal aggregate <op> constant of the same scale` (the aggregate: COUNT, SUM, MIN, MAX with no wide or
+    float state); False for any other shape, which the stage after aggregation decides as before."""
+    ref x = q.pexprs[at]
+    if x.op == B_AND:
+        return _conds(q, sp, x.a, out) and _conds(q, sp, x.b, out)
+    if x.op != B_CMP or x.a < 0 or x.b < 0:
+        return False
+    var leaf = x.a
+    var lit = x.b
+    var code = Int(x.value)
+    if q.pexprs[leaf].op != B_AGG:                                # `300 < sum(x)` is `sum(x) > 300`
+        leaf = x.b
+        lit = x.a
+        code = 23 if code == 21 else 22 if code == 20 else 21 if code == 23 else 20 if code == 22 else code
+    ref l = q.pexprs[leaf]
+    ref c = q.pexprs[lit]
+    if l.op != B_AGG or c.op != B_LIT or c.kind == FLOAT.value or c.kind == TEXT.value or c.kind == BOOL.value:
+        return False
+    ref ag = q.aggs[Int(l.value)]
+    var a = Int(l.value)
+    if ag.hol or ag.kind == FLOAT.value or ag.kind == TEXT.value or ag.scale != c.scale or ag.kind != c.kind:
+        return False
+    if ag.arg >= 0 and q.rexprs[ag.arg].kind == FLOAT.value:
+        return False
+    var f = ag.func
+    if f == F_COUNT_STAR:
+        out.append(_Cond(-1, -1, code, c.value, -1))
+    elif f == F_COUNT:
+        out.append(_Cond(-1, sp.agg_nul_slot[a], code, c.value, -1))
+    elif f == F_SUM or f == F_MIN or f == F_MAX:
+        out.append(_Cond(sp.agg_val_slot[a], sp.agg_nul_slot[a], code, c.value, sp.agg_hi_slot[a] if f == F_SUM else -1))
+    else:
+        return False
+    return True
+
+
+def _having_groups(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, mut gids: List[Int]) -> Int:
+    """F-203: when HAVING is a conjunction of `aggregate <op> constant`, decides it on the partial slots of every group and keeps only the survivors in
+    `gids` (TPC-H Q18's inner step: 624 of 15M groups), so the finish builds columns for those alone. the number of groups there were; -1 (gids untouched) for any other HAVING."""
+    var conds = List[_Cond]()
+    if plan.group == G_NONE or q.having < 0 or not _conds(q, sp, q.having, conds):
+        return -1
+    var total = plan.domain if plan.group == G_DENSE else acc.groups()
+    var existing = 0
+    for g in range(total):
+        var rows = acc.counts[g]
+        if rows == 0:
+            continue
+        existing += 1
+        var keep = True
+        for i in range(len(conds)):
+            var nulls = acc.slots[conds[i].nul][g] if conds[i].nul >= 0 else 0
+            var v = Int128(rows - nulls)
+            if conds[i].slot >= 0:
+                if rows - nulls == 0:
+                    keep = False                                   # NULL
+                    break
+                v = Int128(Int64(acc.slots[conds[i].slot][g]))
+                if conds[i].hi >= 0:
+                    v += Int128(Int64(acc.slots[conds[i].hi][g])) << Int128(32)
+            var c = conds[i].code
+            var y = Int128(conds[i].lit)
+            if not (v < y if c == 20 else v <= y if c == 21 else v > y if c == 22 else v >= y if c == 23 else v == y if c == 24 else v != y):
+                keep = False
+                break
+        if keep:
+            gids.append(g)
+    return existing
+
+
 def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hres: HolResult, hol_of: List[Int],
             dicts: DictAccess, opts: PlannerOptions, mut notes: List[String]) raises -> Table:
     # the groups that exist: only non-empty ones, except the one row of a query with no GROUP BY
     var t_a = perf_counter_ns()
     var gids = List[Int]()
+    var having_total = _having_groups(q, plan, sp, acc, gids)        # F-203: -1 when HAVING is not a plain comparison of aggregates with constants
     if plan.group == G_NONE:
         gids.append(0)
+    elif having_total >= 0:
+        notes.append("having: " + commas(len(gids)) + " of " + commas(having_total) + " groups kept (decided on the groups' partial slots, only the survivors' columns built)")
     elif plan.group == G_DENSE:
         for g in range(plan.domain):
             if acc.counts[g] > 0:
