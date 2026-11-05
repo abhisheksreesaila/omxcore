@@ -381,6 +381,22 @@ def two_jobs_share_the_cache() raises:
     check_int(cat.view_runs(), before, "no run: the jobs' results are in the shared cache")
 
 
+def two_jobs_share_the_cache_round_after_round() raises:
+    # F-199: the cache's lock once failed to order the list it guards (the compiler treated `mut self` as the only user), so two jobs putting at the same
+    # moment crashed about 1 round in 150. One round is cheap: many of them make the old crash a near certainty.
+    for round in range(400):
+        var cat = Catalog()
+        cat.add_table("orders", orders())
+        cat.view("v1", "SELECT region, qty FROM orders WHERE qty > 0")
+        cat.view("v2", "SELECT region, sum(qty) AS q FROM v1 GROUP BY region")
+        var a = sql_job(cat, "SELECT q FROM v2 ORDER BY q")
+        var b = sql_job(cat, "SELECT q FROM v2 ORDER BY q DESC")
+        if a.wait() != JOB_DONE or b.wait() != JOB_DONE:
+            fail("both jobs finish, round " + String(round))
+        check(rows_of(a.result().table), "4\n6\n10\n17\n", "job a, round " + String(round))
+        check(rows_of(b.result().table), "17\n10\n6\n4\n", "job b, round " + String(round))
+
+
 def main() raises:
     views_read_views()
     view_from_a_query()
@@ -392,5 +408,6 @@ def main() raises:
     a_frame_query_view_follows_the_edits()
     a_wide_total_behind_a_view_is_refused()
     two_jobs_share_the_cache()
+    two_jobs_share_the_cache_round_after_round()
     copy_writes_parquet()
     print("ok")
