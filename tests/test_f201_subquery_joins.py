@@ -31,8 +31,12 @@ def data(tmp_path_factory):
         case when i % 17 = 0 then null when (((i * 3) % 5000) % 100) = 7 then 60 + (i % 30) else 1 + (i % 9) end as qty, (i * 11) % 300 as cust
         from range(20000) r(i)""")
     con.execute("create table nofact as select * from fact where false")
+    # Q20's shape: partsupp rows keyed by two columns, line items of the same pairs (some pairs have none, some line items have a NULL part)
+    con.execute("""create table ps as select (i % 400) as pk, (i % 7) as sk, ((i * 13) % 90)::int as avail from range(2000) r(i) where (i % 400, i % 7) is not null""")
+    con.execute("""create table li as select case when i % 97 = 0 then null else (i * 11) % 450 end as pk, (i % 7) as sk, (1 + i % 9) as qty,
+        date '2020-01-01' + (i % 700)::int as d from range(30000) r(i)""")
     paths = {}
-    for t in ["cust", "ord", "fact", "nofact"]:
+    for t in ["cust", "ord", "fact", "nofact", "ps", "li"]:
         paths[t] = d / f"{t}.parquet"
         con.execute(f"copy {t} to '{paths[t]}' (format parquet, row_group_size 4000)")
     return {"con": con, "paths": paths}
@@ -120,6 +124,17 @@ def test_not_exists_over_an_inner_table_with_no_rows(mx, data):
     res = q(mx, data, """SELECT count(*) FROM cust c, ord o WHERE c.ck = o.ck AND NOT EXISTS (SELECT 1 FROM nofact f WHERE f.ok = o.ok AND f.cust <> o.ck)""",
             ["cust", "ord", "nofact"])
     assert res["rows"][0][0] > 0
+
+
+TWO_KEYS = """SELECT count(*), sum(ps.avail) FROM ps WHERE ps.pk IN (SELECT pk FROM ps WHERE avail > {a})
+    AND ps.avail > (SELECT 0.5 * sum(li.qty) FROM li WHERE li.pk = ps.pk AND li.sk = ps.sk AND li.d >= DATE '2020-06-01' AND li.d < DATE '2021-06-01')"""
+
+
+@pytest.mark.parametrize("a", [20, 80, 1000])
+def test_a_correlation_on_two_columns_is_cut_to_the_first_key_and_still_matches_on_both(mx, data, a):
+    res = q(mx, data, TWO_KEYS.format(a=a), ["ps", "li"])
+    if a < 1000:
+        note(res, "cut to the keys of the")
 
 
 # ── random worlds ───────────────────────────────────────────────────────────────────────────────────

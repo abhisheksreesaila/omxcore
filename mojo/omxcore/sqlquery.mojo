@@ -676,7 +676,7 @@ def run_pending[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st: Sql
         sub.col = k.table_col
         var on = -1
         var ok = True
-        for i in range(len(s.rk_inner)):
+        for i in range(1):                                                      # the first key only: a cut is a superset filter, and several keys would be packed on every row of D's table
             var oname = st.exprs[s.rk_outer[i]].text
             var has = False
             for c in range(catalog.sources[ci].table.columns()):
