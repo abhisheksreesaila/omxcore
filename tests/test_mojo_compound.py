@@ -9,6 +9,7 @@ asserted where the ticket promises them. The TPC-H shapes (Q2, Q17, Q20, Q21, Q2
 import re
 
 import duckdb
+from conftest import oracle_connection
 import pytest
 
 from mx_oracle import check, mx_binary, run_mx
@@ -25,7 +26,7 @@ def mx():
 @pytest.fixture(scope="session")
 def data(tmp_path_factory):
     d = tmp_path_factory.mktemp("compound")
-    con = duckdb.connect()
+    con = oracle_connection()
     con.execute(f"""create table t as select i::BIGINT as id,
         case when i % 11 = 0 then null else (i % 7)::BIGINT end as k,
         case when i % 13 = 0 then null else ((i * 37) % 50 - 10)::BIGINT end as v,
@@ -300,7 +301,7 @@ def test_the_plan_names_each_subquery_step(mx, data):
 @pytest.fixture(scope="session")
 def tpch(tmp_path_factory):
     d = tmp_path_factory.mktemp("tpch_compound")
-    con = duckdb.connect()
+    con = oracle_connection()
     con.execute("INSTALL tpch")
     con.execute("LOAD tpch")
     con.execute("CALL dbgen(sf=0.1)")
@@ -478,7 +479,7 @@ def test_a_compound_query_into_a_parquet_file_with_inner_sorts_that_spill(mx, da
     out = tmp_path / "out.parquet"
     run_mx(mx, ["sql", "--format", "parquet", "--out", str(out), "--sort-budget", "1024", "--sort-run-rows", "40", "--spill-dir", str(tmp_path), sql],
            {"t": data["paths"]["t"]})
-    got = duckdb.connect().execute(f"select * from read_parquet('{out}')").fetchall()
+    got = oracle_connection().execute(f"select * from read_parquet('{out}')").fetchall()
     want = data["con"].execute(sql).fetchall()
     assert got == want and len(got) > 50
 

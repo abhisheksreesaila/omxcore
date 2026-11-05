@@ -14,6 +14,7 @@ import textwrap
 import warnings
 
 import duckdb
+from conftest import oracle_connection
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -63,7 +64,7 @@ def _budgets(monkeypatch):
 
 
 def sql(query, files):
-    con = duckdb.connect()
+    con = oracle_connection()
     for n, p in files.items():
         con.execute(f"CREATE VIEW {n} AS SELECT * FROM read_parquet('{p}')")
     return con.sql(query).arrow().read_all()
@@ -641,7 +642,7 @@ SILENT = {
 
 
 def silent_reference(query, paths):
-    con = duckdb.connect()
+    con = oracle_connection()
     for n, p in paths.items():
         con.execute(f"CREATE VIEW {n} AS SELECT * FROM read_parquet('{p}')")
     return con.sql(query).arrow().read_all()

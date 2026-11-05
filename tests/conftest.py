@@ -46,6 +46,14 @@ def pytest_sessionfinish(session, exitstatus):
 import pytest  # noqa: E402
 
 
+def oracle_connection(*args, **kw):
+    """A DuckDB connection for a test oracle, on ONE thread. DuckDB 1.5.1 with threads > 1 can stall for good inside a streaming
+    `execute(...).fetchall()` on a loaded machine: the main thread spins in StreamQueryResult::WaitForTask while every worker sleeps
+    (F-198, seen in test_mojo_window.py). Drop the pin here, in one place, when DuckDB fixes it."""
+    import duckdb
+    return duckdb.connect(*args, config={**kw.pop("config", {}), "threads": 1}, **kw)
+
+
 def _mx_env():
     return {k: v for k, v in os.environ.items() if k.startswith("MXFRAME_")}
 
