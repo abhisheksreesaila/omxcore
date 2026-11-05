@@ -31,6 +31,7 @@ def digest(scan: ParquetScan) raises -> Int:
     """What a reader of both dictionaries sees: word counts, every word's text, and its code looked up by the text."""
     var h = 0
     var names: List[String] = ["a", "b"]
+    var stems: List[String] = ["alpha-", "beta-"]
     for k in range(2):
         var c = scan.index(names[k])
         var n = scan.word_count(c)
@@ -38,7 +39,7 @@ def digest(scan: ParquetScan) raises -> Int:
         h += n
         for w in range(WORDS):
             var text = scan.text_of(c, w)
-            expect(text.byte_length() > 5, "a word: " + text)
+            expect(text == stems[k] + String(w), "word " + String(w) + ": " + text)
             h += scan.code_of(c, text) * (w + 1) + text.byte_length()
     return h
 
