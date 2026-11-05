@@ -126,6 +126,29 @@ def test_not_exists_over_an_inner_table_with_no_rows(mx, data):
     assert res["rows"][0][0] > 0
 
 
+SEMI = "SELECT count(*), sum(o.tot) FROM ord o WHERE o.ok < {m} AND {neg} EXISTS (SELECT 1 FROM fact f WHERE f.ok = o.ok AND f.qty > 5)"
+
+
+@pytest.mark.parametrize("neg", ["", "NOT"])
+def test_exists_with_a_filtered_inner_table_is_cut_to_the_few_outer_rows(mx, data, neg):
+    res = q(mx, data, SEMI.format(m=300, neg=neg), ["ord", "fact"])
+    note(res, "outer rows after the statement's filters")
+    note(res, "cut to the keys of the")
+    assert res["rows"][0][0] > 0
+
+
+@pytest.mark.parametrize("neg", ["", "NOT"])
+def test_exists_with_many_outer_rows_keeps_the_semi_join_with_the_inner_table(mx, data, neg):
+    res = q(mx, data, SEMI.format(m=4000, neg=neg), ["ord", "fact"])
+    no_note(res, "cut to the keys of the")
+
+
+@pytest.mark.parametrize("neg", ["", "NOT"])
+def test_exists_over_an_inner_table_with_no_rows_and_few_outer_rows(mx, data, neg):
+    res = q(mx, data, "SELECT count(*) FROM ord o WHERE o.ok < 300 AND " + neg + " EXISTS (SELECT 1 FROM nofact f WHERE f.ok = o.ok AND f.qty > 5)", ["ord", "nofact"])
+    assert res["rows"][0][0] == (0 if neg == "" else 300)
+
+
 TWO_KEYS = """SELECT count(*), sum(ps.avail) FROM ps WHERE ps.pk IN (SELECT pk FROM ps WHERE avail > {a})
     AND ps.avail > (SELECT 0.5 * sum(li.qty) FROM li WHERE li.pk = ps.pk AND li.sk = ps.sk AND li.d >= DATE '2020-06-01' AND li.d < DATE '2021-06-01')"""
 
@@ -148,6 +171,9 @@ TEMPLATES = [
     "SELECT a.v, count(*) FROM a, b WHERE a.k = b.k AND (SELECT count(*) FROM c WHERE c.k = a.k AND c.x > {t}) = 0 GROUP BY a.v ORDER BY 1",
     "SELECT a.v, count(*) FROM a, b WHERE a.k = b.k AND EXISTS (SELECT 1 FROM c WHERE c.k = a.k AND c.x <> a.x AND c.x > {t}) GROUP BY a.v ORDER BY 1",
     "SELECT a.v, count(*) FROM a, b WHERE a.k = b.k AND a.x IN (SELECT x FROM c WHERE c.k = a.k AND c.x > {t}) GROUP BY a.v ORDER BY 1",
+    "SELECT a.v, count(*), sum(a.x) FROM a WHERE a.x < 8 AND EXISTS (SELECT 1 FROM c WHERE c.k = a.k AND c.x > {t}) GROUP BY a.v ORDER BY 1",
+    "SELECT a.v, count(*), sum(a.x) FROM a WHERE a.x < 8 AND NOT EXISTS (SELECT 1 FROM c WHERE c.k = a.k AND c.x > {t}) GROUP BY a.v ORDER BY 1",
+    "SELECT a.v, count(*) FROM a WHERE a.x < 8 AND a.v > (SELECT count(*) FROM c WHERE c.k = a.k AND c.x > {t}) GROUP BY a.v ORDER BY 1",
 ]
 
 
