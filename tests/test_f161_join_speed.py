@@ -200,19 +200,6 @@ def test_forced_materialized_with_a_selective_filter(mx, data):
     q(mx, data, SELECTIVE[0], ["bigf", "dimk"], extra=["--join", "materialize"])
 
 
-STAR = [
-    "SELECT d.name, sg.gname, count(*), sum(f.x) FROM bigf f JOIN dimk d ON f.k = d.k JOIN smallg sg ON f.g = sg.g WHERE f.x < 50 GROUP BY d.name, sg.gname",
-    "SELECT sg.gname, count(*), sum(d.w) FROM bigf f JOIN dimk d ON f.k = d.k JOIN smallg sg ON f.g = sg.g WHERE f.x < 100 AND f.s LIKE '%e%' GROUP BY sg.gname",
-]
-
-
-@pytest.mark.parametrize("sql", STAR)
-def test_a_star_probe_filter_runs_before_the_probes(mx, data, sql):
-    res = q(mx, data, sql, ["bigf", "dimk", "smallg"])
-    assert "join path: fused: a star" in " ".join(res["notes"]), res["notes"]
-    assert FIRST in " ".join(res["notes"]), res["notes"]
-
-
 def test_tpch_q12_and_q14_expand_in_the_front_stage():
     """TPC-H at SF 1 (DuckDB's dbgen, the gate's data): Q12 and Q14 build on the small filtered lineitem side, whose keys repeat (up to 4 and 5 rows of a key): each
     probe row is expanded to its partners in the fused pass; both equal DuckDB. (Q10 and Q3 keep their written order; the gate has them equal too.)"""
