@@ -104,7 +104,7 @@ are few. A failed GPU query always gives its device memory back.
 
 SQL reaches the same machinery (F-191): `mx sql --device cpu|gpu|auto` and `PlannerOptions.device` run the aggregate stage of a
 single-table integer / DECIMAL query through the builder's GPU programs (and its pieces for a table over the budget). AUTO is
-the CPU unless the table has `gpu_min_rows` rows (1,000,000); everything the GPU kernel does not run stays on the CPU and the
+the CPU unless a `DeviceTable` of the table is attached (`PlannerOptions.device_table`) and the table has `gpu_min_rows` rows (1,000,000), so `mx sql --device auto` answers on the CPU; `--device gpu` uploads the table for the query; everything the GPU kernel does not run stays on the CPU and the
 notes and the JSON `device` say which device ran and why.
 
 ## 📊 Aggregates (F-133, F-148)

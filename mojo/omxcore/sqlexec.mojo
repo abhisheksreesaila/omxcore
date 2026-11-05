@@ -731,7 +731,7 @@ def _fold(sp: SqlProgram, plan: PhysicalPlan, chunk: SharedTable, mask_addr: Int
     elif sp.p.mat:
         r = _run_mat(chunk, sp.p, mask_addr, hs, 0, 0, job)
     else:
-        var on_gpu = _gpu_chunk(chunk, sp, gpu, job) if gpu.dt else Optional[QueryResult](None)    # F-191
+        var on_gpu = _gpu_chunk(chunk, sp, gpu, job) if (gpu.dt and mask_addr == 0) else Optional[QueryResult](None)    # F-191; the GPU kernel takes no overlay mask: a masked chunk stays on the CPU
         if on_gpu:
             r = on_gpu.take()
             job.advance(n)

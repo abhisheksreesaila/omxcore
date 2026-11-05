@@ -438,7 +438,7 @@ r.explain; r.ms; r.device (CPU or GPU: where the aggregate stage ran); r.fallbac
 var e = sql(cat, "EXPLAIN SELECT ...")       # the plan as a one-column Table `plan` (also `e.explain`); nothing runs
 var o = PlannerOptions(); o.group = GROUP_HASHED          # GROUP_AUTO, GROUP_DENSE or GROUP_HASHED; o.dense_limit; o.threads
 var h = sql(cat, "SELECT ...", o)
-var g = PlannerOptions(); g.device = GPU                  # F-191: CPU, GPU or AUTO (the default); g.gpu_min_rows (AUTO's threshold, default 1,000,000); g.device_table (a DeviceTable already on the device)
+var g = PlannerOptions(); g.device = GPU                  # F-191: CPU, GPU or AUTO (the default); g.gpu_min_rows (AUTO's threshold, default 1,000,000); g.device_table (a DeviceTable already on the device: AUTO uses the GPU only with one, GPU uploads the table without one)
 var on_gpu = sql(cat, "SELECT region, sum(qty) FROM orders WHERE price > 0 GROUP BY region", g)     # on_gpu.device == GPU; the notes end with `device: GPU (...)`
 ```
 
