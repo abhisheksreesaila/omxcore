@@ -113,7 +113,10 @@ MANY_TO_MANY = [
 def test_many_to_many_joins_equal_duckdb(mx, data, sql):
     res = q(mx, data, sql, ["facts", "dims"])
     assert "repeated keys" in note(res, "join build side"), res["notes"]
-    assert "materialized" in note(res, "join path")
+    if sql.startswith("SELECT f.fid"):                                   # a row query gathers the pairs; an aggregate expands in the front stage (F-161)
+        assert "materialized" in note(res, "join path")
+    else:
+        assert "expanded to its partners" in note(res, "join path"), res["notes"]
 
 
 def test_a_self_join_needs_aliases_and_works_with_them(mx, data):

@@ -53,6 +53,8 @@ comptime PART_ROWS = 8192               # rows per hash partition: a 16-byte-ent
 comptime MAX_PBITS = 12
 comptime BITMAP_MAX_RANGE = 1 << 26     # a hashed map's presence bitmap covers at most 8 MB
 comptime BITMAP_MIN_KEYS = 4096         # a smaller map is cache-resident anyway
+comptime DIRECT_FILTER_MIN = 1 << 20    # F-161: a direct array of at least this many keys (4 MB of Int32, past L2) with at most 1 key in DIRECT_FILTER_SPARSE present gets a presence
+comptime DIRECT_FILTER_SPARSE = 4       # bitmap (the runtime join filter: a miss is answered by one load from a cache-resident bitmap, the array is read only for hits)
 comptime GROUP = 16                     # keys looked up per prefetch group
 comptime HUGE = 1 << 21
 comptime E_TOO_MANY_ROWS = -31          # 2^31 rows or more on a side
@@ -108,6 +110,7 @@ struct JoinMap(Movable):
     var hi: Int64
     var span: Int                    # direct: hi - lo + 1
     var unique: Bool                 # no key repeats (a presence-only map says True: it keeps one row per key)
+    var maxrep: Int                  # the most build rows one key has (1 when unique; F-161's expansion in the fused front stage is bounded by it)
     var presence: Bool               # built by `hj_build(presence=True)` as a direct array of marks
     var pbits: Int                   # hash: 1 << pbits partitions
     var u: Int                       # direct, unique: Int32[span]  build row or -1
@@ -126,6 +129,7 @@ struct JoinMap(Movable):
         self.hi = 0
         self.span = 0
         self.unique = True
+        self.maxrep = 1
         self.presence = False
         self.pbits = 0
         self.u = 0
@@ -150,7 +154,7 @@ struct JoinMap(Movable):
         if self.presence:
             return "direct array, presence marks only"
         var base = "direct array" if self.mode == MODE_DIRECT else "hash table (" + String(1 << self.pbits) + " partitions)"
-        return base + (", unique keys" if self.unique else ", repeated keys (CSR rows)")
+        return base + (", unique keys" if self.unique else ", repeated keys (CSR rows)") + (", runtime join filter: a bitmap of the " + String(self.nvalid) + " keys in " + String(self.span) + " values answers the misses" if (self.mode == MODE_DIRECT and self.bitmap != 0) else "")
 
 
 struct MapView(ImplicitlyCopyable, Movable):
@@ -358,6 +362,8 @@ def hj_build(keys_a: Int, ok_a: Int, n: Int, threads: Int, presence: Bool = Fals
     var nt = max(1, min(T, P))
     if direct:
         _build_direct(m, prow, pkey, poff, pmax, P, pshift, nt, nvalid)
+        if span >= DIRECT_FILTER_MIN and nvalid * DIRECT_FILTER_SPARSE <= span and pshift >= 3:
+            _direct_filter(m, pkey, poff, P, nt)
     else:
         _build_hash(m, prow, pkey, poff, pmax, P, pbits, nt, nvalid)
     _free(Int(pmax))
@@ -376,6 +382,27 @@ def hj_build(keys_a: Int, ok_a: Int, n: Int, threads: Int, presence: Bool = Fals
         m.bitmap = Int(bm)
         m.bytes += nbytes
     return m^
+
+
+def _direct_filter(mut m: JoinMap, pkey: LP, poff: LP, P: Int, nt: Int):
+    """The presence bitmap of a sparse direct array: one bit per key of lo .. hi. A partition owns a stretch of keys that starts at a multiple of 8, so no two tasks
+    write one byte."""
+    var lo = m.lo
+    var nbytes = (m.span + 7) // 8 + 8
+    var bm = BP(unsafe_from_address=_alloc(nbytes))
+    unsafe_memset_zero(bm, nbytes)
+
+    def mark(t: Int) {imm}:
+        var p = t
+        while p < P:
+            for idx in range(Int(poff[p]), Int(poff[p + 1])):
+                var d = Int(pkey[idx] - lo)
+                bm[d >> 3] = bm[d >> 3] | (UInt8(1) << UInt8(d & 7))
+            p += nt
+
+    par_n(mark, nt, nt)
+    m.bitmap = Int(bm)
+    m.bytes += nbytes
 
 
 def _build_direct(mut m: JoinMap, prow: IP, pkey: LP, poff: LP, pmax: LP, P: Int, pshift: Int, nt: Int, nvalid: Int):
@@ -403,6 +430,7 @@ def _build_direct(mut m: JoinMap, prow: IP, pkey: LP, poff: LP, pmax: LP, P: Int
     var most = Int64(0)
     for p in range(P):
         most = max(most, pmax[p])
+    m.maxrep = max(Int(most), 1)
     if most <= 1:
         m.unique = True
         _free(Int(S))
@@ -495,6 +523,7 @@ def _build_hash(mut m: JoinMap, prow: IP, pkey: LP, poff: LP, pmax: LP, P: Int, 
     var most = Int64(0)
     for p in range(P):
         most = max(most, pmax[p])
+    m.maxrep = max(Int(most), 1)
     m.ent = ent
     m.eoff = Int(eoff)
     m.bytes += 16 * total + 8 * (P + 1)
@@ -583,10 +612,10 @@ def _prefetch_key(m_mode: Int, lo: Int64, hi: Int64, span: Int, unique: Bool, u:
     """Brings the table line of key k toward the cache."""
     if k < lo or k > hi:
         return
+    if bitmap != 0 and not _has_bit(BP(unsafe_from_address=bitmap), Int(k - lo)):
+        return                                                    # (a miss never touches the table: F-161's key bitmap on a direct array, the hash's own presence bits)
     if m_mode == MODE_DIRECT:
         _prefetch((u if unique else s) + 4 * Int(k - lo))
-        return
-    if bitmap != 0 and not _has_bit(BP(unsafe_from_address=bitmap), Int(k - lo)):
         return
     var h = _mix(UInt64(k))
     var p = Int(h >> UInt64(64 - pbits)) if pbits > 0 else 0
@@ -631,9 +660,11 @@ def hj_probe_unique(m: JoinMap, keys_a: Int, ok_a: Int, n: Int, out_a: Int, thre
                 if (not has_ok) or oks[i + j] != 0:
                     var k = keys[i + j]
                     if k >= lo and k <= hi:
-                        if mode == MODE_DIRECT:
+                        if bitmap != 0 and not _has_bit(BP(unsafe_from_address=bitmap), Int(k - lo)):
+                            pass
+                        elif mode == MODE_DIRECT:
                             r = IP(unsafe_from_address=u)[Int(k - lo)]
-                        elif bitmap == 0 or _has_bit(BP(unsafe_from_address=bitmap), Int(k - lo)):
+                        else:
                             var e = _hash_entry(ent, eoff, pbits, k)
                             if e != 0:
                                 r = IP(unsafe_from_address=e + 12)[0]
@@ -650,6 +681,8 @@ def _match(mode: Int, unique: Bool, lo: Int64, hi: Int64, u: Int, s: Int, ent: I
     count = 0
     start = 0
     if k < lo or k > hi:
+        return
+    if bitmap != 0 and not _has_bit(BP(unsafe_from_address=bitmap), Int(k - lo)):
         return
     if mode == MODE_DIRECT:
         var d = Int(k - lo)
@@ -923,9 +956,11 @@ def hj_probe_block(v: MapView, keys: LP, ok: BP, has_ok: Bool, i0: Int, sel: IP,
             if k < lo or k > hi:
                 continue
             var b = Int32(-1)
-            if mode == MODE_DIRECT:
+            if bitmap != 0 and not _has_bit(BP(unsafe_from_address=bitmap), Int(k - lo)):
+                pass
+            elif mode == MODE_DIRECT:
                 b = IP(unsafe_from_address=u)[Int(k - lo)]
-            elif bitmap == 0 or _has_bit(BP(unsafe_from_address=bitmap), Int(k - lo)):
+            else:
                 var e = _hash_entry(ent, eoff, pbits, k)
                 if e != 0:
                     b = IP(unsafe_from_address=e + 12)[0]
@@ -995,11 +1030,41 @@ def hj_probe_left_block(v: MapView, keys: LP, ok: BP, has_ok: Bool, i0: Int, sel
             if (not has_ok) or ok[row] != 0:
                 var k = keys[row]
                 if k >= v.lo and k <= v.hi:
-                    if mode == MODE_DIRECT:
+                    if v.bitmap != 0 and not _has_bit(BP(unsafe_from_address=v.bitmap), Int(k - v.lo)):
+                        pass
+                    elif mode == MODE_DIRECT:
                         b = IP(unsafe_from_address=v.u)[Int(k - v.lo)]
-                    elif v.bitmap == 0 or _has_bit(BP(unsafe_from_address=v.bitmap), Int(k - v.lo)):
+                    else:
                         var e = _hash_entry(v.ent, eoff, v.pbits, k)
                         if e != 0:
                             b = IP(unsafe_from_address=e + 12)[0]
             prow[i + j] = b
         i += g
+
+
+def hj_probe_block_rep(v: MapView, keys: LP, ok: BP, has_ok: Bool, i0: Int, sel: IP, n: Int, act: IP, st: IP, cnt: IP, left: Bool) -> Int:
+    """The fused form for a map whose keys repeat (F-161): for the block rows `sel[0..n)` (row = i0 + sel[j]) look the key up. A row with partners becomes an entry
+    of the active list: `act[e]` its block row, `st[e]` the offset of its first build row in the map's row array (`v.r`), `cnt[e]` how many. With `left`,
+    a row without a partner (or a usable key) is an entry with `cnt[e] = 0`. The entries are in `sel` order. Returns how many entries."""
+    var eoff = LP(unsafe_from_address=v.eoff)
+    var nact = 0
+    var i = 0
+    while i < n:
+        var g = min(GROUP, n - i)
+        if v.mode != MODE_EMPTY:
+            for j in range(g):
+                if (not has_ok) or ok[i0 + Int(sel[i + j])] != 0:
+                    _prefetch_key(v.mode, v.lo, v.hi, 0, False, v.u, v.s, v.ent, eoff, v.pbits, v.bitmap, keys[i0 + Int(sel[i + j])])
+        for j in range(g):
+            var row = i0 + Int(sel[i + j])
+            var start = 0
+            var count = 0
+            if (not has_ok) or ok[row] != 0:
+                _lookup(v.mode, False, v.lo, v.hi, v.u, v.s, v.ent, eoff, v.pbits, v.bitmap, keys[row], start, count)
+            if count > 0 or left:
+                act[nact] = sel[i + j]
+                st[nact] = Int32(start)
+                cnt[nact] = Int32(count)
+                nact += 1
+        i += g
+    return nact

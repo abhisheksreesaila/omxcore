@@ -37,7 +37,7 @@ from .joincore import JoinKeys, JoinSide, KeyPlan, make_key_plan, column_ndv, no
 from .kernels.hashjoin_cpu import hj_build, JoinMap, PM_SEMI, PM_ANTI, PM_ANTI_NA, PM_NONE
 from .kargs import KernelRun
 from .winsql import plan_windows, finish_windows, point_wide_columns, fix_wide_columns, WIN_TABLE
-from .jfront import FusedJoin, StageData, StreamStage, ProbeStream, chunk_join, stream_template, front_spec, jf_front
+from .jfront import EXPAND_MAX_REP, pred_reads_probe_only, FusedJoin, StageData, StreamStage, ProbeStream, chunk_join, stream_template, front_spec, jf_front
 from std.memory import ArcPointer
 from .gpu import DeviceTable, HAS_GPU, gpu_available
 from .rows import RowStage, prepare_rows, execute_rows, _Item
@@ -584,15 +584,17 @@ struct _Gpu(Movable):
         return "device: CPU (" + who + (": " if self.asked == AUTO else "; ") + self.reason() + ")"
 
 
-comptime OP_LT = 20      # (query.mojo has no names for the kernel's float compares OP_LT .. OP_NE, 20 .. 25; SQL tests its 0 / 1 predicate registers with them,
-comptime OP_NE = 25      #  and no other float value reaches the program: a FLOAT column and I2F are declined above)
+comptime OP_SUBF = 11    # float64 x - y (three-valued logic: 1.0 - unknown), the kernel's OP_SUB
+comptime OP_LT = 20      # query.mojo has no names for the kernel's float64 compares OP_LT .. OP_NE (20 .. 25). SQL emits them on 0 / 1 predicate registers and on
+comptime OP_NE = 25      # float constants (0.0, 0.5, 1.0) for NULL / unknown handling (three-valued AND / OR); the GPU kernel compares them as float64 like the CPU
+                         # (pipeline_gpu.mojo OP_LT .. OP_NE). A FLOAT column and I2F never reach here: `_gpu_blocker` declines them.
 
 
 def _gpu_op_ok(op: Int) -> Bool:
     """The integer instructions the builder's GPU kernel runs with the CPU's meaning (kernels_aot/pipeline_gpu.mojo)."""
     return (op == OP_LOAD_CONST or op == OP_LOADI or op == OP_IADD or op == OP_ISUB or op == OP_IMUL or op == OP_AND or op == OP_OR or op == OP_NOT or
             op == OP_SELECT or op == OP_ISNULL or op == OP_IDIV or op == OP_IMOD or op == OP_IMIN or op == OP_IMAX or op == OP_ICMP or
-            op == OP_AGG_ISUM or op == OP_AGG_IMIN or op == OP_AGG_IMAX or (op >= OP_LT and op <= OP_NE) or op == OP_F2I)
+            op == OP_AGG_ISUM or op == OP_AGG_IMIN or op == OP_AGG_IMAX or (op >= OP_LT and op <= OP_NE) or op == OP_F2I or op == OP_SUBF)
 
 
 def _bad_op(ins: List[Int32]) -> Int:
@@ -627,8 +629,9 @@ def _gpu_blocker(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, sp: SqlProgr
 
 
 def _pick_device(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, opts: PlannerOptions, two_pass: Bool, fj: Bool) -> _Gpu:
-    """CPU never touches the GPU. AUTO runs on the CPU unless the table has `opts.gpu_min_rows` rows (the builder's rule) and the GPU programs run the
-    query. GPU runs what the programs run. Everything else is the CPU with the reason."""
+    """CPU never touches the GPU. AUTO runs on the CPU unless a DeviceTable of this table is attached (its data is resident: uploading per query costs more than
+    the CPU's answer), the table has `opts.gpu_min_rows` rows (the builder's rule) and the GPU programs run the query. GPU runs what the programs run, uploading
+    the table for the query when none is attached. Everything else is the CPU with the reason."""
     var g = _Gpu(opts.device)
     if opts.device == CPU:
         return g^
@@ -639,23 +642,34 @@ def _pick_device(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, sp: SqlProgr
     if blocker.byte_length() > 0:
         g.why = blocker^
         return g^
+    var attached = _attached(src, opts)
+    if opts.device == AUTO and not attached:
+        g.why = "no table resident on the GPU (attach a DeviceTable, or --device gpu uploads it for the query)"
+        return g^
     comptime if HAS_GPU:
         if not gpu_available():
             g.why = "no GPU found"
             return g^
         g.use = True
+        g.uploaded = not attached
     else:
         g.why = "no GPU on this build"
     return g^
 
 
+def _attached(src: SqlSource, opts: PlannerOptions) -> Bool:
+    """A live DeviceTable made from this source's table is attached."""
+    return Bool(opts.device_table) and src.kind == SRC_TABLE and opts.device_table.value().is_live() and opts.device_table.value().mirrors(src.table)
+
+
 def _gpu_open(src: SqlSource, opts: PlannerOptions, mut g: _Gpu) raises:
-    """The device copy of the table: the attached one, else the table is uploaded for this query. A table that does not fit stays unresident (it runs in pieces)."""
-    if opts.device_table and opts.device_table.value().is_live() and opts.device_table.value().mirrors(src.table):
+    """The device copy of the table: the attached one, else the table is uploaded for this query (every column: `DeviceTable` takes a whole table). A table that
+    does not fit stays unresident (it runs in pieces). A copy uploaded by an earlier run of this query (the 128-bit retry) is released first."""
+    g.dt = None
+    if _attached(src, opts):
         g.dt = opts.device_table.value()
     else:
         g.dt = DeviceTable(src.table)
-        g.uploaded = True
 
 
 def _gpu_chunk(chunk: SharedTable, sp: SqlProgram, mut g: _Gpu, job: JobCtl) raises -> Optional[QueryResult]:
@@ -929,6 +943,8 @@ def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
     var delta_rows = len(lsrc.overlay.delta)
     if gpu.use:                                                       # F-191
         _gpu_open(src, opts, gpu)
+    if fj and not ps and fj.value()[].pred_first and sp.p.pred_reg >= 0 and pred_reads_probe_only(sp.p, fj.value()[].n_probe_cols):
+        notes.append("probe filter first: the filter reads only the probe table's columns, so each block of 1,024 rows is filtered before the probe and only the rows that pass are probed")
     var t_run = perf_counter_ns()
     var ns_load = 0
     opts.job.stage(STAGE_AGGREGATE)
@@ -1035,6 +1051,12 @@ def _prefill_ranges(mut src: SqlSource, jq: BoundQuery, pt: SharedTable, bt: Sha
 
 def _side_names(q: BoundQuery, t: Int) -> String:
     return q.tab_alias[t] if q.tab_alias[t].byte_length() > 0 else q.tab_names[t]
+
+
+def _expand_note(expands: Bool, maxrep: Int) -> String:
+    if not expands:
+        return String("")
+    return " (the build side's keys repeat, up to " + commas(maxrep) + " rows of a key: each probe row is expanded to its partners in rounds inside the front stage, no pairs are written)"
 
 
 def _kind_name(k: Int) -> String:
@@ -1337,13 +1359,18 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
     var right = _plain_side(catalog, q, 1, rneed)
     var lrows = 0
     var rrows = 0
+    var pf0 = False                                                  # F-161: side t's selective filter is left to the pipeline, which runs it before the probe
+    var pf1 = False
     if str0:
         lrows = catalog.sources[q.sources[0]].rows()                 # (its rows before the filter: the side is not read to count them)
     elif may0:
         lrows = _count_side[P](catalog, q, 0, planner, opts, trust)
-        if lrows * DEFER_PASS_DEN < catalog.sources[q.sources[0]].table.rows():      # a selective filter: writing the few rows that pass beats probing them all
-            may0 = False
-            left = _join_side[P](catalog, q, 0, lneed, planner, opts, trust)
+        if lrows * DEFER_PASS_DEN < catalog.sources[q.sources[0]].table.rows():      # a selective filter: writing the few rows that pass beats probing them all ...
+            if len(q.conj_x) == 0:
+                pf0 = True                                       # ... unless the pipeline runs the filter first and probes only those rows (F-161): nothing is written
+            else:
+                may0 = False
+                left = _join_side[P](catalog, q, 0, lneed, planner, opts, trust)
     else:
         left = _join_side[P](catalog, q, 0, lneed, planner, opts, trust)
         lrows = left.table.rows()
@@ -1352,8 +1379,11 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
     elif may1:
         rrows = _count_side[P](catalog, q, 1, planner, opts, trust)
         if rrows * DEFER_PASS_DEN < catalog.sources[q.sources[1]].table.rows():
-            may1 = False
-            right = _join_side[P](catalog, q, 1, rneed, planner, opts, trust)
+            if len(q.conj_x) == 0:
+                pf1 = True
+            else:
+                may1 = False
+                right = _join_side[P](catalog, q, 1, rneed, planner, opts, trust)
     else:
         right = _join_side[P](catalog, q, 1, rneed, planner, opts, trust)
         rrows = right.table.rows()
@@ -1401,6 +1431,7 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
     var t_build = perf_counter_ns()
     var t_probe = perf_counter_ns()
     var fusable = False
+    var expands = False
     var pass_no = 0
     var kplan = KeyPlan()
     var probe_src = SqlSource("", Table.empty().share())             # a streamed probe's source (a copy of the catalog's)
@@ -1444,7 +1475,8 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
         if fmode == PM_ANTI_NA and not streaming:
             unmatchable_not_null(keys, m.lo, m.hi, left.table, left.key_cols[0], left.table.rows())
         t_probe = perf_counter_ns()
-        fusable = opts.fuse and not keys.verify and not any_holistic and (m.unique or semi_anti)
+        expands = kind <= 1 and not q.rows and not m.unique and m.maxrep <= EXPAND_MAX_REP        # F-161: an aggregate over repeated build keys expands in the front stage
+        fusable = opts.fuse and not keys.verify and not any_holistic and (m.unique or semi_anti or expands)
         if streaming and (kplan.hashed or fmode == PM_ANTI_NA):
             fusable = False                                          # (hashed tuples are verified per pair; NOT IN's unmatchable words are settled over the whole probe side)
         if defer_probe >= 0 and not fusable and pass_no == 1:
@@ -1508,13 +1540,14 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
         cat2.sources[0].fixed_rows = np
         _stream_overlay_fix(cat2.sources[0], probe_src, vstage, vreal_s)
         _prefill_ranges_stream(cat2.sources[0], jq, bside, vstage, vreal_s)
+        var maxrep = m.maxrep
         var stages = List[StreamStage]()
         stages.append(StreamStage(bside, ArcPointer(m^), kplan^, probe_keys_src.copy()))
         var ps = ArcPointer(ProbeStream(probe_src.copy(), used^, pos^, stages^, fmode, False, vstage^, vreal_s^))
         var template = ArcPointer(stream_template(ps))
         res.notes.append("join path: fused: " + commas(np) + " probe rows (before the filter) of " + String(len(ps[].used)) + " columns arrive chunk by chunk, " +
                          ("each looks its partner up in blocks of 1,024" if not semi_anti else "each is kept or dropped by whether its key is present in the build side, in blocks of 1,024") +
-                         " (no joined row is written, no copy of the probe side)" + (" (a row without a partner stays: its build-side columns are NULL)" if kind == 1 else ""))
+                         " (no joined row is written, no copy of the probe side)" + (" (a row without a partner stays: its build-side columns are NULL)" if kind == 1 else "") + _expand_note(expands, maxrep))
         inner = _run_sql_once(cat2, jq, planner, opts, trust, lie, template)
     elif fusable:
         # fused: no joined row is written; the pipeline probes block by block (keeps or drops the rows by the join's rule) and gathers the build side's columns into scratch
@@ -1532,7 +1565,9 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
         var pt = right.table if left_builds else left.table
         var bt = left.table if left_builds else right.table
         _prefill_ranges(cat2.sources[0], jq, pt, bt, vprobe, vreal)
-        var fj = ArcPointer(FusedJoin(pt, bt, vprobe^, vreal^, ArcPointer(m^), keys^, fmode))
+        var fjv = FusedJoin(pt, bt, vprobe^, vreal^, ArcPointer(m^), keys^, fmode)
+        fjv.pred_first = defer_probe >= 0 and (pf0 if defer_probe == 0 else pf1)          # F-161: the selective probe filter runs before the probe
+        var fj = ArcPointer(fjv^)
         if semi_anti:
             res.notes.append("join path: fused: " + commas(np) + " probe rows are " +
                              ("kept when their key is present in the build side" if kind == 2 else "dropped when their key is present in the build side" if kind == 3 else "kept when their key is absent from the list") +
@@ -1540,7 +1575,7 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
         else:
             res.notes.append("join path: fused: " + commas(np) + " probe rows look their partner up in blocks of 1,024 and " + String(len(fj[].partner)) +
                              " build-side " + ("column is" if len(fj[].partner) == 1 else "columns are") + " gathered into per-worker scratch (no joined row is written)" +
-                             (" (a row without a partner stays: its build-side columns are NULL)" if kind == 1 else ""))
+                             (" (a row without a partner stays: its build-side columns are NULL)" if kind == 1 else "") + _expand_note(expands, fj[].map[].maxrep))
         inner = _run_sql_once(cat2, jq, planner, opts, trust, lie, fj)
     else:
         var t_gather = perf_counter_ns()
@@ -1562,6 +1597,8 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
             why = " (a holistic aggregate needs every joined row)"
         elif keys.verify:
             why = " (the keys are hashed tuples, verified per pair)"
+        elif not m.unique and not semi_anti and not q.rows and kind <= 1 and m.maxrep > EXPAND_MAX_REP:
+            why = " (the build side's keys repeat, one up to " + commas(m.maxrep) + " times: past " + String(EXPAND_MAX_REP) + " the front stage would need a round for each)"
         elif not m.unique and not semi_anti:
             why = " (the build side's keys repeat)"
         if semi_anti:

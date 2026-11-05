@@ -52,6 +52,8 @@ def test_default_is_auto_and_a_small_table_runs_on_the_cpu_saying_why(mx, data):
 
 
 def test_device_cpu_never_touches_the_gpu(mx, data):
+    """Checks the answer, `device` and the note. It cannot prove that no GPU context was created (there is no counter for that); the code path is that
+    `_pick_device` returns before anything GPU-side when the device is CPU."""
     path, con = data
     res = check(mx, AGG, con, files={"t": path}, ordered=True, extra=("--device", "cpu", "--gpu-min-rows", "0"))
     assert res["device"] == "cpu"
@@ -71,13 +73,13 @@ def test_device_gpu_runs_the_aggregates_and_equals_duckdb(mx, data, has_gpu):
         assert "device: GPU (GPU asked for, the table uploaded for this query)" in res["notes"]
 
 
-def test_auto_goes_to_the_gpu_at_its_row_threshold(mx, data, has_gpu):
-    if not has_gpu:
-        pytest.skip("no GPU on this machine")
+def test_auto_stays_on_the_cpu_without_a_resident_table(mx, data, has_gpu):
+    """The command line has no DeviceTable (uploading per query is slower than the CPU's answer), so AUTO answers on the CPU even over its row threshold
+    and says why; `--device gpu` uploads the table. (AUTO going to the GPU with a DeviceTable attached is tests `mojo/tests/test_sql_gpu.mojo`.)"""
     path, con = data
-    on = check(mx, AGG, con, files={"t": path}, ordered=True, extra=("--gpu-min-rows", "400"))
-    off = check(mx, AGG, con, files={"t": path}, ordered=True, extra=("--gpu-min-rows", "401"))
-    assert (on["device"], off["device"]) == ("gpu", "cpu"), notes_of(on) + notes_of(off)
+    res = check(mx, AGG, con, files={"t": path}, ordered=True, extra=("--gpu-min-rows", "0"))
+    assert res["device"] == "cpu"
+    assert any(n.startswith("device: CPU (AUTO: no table resident on the GPU") for n in res["notes"]), notes_of(res)
 
 
 def test_what_the_gpu_programs_do_not_run_stays_on_the_cpu_with_the_reason(mx, data):

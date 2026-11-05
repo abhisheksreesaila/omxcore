@@ -14,18 +14,28 @@ both alive for the whole kernel call.
 from std.memory import ArcPointer
 from .table import SharedTable, Table
 from .bind import SqlSource
-from .query import Program
+from .query import Program, OP_LOAD_COL, OP_LOADI, OP_ISNULL
 from .kernels.pipeline_cpu import IP, LP, FP, BP, VEC
-from .kernels.hashjoin_cpu import JoinMap, MapView, load_view, hj_probe_block, hj_probe_left_block, hj_filter_block
+from .kernels.hashjoin_cpu import JoinMap, MapView, load_view, hj_probe_block, hj_probe_left_block, hj_filter_block, hj_probe_block_rep
 from .kargs import KernelRun
 from .joincore import JoinKeys, KeyPlan, probe_chunk_keys
 
 comptime DT_NULLMASK = 7
+comptime OP_CMPC = 38        # (kernels_aot/pipeline_cpu.mojo) the opcodes that read a program column; the others read registers
+comptime OP_STR = 40
 
 # how the front stage treats a probe row (F-154): the inner join drops rows without a partner; a LEFT join keeps them (their build columns are NULL);
 # a semi / anti join keeps or drops rows by whether the key is present and gathers nothing (the numbers are the kernel's `PM_*` modes)
 comptime FM_INNER = 0
 comptime FM_LEFT = 1
+
+# F-161: a map whose keys repeat is expanded inside the front stage. The block's probe rows with partners become a list of (row, first partner, how many);
+# round r puts out the r-th partner of every row that has one, so no row appears twice in a round (the build columns are gathered per block row) and a block
+# takes as many calls as its most repeated key has rows. The front sets this bit in its return value while rounds remain (the kernel calls it again).
+comptime FRONT_MORE = 1 << 40
+comptime FRONT_PRESEL = 1 << 41          # the front's `n` argument: `sel` already lists the rows to probe (pipeline_cpu.FRONT_PRESEL)
+comptime FRONT_COUNT_MASK = (1 << 32) - 1
+comptime EXPAND_MAX_REP = 64           # a key with more build rows than this is not expanded in the front stage (a hot key would need that many rounds per block)
 
 
 struct StageData(Movable):
@@ -91,12 +101,14 @@ struct FusedJoin(Movable):
     var fmode: Int                   # FM_INNER, FM_LEFT, or a presence filter mode (semi / anti: no partner columns)
     var partner_table: List[SharedTable]   # the table each partner column comes from (one table for a join; a star has one per dimension)
     var partner_stage: List[Int]           # ... and which stage (dimension) of the star
+    var pred_first: Bool             # F-161: the caller asks for the program's predicate to run before the probe when it reads only the probe table's columns
     var stages: List[StageData]      # a star: the dimensions probed one after the other, each with unique keys (empty for a single join)
 
     def __init__(out self, probe: SharedTable, build: SharedTable, var vprobe: List[Bool], var vreal: List[Int], map: ArcPointer[JoinMap], var keys: JoinKeys, fmode: Int = 0):
         self.fmode = fmode
         self.n_probe_cols = probe.columns()
         self.stream = None
+        self.pred_first = False
         self.probe = probe
         self.build = build
         self.vpartner = List[Int]()
@@ -122,6 +134,7 @@ struct FusedJoin(Movable):
         self.fmode = 0
         self.n_probe_cols = probe.columns()
         self.stream = None
+        self.pred_first = False
         self.probe = probe
         self.build = probe
         self.vprobe = List[Bool]()
@@ -166,6 +179,10 @@ struct FrontSpec(ImplicitlyCopyable, Movable):
     var off_bits: Int
     var ws_bytes: Int
     var fmode: Int
+    var pred_first: Bool             # F-161: the program's predicate reads only probe columns: it runs first (the kernel's Prog.pred_first)
+    var expand: Bool                 # F-161: the map's keys repeat; the block is put out in rounds (`_jf_expand`)
+    var off_exp: Int                 # ... its state (8 words) and the active rows' arrays (block row, first partner, partners), in the scratch
+    var rows_a: Int                  # ... the map's array of build rows
     var n_stages: Int                # a star: how many dimensions, ...
     var stages_a: Int                # ... and their 15 words each (the map's 11, the probe keys' address, the NULL flags' address, 2 spare)
 
@@ -173,6 +190,10 @@ struct FrontSpec(ImplicitlyCopyable, Movable):
         self.n_stages = 0
         self.stages_a = 0
         self.fmode = 0
+        self.pred_first = False
+        self.expand = False
+        self.off_exp = 0
+        self.rows_a = 0
         self.view = MapView(JoinMap())
         self.keys_a = 0
         self.ok_a = 0
@@ -194,12 +215,27 @@ def _align8(n: Int) -> Int:
     return (n + 7) // 8 * 8
 
 
+def pred_reads_probe_only(p: Program, first: Int) -> Bool:
+    """True when no instruction of the predicate reads a column of the build side (program columns from table column `first` on are the build side's)."""
+    for k in range(len(p.pred) // 5):
+        var op = Int(p.pred[5 * k])
+        if op == OP_LOAD_COL or op == OP_LOADI or op == OP_CMPC or op == OP_STR or op == OP_ISNULL:
+            if p.cols[Int(p.pred[5 * k + 2])] >= first:
+                return False
+    return True
+
+
 def front_spec(mut run: KernelRun, fj: FusedJoin, p: Program) raises -> FrontSpec:
     """Which of the program's columns are the build side's, and where the front stage finds what it gathers. The arrays go into the run's
     regions (alive as long as the run, which the kernel call is a method of)."""
     var fs = FrontSpec()
     fs.view = MapView(fj.map[])
     fs.fmode = fj.fmode
+    fs.expand = fj.fmode <= FM_LEFT and len(fj.stages) == 0 and not fj.map[].unique
+    fs.rows_a = fj.map[].r
+    if fj.pred_first and p.pred_reg >= 0 and pred_reads_probe_only(p, fj.n_probe_cols):
+        fs.pred_first = True
+        run.code[8] = Int32(1)
     fs.keys_a = fj.keys.pk_addr
     fs.ok_a = fj.keys.po_addr
     fs.n_words = len(p.cols)
@@ -245,21 +281,29 @@ def front_spec(mut run: KernelRun, fj: FusedJoin, p: Program) raises -> FrontSpe
     fs.off_prow = _align8(fs.n_words * 8)
     fs.off_vals = fs.off_prow + max(fs.n_stages, 1) * VEC * 4
     fs.off_bits = fs.off_vals + fs.n_partner * VEC * 8
-    fs.ws_bytes = fs.off_bits + fs.n_partner * (VEC // 8) + 64
+    fs.off_exp = _align8(fs.off_bits + fs.n_partner * (VEC // 8))
+    fs.ws_bytes = fs.off_exp + (64 + 3 * VEC * 4 if fs.expand else 0) + 64
+    if fs.expand:
+        fs.ws_bytes |= fj.map[].maxrep << 32                         # the kernel cuts its morsels by the most partners a row can have (pipeline_cpu.morsel_rows)
     return fs
 
 
-def jf_front(fs: FrontSpec, i0: Int, n: Int, sel: IP, ws: BP) -> Int:
+def jf_front(fs: FrontSpec, i0: Int, n_arg: Int, sel: IP, ws: BP) -> Int:
     """One block: probe, drop the misses, gather the partners' columns into the worker's scratch, and aim the program's column table at the
-    probe table and the scratch (rebased by the block's first row, as the kernel's loads index `i0 + row`)."""
-    for j in range(n):
-        sel[j] = Int32(j)
+    probe table and the scratch (rebased by the block's first row, as the kernel's loads index `i0 + row`). `n_arg` is the block's row count; with
+    `FRONT_PRESEL` it is the number of rows `sel` lists already (the predicate ran first), else every row of the block is probed."""
+    var n = n_arg & FRONT_COUNT_MASK
+    if (n_arg & FRONT_PRESEL) == 0:
+        for j in range(n):
+            sel[j] = Int32(j)
     if fs.n_stages > 0:
         return _jf_star(fs, i0, n, sel, ws)
     var prow = IP(unsafe_from_address=Int(ws) + fs.off_prow)
     var keys = LP(unsafe_from_address=fs.keys_a)
     var okp = BP(unsafe_from_address=fs.ok_a if fs.ok_a != 0 else Int(ws))
     var kept: Int
+    if fs.expand:
+        return _jf_expand(fs, i0, n, sel, ws, prow, keys, okp)
     if fs.fmode == FM_INNER:
         kept = hj_probe_block(fs.view, keys, okp, fs.ok_a != 0, i0, sel, n, prow)
     elif fs.fmode == FM_LEFT:
@@ -269,6 +313,13 @@ def jf_front(fs: FrontSpec, i0: Int, n: Int, sel: IP, ws: BP) -> Int:
         kept = hj_filter_block(fs.view, keys, okp, fs.ok_a != 0, i0, sel, n, fs.fmode)
     if kept == 0:
         return 0
+    _gather(fs, i0, ws, sel, prow, kept)
+    return kept
+
+
+def _gather(fs: FrontSpec, i0: Int, ws: BP, sel: IP, prow: IP, kept: Int):
+    """The partners' columns of the `kept` rows `sel[t]` (partner `prow[t]`, -1: a LEFT join's row without one) into the worker's scratch, and the
+    program's column table aimed at them."""
     var lc = LP(unsafe_from_address=Int(ws))
     var arow = LP(unsafe_from_address=fs.tbl_a) + 2
     for q in range(fs.n_words):
@@ -310,7 +361,41 @@ def jf_front(fs: FrontSpec, i0: Int, n: Int, sel: IP, ws: BP) -> Int:
                 bits[b >> 3] = bits[b >> 3] | (UInt8(1) << UInt8(b & 7))
         lc[slot] = Int64(Int(bits))
         lc[slot + 1] = Int64(-i0)
-    return kept
+
+
+def _jf_expand(fs: FrontSpec, i0: Int, n: Int, sel: IP, ws: BP, prow: IP, keys: LP, okp: BP) -> Int:
+    """One round of a block over a map whose keys repeat. The first call for a block probes its rows and keeps the list of those with partners (all of
+    them in a LEFT join, a row without one has no partners to put out but its NULL ones); each call puts out the next partner of every row in the list
+    and drops the rows that have no more, then says in its return value (`FRONT_MORE`) whether another round remains."""
+    var stt = LP(unsafe_from_address=Int(ws) + fs.off_exp)
+    var act = IP(unsafe_from_address=Int(ws) + fs.off_exp + 64)
+    var st = act + VEC
+    var cnt = st + VEC
+    var left = fs.fmode == FM_LEFT
+    if stt[0] == 0:
+        stt[2] = Int64(hj_probe_block_rep(fs.view, keys, okp, fs.ok_a != 0, i0, sel, n, act, st, cnt, left))
+        stt[1] = 0
+    var r = Int(stt[1])
+    var nact = Int(stt[2])
+    var rows = IP(unsafe_from_address=fs.rows_a)
+    var nk = 0
+    for e in range(nact):
+        sel[e] = act[e]
+        prow[e] = rows[Int(st[e]) + r] if cnt[e] > 0 else Int32(-1)
+        if Int(cnt[e]) > r + 1:
+            act[nk] = act[e]
+            st[nk] = st[e]
+            cnt[nk] = cnt[e]
+            nk += 1
+    stt[2] = Int64(nk)
+    if nk > 0:
+        stt[0] = 1
+        stt[1] = Int64(r + 1)
+    else:
+        stt[0] = 0
+    if nact > 0:
+        _gather(fs, i0, ws, sel, prow, nact)
+    return nact + (FRONT_MORE if nk > 0 else 0)
 
 
 def _jf_star(fs: FrontSpec, i0: Int, n: Int, sel: IP, ws: BP) -> Int:

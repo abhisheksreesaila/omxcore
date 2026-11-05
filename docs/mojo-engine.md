@@ -155,7 +155,9 @@ without them. Malformed SQL never crashes (fuzzed); every unsupported form raise
 
 A hash-join kernel (`libmxhashjoin_cpu.so`, a C interface any language can call) builds a direct array when keys are
 dense and radix-partitioned tables when they are not, in parallel without atomics. Unique build keys join inside the
-aggregation kernel (no joined row is written); repeated keys or row output materialize pairs under a memory budget.
+aggregation kernel (no joined row is written); repeated keys expand inside the same pass for aggregates (F-161: each probe row
+puts out its partners in rounds, so an m:n join or a LEFT join with repeated build keys writes no pairs); row output materializes
+pairs under a memory budget.
 Keys follow SQL and DuckDB exactly: NULL never matches, text matches byte for byte across tables, decimals are aligned,
 NaN matches NaN.
 
@@ -233,7 +235,7 @@ queries (`ORDER BY ... LIMIT` keeps the best rows of each chunk in per-worker he
 for a star of unique-key dimensions. The note `join path: fused: ... chunk by chunk` says so. Peak memory is the build side plus
 the row groups being decoded (up to min(threads, 8) at once, a worker each, for every scan aggregate), not the file: a 6M-row,
 6-column scan joined to a 1,000-row dimension peaked at 384 MB read whole and 75 MB streamed (`ru_maxrss` of a fresh `mx`
-process; not a timing). When the build keys repeat or are hashed, the join falls back to materializing the probe side.
+process; not a timing). When the build keys are hashed (or repeat in a row query or past 64 rows a key), the join falls back to materializing the probe side.
 
 The build side is collected row by row and counted against the join's memory budget while it grows
 (`PlannerOptions.join_budget`, `mx --join-budget`): a build side past it raises "the build side of the join (t) has N rows of
@@ -247,8 +249,10 @@ columns are columns of a join too, on either side (`s.net`, `s.*`); a formula as
 
 ## Still behind DuckDB (next)
 
-- Multi-table joins that write intermediate rows (TPC-H Q5, Q7, Q10: 2-4x) and one-to-many LEFT joins: F-161, a
-  star-aware planner that probes every dimension in one pass, filters kept inside the join.
+- Multi-table joins that write intermediate rows (TPC-H Q5, Q7, Q10: 2-4x): F-161's rest, a star-aware planner that
+  probes every dimension in one pass. Built in F-161 and **not measured yet** (the machine was shared): one-to-many expansion in the
+  fused front stage (customer LEFT JOIN orders GROUP BY, TPC-H Q12 and Q14 shapes), a selective probe filter run before the
+  probe, a bitmap that answers a sparse direct array's misses.
 - Full sorts and million-row outputs (~2x), and text functions that build new words over huge dictionaries (F-167).
 - Still to build: the gate: all 22
   TPC-H queries through `mx` equal to DuckDB (F-162), and the quiet-machine scoreboard against DuckDB and Polars on
