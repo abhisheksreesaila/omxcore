@@ -239,6 +239,8 @@ def _view_slot[P: Planner](mut run: QueryRun, mut catalog: Catalog, vi: Int, nam
     var vopts = opts.copy()
     vopts.sink = None                                   # a view's rows are a table, whatever file the outer query writes
     var r = sql_with(vcat, catalog.view_text(vi), planner, vopts)
+    if r.table.any_wide():                              # (as register_result: the steps after a view read int64s)
+        raise Error(OVERFLOW_MESSAGE)
     var shared = r.take_table().share()
     var rows = shared.rows()
     catalog.cache[].put(key^, shared, inputs^)

@@ -1,7 +1,7 @@
 # F-160: named views, preview with the LIMIT pushed down, the result cache (counted by runs, not by time), and COPY (query) TO 'file.parquet'.
 # The expected rows are DuckDB's on the same ten rows (create view ... as ...; the edits as UPDATEs).
 from omxcore import (Table, SharedTable, Frame, Catalog, Query, col, lit, sql, preview, SqlResult, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, write_parquet, read_parquet,
-                     scan_parquet, ZSTD)
+                     scan_parquet, ZSTD, sql_job, Job, JOB_DONE)
 
 
 def fail(msg: String) raises:
@@ -130,6 +130,7 @@ def preview_pushes_the_limit() raises:
     var r = preview(cat, "ranked", 3)
     check(rows_of(r.table), "east 9\neast 7\nNULL 6\n", "the first 3 rows of an ordered view")
     has_note(r, "preview ranked: LIMIT 3 pushed into the view's query")
+    has_note(r, "top-3 wanted")
     r = preview(cat, "ranked", 0)
     check_int(r.table.rows(), 0, "0 rows")
     r = preview(cat, "ranked")
@@ -279,9 +280,9 @@ def copy_writes_parquet() raises:
     var msgs: List[String] = ["COPY (SELECT qty FROM orders) TO 'x.csv'", "COPY (SELECT qty FROM orders) TO 'x.parquet' (FORMAT CSV)",
                               "COPY (SELECT qty FROM orders) TO 'x.parquet' (COMPRESSION lz4)", "COPY SELECT qty FROM orders TO 'x.parquet'",
                               "COPY (SELECT qty FROM orders) 'x.parquet'", "COPY (SELECT qty FROM orders TO 'x.parquet'",
-                              "COPY (SELECT qty FROM orders) TO 'x.parquet' (DELIMITER ',')", "COPY (SELECT qty FROM orders) TO 'x.parquet' (ROW_GROUP_SIZE 7)"]
+                              "COPY (SELECT qty FROM orders) TO 'x.parquet' (DELIMITER ',')", "COPY (SELECT qty FROM orders) TO 'x.parquet' (ROW_GROUP_SIZE 7)", "COPY (SELECT qty FROM orders) TO 'x.parquet' (ROW_GROUP_SIZE 0)"]
     var wants: List[String] = ["Parquet only", "Parquet only", "zstd, snappy or uncompressed", "COPY takes a query in parentheses", "needs TO", "never closed",
-                               "not supported", "multiple of 8"]
+                               "not supported", "multiple of 8", "positive multiple of 8"]
     for i in range(len(msgs)):
         var failed = False
         try:
@@ -294,6 +295,92 @@ def copy_writes_parquet() raises:
             fail("`" + msgs[i] + "` should have failed")
 
 
+def big_ids(n: Int) raises -> SharedTable:
+    var t = Table.empty()
+    var id = t.add_column("id", INT)
+    for i in range(n):
+        t.append(id, Int64(i))
+    return t^.share()
+
+
+def note_with(r: SqlResult, text: String) -> String:
+    for n in r.notes:
+        if text in n:
+            return n
+    return String()
+
+
+def preview_stops_the_scan() raises:
+    """The engine says how many rows it read: a preview reads a few slices, the same LIMIT put after the view reads the whole view."""
+    var cat = Catalog()
+    cat.add_table("big", big_ids(400000))
+    cat.view("v", "SELECT id FROM big WHERE id >= 0")
+    var r = preview(cat, "v", 5)
+    check(rows_of(r.table), "0\n1\n2\n3\n4\n", "the first 5 rows")
+    var stopped = note_with(r, "stopped early: the LIMIT was met")
+    if stopped.byte_length() == 0 or "400,000 rows selected" in stopped:
+        fail("the preview should stop the scan early; the notes say: " + note_with(r, "rows:"))
+    var whole = sql(cat, "SELECT id FROM v LIMIT 5")
+    if "400,000 rows" not in note_with(whole, "view v: evaluated in place"):
+        fail("a LIMIT after the view reads the whole view first: " + note_with(whole, "view v"))
+
+
+def a_frame_query_view_follows_the_edits() raises:
+    var cat = Catalog()
+    var f = Frame(orders())
+    cat.add_table("orders", orders())
+    cat.view("v", Query(f).where(col("qty") > lit(2)))
+    var r = sql(cat, "SELECT sum(qty) FROM v")
+    check(rows_of(r.table), "34\n", "before the edit")
+    f.set(1, 1, 10)                                       # row 1: qty 1 -> 10
+    cat.view("v", Query(f).where(col("qty") > lit(2)))
+    r = sql(cat, "SELECT sum(qty) FROM v")
+    check(rows_of(r.table), "44\n", "the view rebuilt from the edited frame")
+    check_int(cat.view_runs(), 2, "it ran again")
+    cat.view("v", Query(f).where(col("qty") > lit(2)))
+    r = sql(cat, "SELECT sum(qty) FROM v")
+    check_int(cat.view_runs(), 2, "the same edits keep the result")
+
+
+def a_wide_total_behind_a_view_is_refused() raises:
+    var t = Table.empty()
+    var x = t.add_column("x", INT)
+    t.append(x, 5000000000000000000)
+    t.append(x, 5000000000000000000)
+    t.append(x, 7)
+    var cat = Catalog()
+    cat.add_table("big", t^.share())
+    cat.view("w", "SELECT sum(x) AS s FROM big")
+    var refused = False
+    try:
+        _ = sql(cat, "SELECT s FROM w")
+    except e:
+        refused = "passed the int64 range" in String(e)
+    if not refused:
+        fail("a total past int64 behind a view is refused like one behind a CTE")
+    check_int(cat.view_hits() + cat.view_runs(), 0, "and nothing was kept")
+
+
+def two_jobs_share_the_cache() raises:
+    var cat = Catalog()
+    cat.add_table("orders", orders())
+    cat.view("v1", "SELECT region, qty FROM orders WHERE qty > 0")
+    cat.view("v2", "SELECT region, sum(qty) AS q FROM v1 GROUP BY region")
+    var a = sql_job(cat, "SELECT q FROM v2 ORDER BY q")
+    var b = sql_job(cat, "SELECT q FROM v2 ORDER BY q DESC")
+    if a.wait() != JOB_DONE or b.wait() != JOB_DONE:
+        fail("both jobs finish")
+    check(rows_of(a.result().table), "4\n6\n10\n17\n", "job a")
+    check(rows_of(b.result().table), "17\n10\n6\n4\n", "job b")
+    # each view ran once, or twice when both jobs missed together; never fewer than once, and the catalog's own read is a hit
+    if cat.view_runs() < 2 or cat.view_runs() > 4:
+        fail("view runs after two jobs: " + String(cat.view_runs()))
+    var before = cat.view_runs()
+    var r = sql(cat, "SELECT q FROM v2 ORDER BY q")
+    check(rows_of(r.table), "4\n6\n10\n17\n", "the catalog reads what the jobs kept")
+    check_int(cat.view_runs(), before, "no run: the jobs' results are in the shared cache")
+
+
 def main() raises:
     views_read_views()
     view_from_a_query()
@@ -301,5 +388,9 @@ def main() raises:
     an_edit_runs_only_the_steps_below_it()
     the_cache_is_bounded_by_bytes()
     a_file_the_view_names_is_an_input()
+    preview_stops_the_scan()
+    a_frame_query_view_follows_the_edits()
+    a_wide_total_behind_a_view_is_refused()
+    two_jobs_share_the_cache()
     copy_writes_parquet()
     print("ok")

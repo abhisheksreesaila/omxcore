@@ -18,10 +18,10 @@ comptime DEFAULT_CACHE_BYTES = 256 << 20
 
 
 def table_bytes(t: SharedTable) -> Int:
-    """About what a table holds in memory: 8 bytes and a validity byte a value, and each dictionary word."""
+    """About what a table holds in memory: 8 bytes (16 for a wide column) and a validity byte a value, and each dictionary word."""
     var n = 0
     for c in range(t.columns()):
-        n += t.rows() * 9
+        n += t.rows() * (17 if t.is_wide(c) else 9)       # (a total past int64, F-192, keeps a second word a value)
         if t.kind(c) == TEXT:
             var words = t.dictionary(c)
             for w in range(len(words)):

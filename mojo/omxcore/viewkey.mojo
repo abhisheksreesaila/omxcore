@@ -10,6 +10,11 @@
 The names are found by reading the tokens, not the parse: a word that is also a column name is an extra input at worst (a key that changes with a table
 the view does not read is a result recomputed, never a stale one). The tables the identities name are returned too, for the cache to hold: while an
 entry lives no other table can take a dead one's address.
+
+What is left out on purpose: `PlannerOptions`. The device (CPU, GPU, AUTO), threads, grouping strategy, join order and build side, fusing and the sort
+budgets change how a query runs, not which rows it returns (an option the engine cannot honour raises, and an error is never kept); only the order of
+rows a query leaves unordered may differ, and then the first result kept is the one every read gets. FROM names a file or a table, never a glob or a
+folder in this version, so a file's stamp is its own size and mtime.
 """
 from std.os import stat
 from .sql import lex_sql, T_EOF, T_IDENT, T_QIDENT, T_STR, lower_ascii

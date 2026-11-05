@@ -275,10 +275,12 @@ struct Query(Movable, ViewSource):
     var _window_rows: Int                # rows per window of a count_distinct / percentile / top_k query (0: as many as
                                          # fit WINDOW_BYTES); tests set it small to cut a table into several windows
     var _threads: Int                    # worker threads the CPU kernel starts (0: one a core); a float64 sum is the same for any number
+    var edits: Int                       # F-160: the frame's edit counter when `Query(frame)` copied it (0 for a table or scan): a view's cache key
     var windows: List[WindowFn]          # F-168: window functions over the rows the plan keeps (`window`; `compute_windows` in winquery.mojo runs them)
 
     def __init__(out self, table: SharedTable):
         self.windows = List[WindowFn]()
+        self.edits = 0
         self.table = table
         self.device = None
         self.scan = None
@@ -296,6 +298,7 @@ struct Query(Movable, ViewSource):
         columns the plan uses), runs the kernel on it on the CPU and merges the partial results, so the answer is
         `read_parquet` + the same query, exactly, and the peak memory is one row group plus the result."""
         self.windows = List[WindowFn]()
+        self.edits = 0
         self.table = scan.schema
         self.device = None
         self._window_rows = 0
@@ -310,6 +313,7 @@ struct Query(Movable, ViewSource):
 
     def __init__(out self, frame: Frame) raises:
         self.windows = List[WindowFn]()
+        self.edits = 0
         self.table = frame.base
         self.device = None
         self._window_rows = 0
@@ -321,6 +325,7 @@ struct Query(Movable, ViewSource):
         self.nodes = [PlanNode(P_SCAN, -1, List[Expr](), List[Agg](), 0)]
         self.framed = True
         self.overlay = frame.overlay()
+        self.edits = frame.edits
 
     def _top(self) -> Int:
         return len(self.nodes) - 1
@@ -369,6 +374,7 @@ struct Query(Movable, ViewSource):
             src.kind = SRC_FRAME
         src.overlay = self.overlay.copy()
         src.framed = self.framed
+        src.version = self.edits
         return src^
 
     def _aggregate(self) -> Int:

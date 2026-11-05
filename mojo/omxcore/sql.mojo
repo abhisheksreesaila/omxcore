@@ -1966,6 +1966,8 @@ def split_copy(text: String) raises -> Optional[CopyTo]:
                 if toks[t].kind != T_INT:
                     raise _tail_error(toks[t], base, "ROW_GROUP_SIZE is a number of rows, found " + val)
                 out.row_group_rows = Int(toks[t].text)
+                if out.row_group_rows <= 0:
+                    raise _tail_error(toks[t], base, "ROW_GROUP_SIZE must be a positive multiple of 8, found " + val)
             else:
                 raise _tail_error(toks[at], base, "the COPY option " + opt + " is not supported (FORMAT, COMPRESSION, ROW_GROUP_SIZE)")
             t += 1
