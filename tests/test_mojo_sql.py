@@ -505,7 +505,7 @@ def test_explain_shows_the_logical_and_the_physical_plan(probe, data):
         "  group: dense, 2 keys s 16 (with a NULL slot) x k 7 (with a NULL slot) = 112 slots: the domain of 112 slots is small",
         "  columns read: k, x, d, s (4 of 9)",
         "  kernel: 36 instructions a row (2 slots)",
-        "  device: CPU (SQL runs on the CPU)",
+        "  device: CPU (AUTO: the table has 20000 rows, under the 1000000 AUTO runs on the GPU)",
     ], lines
     assert res["explain"] == "\n".join(lines) + "\n"
     assert not any(n.startswith("ran:") for n in res["notes"]), "EXPLAIN does not run the query"

@@ -109,10 +109,10 @@ def test_decimals_are_exact_number_text_and_text_is_escaped(mx, files):
         assert row[1] is None or isinstance(row[1], Decimal)
 
 
-def test_device_gpu_is_accepted_and_the_notes_say_it_ran_on_the_cpu(mx, files):
-    out = run_mx(mx, ["sql", "SELECT count(*) FROM t", "--device", "gpu"], {"t": files["parquet"]})
+def test_device_gpu_on_a_scan_runs_on_the_cpu_and_the_notes_say_why(mx, files):
+    out = run_mx(mx, ["sql", "SELECT count(*) FROM t", "--device", "gpu", "--stream", "always"], {"t": files["parquet"]})
     assert out["rows"] == [[5000]] and out["device"] == "cpu"
-    assert "device: --device gpu asked for; SQL runs on the CPU in this version" in out["notes"]
+    assert any(n.startswith("device: CPU (GPU asked for; ") for n in out["notes"]), out["notes"]
 
 
 def test_max_rows_truncates_and_says_so(mx, files):

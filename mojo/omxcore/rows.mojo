@@ -988,7 +988,6 @@ def prepare_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, dicts: DictA
         if sp.p.text_tabs > 0:
             notes.append("text: " + String(sp.p.text_tabs) + " per-word " + ("table" if sp.p.text_tabs == 1 else "tables") + " over " + String(sp.p.text_words) +
                          " dictionary words in " + _ms(Float64(sp.p.text_ns) / 1e6) + " ms (each text function ran once per word, never per row)")
-        notes.append("device: CPU (SQL runs on the CPU)")
     return RowStage(sp^, built[0].copy())
 
 
