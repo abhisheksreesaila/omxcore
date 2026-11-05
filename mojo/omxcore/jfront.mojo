@@ -16,7 +16,7 @@ from .table import SharedTable, Table
 from .bind import SqlSource
 from .query import Program
 from .kernels.pipeline_cpu import IP, LP, FP, BP, VEC
-from .kernels.hashjoin_cpu import JoinMap, MapView, load_view, hj_probe_block, hj_probe_left_block, hj_filter_block
+from .kernels.hashjoin_cpu import JoinMap, MapView, load_view, hj_probe_block, hj_probe_left_block, hj_filter_block, hj_probe_block_rep
 from .kargs import KernelRun
 from .joincore import JoinKeys, KeyPlan, probe_chunk_keys
 
@@ -26,6 +26,12 @@ comptime DT_NULLMASK = 7
 # a semi / anti join keeps or drops rows by whether the key is present and gathers nothing (the numbers are the kernel's `PM_*` modes)
 comptime FM_INNER = 0
 comptime FM_LEFT = 1
+
+# F-161: a map whose keys repeat is expanded inside the front stage. The block's probe rows with partners become a list of (row, first partner, how many);
+# round r puts out the r-th partner of every row that has one, so no row appears twice in a round (the build columns are gathered per block row) and a block
+# takes as many calls as its most repeated key has rows. The front sets this bit in its return value while rounds remain (the kernel calls it again).
+comptime FRONT_MORE = 1 << 40
+comptime EXPAND_MAX_REP = 64           # a key with more build rows than this is not expanded in the front stage (a hot key would need that many rounds per block)
 
 
 struct StageData(Movable):
@@ -166,6 +172,9 @@ struct FrontSpec(ImplicitlyCopyable, Movable):
     var off_bits: Int
     var ws_bytes: Int
     var fmode: Int
+    var expand: Bool                 # F-161: the map's keys repeat; the block is put out in rounds (`_jf_expand`)
+    var off_exp: Int                 # ... its state (8 words) and the active rows' arrays (block row, first partner, partners), in the scratch
+    var rows_a: Int                  # ... the map's array of build rows
     var n_stages: Int                # a star: how many dimensions, ...
     var stages_a: Int                # ... and their 15 words each (the map's 11, the probe keys' address, the NULL flags' address, 2 spare)
 
@@ -173,6 +182,9 @@ struct FrontSpec(ImplicitlyCopyable, Movable):
         self.n_stages = 0
         self.stages_a = 0
         self.fmode = 0
+        self.expand = False
+        self.off_exp = 0
+        self.rows_a = 0
         self.view = MapView(JoinMap())
         self.keys_a = 0
         self.ok_a = 0
@@ -200,6 +212,8 @@ def front_spec(mut run: KernelRun, fj: FusedJoin, p: Program) raises -> FrontSpe
     var fs = FrontSpec()
     fs.view = MapView(fj.map[])
     fs.fmode = fj.fmode
+    fs.expand = fj.fmode <= FM_LEFT and len(fj.stages) == 0 and not fj.map[].unique
+    fs.rows_a = fj.map[].r
     fs.keys_a = fj.keys.pk_addr
     fs.ok_a = fj.keys.po_addr
     fs.n_words = len(p.cols)
@@ -245,7 +259,10 @@ def front_spec(mut run: KernelRun, fj: FusedJoin, p: Program) raises -> FrontSpe
     fs.off_prow = _align8(fs.n_words * 8)
     fs.off_vals = fs.off_prow + max(fs.n_stages, 1) * VEC * 4
     fs.off_bits = fs.off_vals + fs.n_partner * VEC * 8
-    fs.ws_bytes = fs.off_bits + fs.n_partner * (VEC // 8) + 64
+    fs.off_exp = _align8(fs.off_bits + fs.n_partner * (VEC // 8))
+    fs.ws_bytes = fs.off_exp + (64 + 3 * VEC * 4 if fs.expand else 0) + 64
+    if fs.expand:
+        fs.ws_bytes |= fj.map[].maxrep << 32                         # the kernel cuts its morsels by the most partners a row can have (pipeline_cpu.morsel_rows)
     return fs
 
 
@@ -260,6 +277,8 @@ def jf_front(fs: FrontSpec, i0: Int, n: Int, sel: IP, ws: BP) -> Int:
     var keys = LP(unsafe_from_address=fs.keys_a)
     var okp = BP(unsafe_from_address=fs.ok_a if fs.ok_a != 0 else Int(ws))
     var kept: Int
+    if fs.expand:
+        return _jf_expand(fs, i0, n, sel, ws, prow, keys, okp)
     if fs.fmode == FM_INNER:
         kept = hj_probe_block(fs.view, keys, okp, fs.ok_a != 0, i0, sel, n, prow)
     elif fs.fmode == FM_LEFT:
@@ -269,6 +288,13 @@ def jf_front(fs: FrontSpec, i0: Int, n: Int, sel: IP, ws: BP) -> Int:
         kept = hj_filter_block(fs.view, keys, okp, fs.ok_a != 0, i0, sel, n, fs.fmode)
     if kept == 0:
         return 0
+    _gather(fs, i0, ws, sel, prow, kept)
+    return kept
+
+
+def _gather(fs: FrontSpec, i0: Int, ws: BP, sel: IP, prow: IP, kept: Int):
+    """The partners' columns of the `kept` rows `sel[t]` (partner `prow[t]`, -1: a LEFT join's row without one) into the worker's scratch, and the
+    program's column table aimed at them."""
     var lc = LP(unsafe_from_address=Int(ws))
     var arow = LP(unsafe_from_address=fs.tbl_a) + 2
     for q in range(fs.n_words):
@@ -310,7 +336,41 @@ def jf_front(fs: FrontSpec, i0: Int, n: Int, sel: IP, ws: BP) -> Int:
                 bits[b >> 3] = bits[b >> 3] | (UInt8(1) << UInt8(b & 7))
         lc[slot] = Int64(Int(bits))
         lc[slot + 1] = Int64(-i0)
-    return kept
+
+
+def _jf_expand(fs: FrontSpec, i0: Int, n: Int, sel: IP, ws: BP, prow: IP, keys: LP, okp: BP) -> Int:
+    """One round of a block over a map whose keys repeat. The first call for a block probes its rows and keeps the list of those with partners (all of
+    them in a LEFT join, a row without one has no partners to put out but its NULL ones); each call puts out the next partner of every row in the list
+    and drops the rows that have no more, then says in its return value (`FRONT_MORE`) whether another round remains."""
+    var stt = LP(unsafe_from_address=Int(ws) + fs.off_exp)
+    var act = IP(unsafe_from_address=Int(ws) + fs.off_exp + 64)
+    var st = act + VEC
+    var cnt = st + VEC
+    var left = fs.fmode == FM_LEFT
+    if stt[0] == 0:
+        stt[2] = Int64(hj_probe_block_rep(fs.view, keys, okp, fs.ok_a != 0, i0, n, act, st, cnt, left))
+        stt[1] = 0
+    var r = Int(stt[1])
+    var nact = Int(stt[2])
+    var rows = IP(unsafe_from_address=fs.rows_a)
+    var nk = 0
+    for e in range(nact):
+        sel[e] = act[e]
+        prow[e] = rows[Int(st[e]) + r] if cnt[e] > 0 else Int32(-1)
+        if Int(cnt[e]) > r + 1:
+            act[nk] = act[e]
+            st[nk] = st[e]
+            cnt[nk] = cnt[e]
+            nk += 1
+    stt[2] = Int64(nk)
+    if nk > 0:
+        stt[0] = 1
+        stt[1] = Int64(r + 1)
+    else:
+        stt[0] = 0
+    if nact > 0:
+        _gather(fs, i0, ws, sel, prow, nact)
+    return nact + (FRONT_MORE if nk > 0 else 0)
 
 
 def _jf_star(fs: FrontSpec, i0: Int, n: Int, sel: IP, ws: BP) -> Int:

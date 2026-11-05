@@ -108,6 +108,7 @@ struct JoinMap(Movable):
     var hi: Int64
     var span: Int                    # direct: hi - lo + 1
     var unique: Bool                 # no key repeats (a presence-only map says True: it keeps one row per key)
+    var maxrep: Int                  # the most build rows one key has (1 when unique; F-161's expansion in the fused front stage is bounded by it)
     var presence: Bool               # built by `hj_build(presence=True)` as a direct array of marks
     var pbits: Int                   # hash: 1 << pbits partitions
     var u: Int                       # direct, unique: Int32[span]  build row or -1
@@ -126,6 +127,7 @@ struct JoinMap(Movable):
         self.hi = 0
         self.span = 0
         self.unique = True
+        self.maxrep = 1
         self.presence = False
         self.pbits = 0
         self.u = 0
@@ -403,6 +405,7 @@ def _build_direct(mut m: JoinMap, prow: IP, pkey: LP, poff: LP, pmax: LP, P: Int
     var most = Int64(0)
     for p in range(P):
         most = max(most, pmax[p])
+    m.maxrep = max(Int(most), 1)
     if most <= 1:
         m.unique = True
         _free(Int(S))
@@ -495,6 +498,7 @@ def _build_hash(mut m: JoinMap, prow: IP, pkey: LP, poff: LP, pmax: LP, P: Int, 
     var most = Int64(0)
     for p in range(P):
         most = max(most, pmax[p])
+    m.maxrep = max(Int(most), 1)
     m.ent = ent
     m.eoff = Int(eoff)
     m.bytes += 16 * total + 8 * (P + 1)
@@ -1003,3 +1007,31 @@ def hj_probe_left_block(v: MapView, keys: LP, ok: BP, has_ok: Bool, i0: Int, sel
                             b = IP(unsafe_from_address=e + 12)[0]
             prow[i + j] = b
         i += g
+
+
+def hj_probe_block_rep(v: MapView, keys: LP, ok: BP, has_ok: Bool, i0: Int, n: Int, act: IP, st: IP, cnt: IP, left: Bool) -> Int:
+    """The fused form for a map whose keys repeat (F-161): for the block rows 0 .. n (row = i0 + j) look the key up. A row with partners becomes an entry
+    of the active list: `act[e]` its block row, `st[e]` the offset of its first build row in the map's row array (`v.r`), `cnt[e]` how many. With `left`,
+    a row without a partner (or a usable key) is an entry with `cnt[e] = 0`. The entries are in block-row order. Returns how many entries."""
+    var eoff = LP(unsafe_from_address=v.eoff)
+    var nact = 0
+    var i = 0
+    while i < n:
+        var g = min(GROUP, n - i)
+        if v.mode != MODE_EMPTY:
+            for j in range(g):
+                if (not has_ok) or ok[i0 + i + j] != 0:
+                    _prefetch_key(v.mode, v.lo, v.hi, 0, False, v.u, v.s, v.ent, eoff, v.pbits, v.bitmap, keys[i0 + i + j])
+        for j in range(g):
+            var row = i0 + i + j
+            var start = 0
+            var count = 0
+            if (not has_ok) or ok[row] != 0:
+                _lookup(v.mode, False, v.lo, v.hi, v.u, v.s, v.ent, eoff, v.pbits, v.bitmap, keys[row], start, count)
+            if count > 0 or left:
+                act[nact] = Int32(i + j)
+                st[nact] = Int32(start)
+                cnt[nact] = Int32(count)
+                nact += 1
+        i += g
+    return nact

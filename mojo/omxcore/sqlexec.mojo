@@ -36,7 +36,7 @@ from .joincore import JoinKeys, JoinSide, KeyPlan, make_key_plan, column_ndv, no
 from .kernels.hashjoin_cpu import hj_build, JoinMap, PM_SEMI, PM_ANTI, PM_ANTI_NA, PM_NONE
 from .kargs import KernelRun
 from .winsql import plan_windows, finish_windows, point_wide_columns, fix_wide_columns, WIN_TABLE
-from .jfront import FusedJoin, StageData, StreamStage, ProbeStream, chunk_join, stream_template, front_spec, jf_front
+from .jfront import EXPAND_MAX_REP, FusedJoin, StageData, StreamStage, ProbeStream, chunk_join, stream_template, front_spec, jf_front
 from std.memory import ArcPointer
 from .rows import RowStage, prepare_rows, execute_rows, _Item
 from .sink import ResultSink                  # F-167
@@ -896,6 +896,12 @@ def _side_names(q: BoundQuery, t: Int) -> String:
     return q.tab_alias[t] if q.tab_alias[t].byte_length() > 0 else q.tab_names[t]
 
 
+def _expand_note(expands: Bool, maxrep: Int) -> String:
+    if not expands:
+        return String("")
+    return " (the build side's keys repeat, up to " + commas(maxrep) + " rows of a key: each probe row is expanded to its partners in rounds inside the front stage, no pairs are written)"
+
+
 def _kind_name(k: Int) -> String:
     if k == 1:
         return "left"
@@ -1260,6 +1266,7 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
     var t_build = perf_counter_ns()
     var t_probe = perf_counter_ns()
     var fusable = False
+    var expands = False
     var pass_no = 0
     var kplan = KeyPlan()
     var probe_src = SqlSource("", Table.empty().share())             # a streamed probe's source (a copy of the catalog's)
@@ -1303,7 +1310,8 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
         if fmode == PM_ANTI_NA and not streaming:
             unmatchable_not_null(keys, m.lo, m.hi, left.table, left.key_cols[0], left.table.rows())
         t_probe = perf_counter_ns()
-        fusable = opts.fuse and not keys.verify and not any_holistic and (m.unique or semi_anti)
+        expands = kind <= 1 and not q.rows and not m.unique and m.maxrep <= EXPAND_MAX_REP        # F-161: an aggregate over repeated build keys expands in the front stage
+        fusable = opts.fuse and not keys.verify and not any_holistic and (m.unique or semi_anti or expands)
         if streaming and (kplan.hashed or fmode == PM_ANTI_NA):
             fusable = False                                          # (hashed tuples are verified per pair; NOT IN's unmatchable words are settled over the whole probe side)
         if defer_probe >= 0 and not fusable and pass_no == 1:
@@ -1367,13 +1375,14 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
         cat2.sources[0].fixed_rows = np
         _stream_overlay_fix(cat2.sources[0], probe_src, vstage, vreal_s)
         _prefill_ranges_stream(cat2.sources[0], jq, bside, vstage, vreal_s)
+        var maxrep = m.maxrep
         var stages = List[StreamStage]()
         stages.append(StreamStage(bside, ArcPointer(m^), kplan^, probe_keys_src.copy()))
         var ps = ArcPointer(ProbeStream(probe_src.copy(), used^, pos^, stages^, fmode, False, vstage^, vreal_s^))
         var template = ArcPointer(stream_template(ps))
         res.notes.append("join path: fused: " + commas(np) + " probe rows (before the filter) of " + String(len(ps[].used)) + " columns arrive chunk by chunk, " +
                          ("each looks its partner up in blocks of 1,024" if not semi_anti else "each is kept or dropped by whether its key is present in the build side, in blocks of 1,024") +
-                         " (no joined row is written, no copy of the probe side)" + (" (a row without a partner stays: its build-side columns are NULL)" if kind == 1 else ""))
+                         " (no joined row is written, no copy of the probe side)" + (" (a row without a partner stays: its build-side columns are NULL)" if kind == 1 else "") + _expand_note(expands, maxrep))
         inner = _run_sql_once(cat2, jq, planner, opts, trust, lie, template)
     elif fusable:
         # fused: no joined row is written; the pipeline probes block by block (keeps or drops the rows by the join's rule) and gathers the build side's columns into scratch
@@ -1399,7 +1408,7 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
         else:
             res.notes.append("join path: fused: " + commas(np) + " probe rows look their partner up in blocks of 1,024 and " + String(len(fj[].partner)) +
                              " build-side " + ("column is" if len(fj[].partner) == 1 else "columns are") + " gathered into per-worker scratch (no joined row is written)" +
-                             (" (a row without a partner stays: its build-side columns are NULL)" if kind == 1 else ""))
+                             (" (a row without a partner stays: its build-side columns are NULL)" if kind == 1 else "") + _expand_note(expands, fj[].map[].maxrep))
         inner = _run_sql_once(cat2, jq, planner, opts, trust, lie, fj)
     else:
         var t_gather = perf_counter_ns()
@@ -1421,6 +1430,8 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
             why = " (a holistic aggregate needs every joined row)"
         elif keys.verify:
             why = " (the keys are hashed tuples, verified per pair)"
+        elif not m.unique and not semi_anti and not q.rows and kind <= 1 and m.maxrep > EXPAND_MAX_REP:
+            why = " (the build side's keys repeat, one up to " + commas(m.maxrep) + " times: past " + String(EXPAND_MAX_REP) + " the front stage would need a round for each)"
         elif not m.unique and not semi_anti:
             why = " (the build side's keys repeat)"
         if semi_anti:

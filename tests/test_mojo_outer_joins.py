@@ -104,10 +104,14 @@ LEFT_REPEATED = [
 
 @pytest.mark.parametrize("sql", LEFT_REPEATED)
 def test_left_join_with_repeated_build_keys_equals_duckdb(mx, data, sql):
-    """Repeated build keys: the pairs (unmatched rows included) are gathered into a table and the query runs over it."""
+    """Repeated build keys: an aggregate expands each left row to its partners inside the front stage (F-161); a row query gathers the pairs (unmatched
+    rows included) into a table and runs over it."""
     res = q(mx, data, sql, ["cust", "ords"])
     assert re.match(r"join build side: o \([\d,]+ rows, the right side: a left join builds on it\): .*repeated keys", note(res, "join build side")), res["notes"]
-    assert note(res, "join path").startswith("join path: materialized:"), res["notes"]
+    if "count(" in sql:
+        assert note(res, "join path").startswith("join path: fused:") and "expanded to its partners" in note(res, "join path"), res["notes"]
+    else:
+        assert note(res, "join path").startswith("join path: materialized:"), res["notes"]
 
 
 def test_a_left_join_counted_per_left_row_is_the_q13_shape(mx, data):
