@@ -149,11 +149,15 @@ def _expand(spec: StaticString) raises -> List[Int32]:
 
 # ── text functions ───────────────────────────────────────────────────────────────────────────────────
 
-def substr(s: String, start: Int, length: Int, has_len: Bool) -> String:
-    """DuckDB's substr: 1-based characters; a negative start counts from the end; the window [p, p + length - 1] (backwards for a negative length) is
-    clipped to the string; no length reads to the end."""
-    var cps = decode(s)
-    var n = len(cps)
+def _is_ascii(s: String) -> Bool:
+    for b in s.as_bytes():
+        if b >= UInt8(0x80):
+            return False
+    return True
+
+
+def _substr_window(n: Int, start: Int, length: Int, has_len: Bool) -> Tuple[Int, Int]:
+    """The 1-based characters [lo, hi] of a string of n characters that substr keeps; lo > hi when none."""
     var p = start if start > 0 else (n + start + 1 if start < 0 else 0)
     var lo = p
     var hi = n
@@ -164,18 +168,37 @@ def substr(s: String, start: Int, length: Int, has_len: Bool) -> String:
             lo = p + length
             hi = p - 1
         else:
-            return String()
+            return (1, 0)
     if lo < 1:
         lo = 1
     if hi > n:
         hi = n
-    if lo > hi:
+    return (lo, hi)
+
+
+def substr(s: String, start: Int, length: Int, has_len: Bool) -> String:
+    """DuckDB's substr: 1-based characters; a negative start counts from the end; the window [p, p + length - 1] (backwards for a negative length) is
+    clipped to the string; no length reads to the end. An ASCII word is cut by bytes (no code points are decoded)."""
+    if _is_ascii(s):
+        var w = _substr_window(s.byte_length(), start, length, has_len)
+        if w[0] > w[1]:
+            return String()
+        return String(s[byte=w[0] - 1:w[1]])
+    var cps = decode(s)
+    var w = _substr_window(len(cps), start, length, has_len)
+    if w[0] > w[1]:
         return String()
-    return encode(cps, lo - 1, hi)
+    return encode(cps, w[0] - 1, w[1])
 
 
 def left_of(s: String, k: Int) -> String:
     """left(s, k): the first k characters; a negative k drops the last -k."""
+    if _is_ascii(s):
+        var n = s.byte_length()
+        var m = k if k >= 0 else n + k
+        if m <= 0:
+            return String()
+        return String(s[byte=0:min(m, n)])
     var cps = decode(s)
     var n = len(cps)
     var m = k if k >= 0 else n + k
@@ -185,6 +208,12 @@ def left_of(s: String, k: Int) -> String:
 
 
 def right_of(s: String, k: Int) -> String:
+    if _is_ascii(s):
+        var n = s.byte_length()
+        var m = k if k >= 0 else n + k
+        if m <= 0:
+            return String()
+        return String(s[byte=n - min(m, n):n])
     var cps = decode(s)
     var n = len(cps)
     var m = k if k >= 0 else n + k

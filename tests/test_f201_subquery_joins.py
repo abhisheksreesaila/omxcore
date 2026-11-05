@@ -174,3 +174,42 @@ def test_random_worlds_equal_duckdb(mx, worlds, seed, ti):
         sql = TEMPLATES[ti].format(t=t)
         w = worlds[seed]
         check(mx, sql, w["con"], files={n: w["paths"][n] for n in "abc"}, ordered=True)
+
+
+# ── text functions over a dictionary (Q22's substring): the same call written twice is answered once, ASCII words are cut by bytes ──────────
+
+@pytest.fixture(scope="session")
+def words(tmp_path_factory):
+    d = tmp_path_factory.mktemp("f201t")
+    con = oracle_connection()
+    con.execute("""create table w as select i as id,
+        case when i % 17 = 0 then null when i % 7 = 0 then 'é' || (i * 31 % 1000)::varchar when i % 11 = 0 then '日本' || (i % 50)::varchar || 'x'
+             when i % 13 = 0 then '' else lpad((i * 7919 % 100000)::varchar, (1 + i % 9)::int, '0') end as s,
+        i % 5 as g from range(40000) r(i)""")
+    path = d / "w.parquet"
+    con.execute(f"copy w to '{path}' (format parquet, row_group_size 8000)")
+    return {"con": con, "paths": {"w": path}}
+
+
+TEXT_QUERIES = [
+    "SELECT substring(s FROM 1 FOR 2) AS p, count(*) FROM w WHERE substring(s FROM 1 FOR 2) IN ('00', '12', 'é1', '日本') GROUP BY substring(s FROM 1 FOR 2) ORDER BY 1",
+    "SELECT substr(s, 2, 3) AS p, count(*), min(id) FROM w GROUP BY 1 ORDER BY 1",
+    "SELECT substr(s, -3) AS p, count(*) FROM w GROUP BY 1 ORDER BY 1",
+    "SELECT substr(s, -3, 2) AS p, substr(s, 0, 2) AS q, substr(s, 3, -2) AS r, count(*) FROM w GROUP BY 1, 2, 3 ORDER BY 1, 2, 3",
+    "SELECT left(s, 2) AS a, right(s, 2) AS b, count(*) FROM w GROUP BY 1, 2 ORDER BY 1, 2",
+    "SELECT left(s, -2) AS a, right(s, -2) AS b, left(s, 0) AS c, count(*) FROM w GROUP BY 1, 2, 3 ORDER BY 1, 2, 3",
+    "SELECT g, count(DISTINCT substr(s, 1, 3)), count(*) FROM w WHERE substr(s, 1, 3) <> '000' GROUP BY g ORDER BY g",
+]
+
+
+@pytest.mark.parametrize("sql", TEXT_QUERIES)
+def test_substring_left_right_equal_duckdb(mx, words, sql):
+    res = check(mx, sql, words["con"], files={"w": words["paths"]["w"]}, ordered=True)
+    assert len(res["rows"]) > 1
+
+
+def test_the_same_substring_written_three_times_is_answered_once(mx, words):
+    res = check(mx, "SELECT substring(s FROM 1 FOR 2) AS p, count(*) FROM w WHERE substring(s FROM 1 FOR 2) IN ('00', '12') GROUP BY substring(s FROM 1 FOR 2) ORDER BY 1",
+                words["con"], files={"w": words["paths"]["w"]}, ordered=True)
+    tabs = [n for n in res["notes"] if n.startswith("text:")]
+    assert len(tabs) == 1 and tabs[0].startswith("text: 1 per-word table over"), tabs

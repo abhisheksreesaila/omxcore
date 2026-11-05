@@ -153,6 +153,10 @@ def _rename_columns(mut t: Table, names: List[String], line: Int, col: Int) rais
         t.by_name[t.cols[c].name] = c
 
 
+def _took(t0: Int) -> String:
+    return ", " + String(Int(Float64(Int(perf_counter_ns()) - t0) / 1e6)) + " ms"
+
+
 def _commas(n: Int) -> String:
     var s = String(n)
     var out = String()
@@ -179,11 +183,12 @@ def _resolve_slot[P: Planner](mut run: QueryRun, mut catalog: Catalog, name: Str
                               names: List[String], planner: P, opts: PlannerOptions) raises -> Tuple[String, String]:
     """A FROM entry: a derived table runs now; a CTE name runs (or reads the table it already made); anything else is left to the engine."""
     if kid >= 0:
+        var tm = Int(perf_counter_ns())
         var r = exec_statement(run, catalog, kid, planner, opts)
         _rename_columns(r.table, names, line, col)
         var rows = r.table.rows()
         var nm = register_result(run, catalog, r, "__d")
-        run.steps.append("derived table " + (alias if alias.byte_length() > 0 else nm) + ": evaluated in place (" + _commas(rows) + " rows)")
+        run.steps.append("derived table " + (alias if alias.byte_length() > 0 else nm) + ": evaluated in place (" + _commas(rows) + " rows" + _took(tm) + ")")
         return (nm, alias)
     if is_file:
         return (name, alias)
@@ -659,6 +664,7 @@ def run_pending[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st: Sql
     """Runs the D of a step that was left pending, against `cur`, the table of the outer rows the step applies to (the stages before it have filtered it)."""
     if s.kid < 0:
         return
+    var t0 = Int(perf_counter_ns())
     var k = run.take(s.kid)
     var reduced = False
     var ci = catalog.find(cur)
@@ -695,7 +701,7 @@ def run_pending[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st: Sql
     if r.table.any_wide():
         raise Error(OVERFLOW_MESSAGE)
     catalog.add_table(s.pd, r.take_table().share())
-    run.steps.append(s.note_pre + s.pd + " (" + _commas(rows) + s.note_post + (" (cut to the keys of the " + _commas(catalog.sources[ci].rows()) + " outer rows)" if reduced else ""))
+    run.steps.append(s.note_pre + s.pd + " (" + _commas(rows) + s.note_post + (" (cut to the keys of the " + _commas(catalog.sources[ci].rows()) + " outer rows)" if reduced else "") + _took(t0))
     if s.fix >= 0 and _numeric_column(catalog, s.pd, s.vname):
         # `x = D.__v` between columns of two tables would be taken for a join key (and an INT against a FLOAT cannot be one): `__v + 0` is an expression
         var line = st.exprs[s.fix].line
@@ -738,6 +744,7 @@ def _substitute[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st: Sql
     var line = st.exprs[n].line
     var col = st.exprs[n].col
     var neg = st.exprs[n].flag
+    var tm = Int(perf_counter_ns())
     var t = _run_kid(run, catalog, kid, planner, opts)
     if kind == X_EXISTS_Q:
         var has = t.rows() > 0
@@ -753,7 +760,7 @@ def _substitute[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st: Sql
             set_typed_null(st, n, t.kind(0), t.scale(0), line, col)
         else:
             set_literal(st, n, t, 0, 0)
-        run.steps.append("scalar subquery: " + _commas(t.rows()) + " row, a constant")
+        run.steps.append("scalar subquery: " + _commas(t.rows()) + " row, a constant" + _took(tm))
         return
     if t.rows() > MAX_IN_LIST:
         raise sql_error(line, col, "IN (SELECT ...) here returned " + _commas(t.rows()) + " rows, more than the " + _commas(MAX_IN_LIST) +
@@ -833,13 +840,14 @@ def _native_in[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st: SqlS
         st.exprs[n].items.append(at)
         run.steps.append("subquery IN: " + run.stmts[kid].table + ", a semi join")
         return
+    var tm = Int(perf_counter_ns())
     var r = exec_statement(run, catalog, kid, planner, opts)
     if r.table.columns() != 1:
         raise sql_error(line, col, "a subquery in IN must return one column, this one returns " + String(r.table.columns()))
     var cname = r.table.name(0)
     var rows = r.table.rows()
     var d = register_result(run, catalog, r, "__d")
-    run.steps.append("subquery IN: " + d + " (" + _commas(rows) + " rows), a semi join")
+    run.steps.append("subquery IN: " + d + " (" + _commas(rows) + " rows" + _took(tm) + "), a semi join")
     var sub = SubQuery()
     sub.table = d
     sub.line = line
@@ -1313,6 +1321,7 @@ def run_stages[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: SqlS
     _split_and_expr(st, st.where, plain)
     var flattened = st.has_right or len(st.extra) > 0
     if flattened:
+        var tm0 = Int(perf_counter_ns())
         var orig = clone_shell(st)
         var sc = scope_of(st, catalog)
         var flat = Flat()
@@ -1322,7 +1331,7 @@ def run_stages[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: SqlS
         var r0 = run_plain(catalog, t0^, run.text, planner, opts)
         var rows0 = r0.table.rows()
         var name0 = register_result(run, catalog, r0, "__t")
-        run.steps.append("outer tables read by a subquery: " + name0 + " (" + _commas(rows0) + " rows)")
+        run.steps.append("outer tables read by a subquery: " + name0 + " (" + _commas(rows0) + " rows" + _took(tm0) + ")")
         for si in range(len(st.subs)):                                          # a subquery's outer references name the flat table (its own columns may share a name)
             for e in st.subs[si].outer:
                 st.exprs[e].text2 = name0
@@ -1346,6 +1355,7 @@ def run_stages[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: SqlS
     var stages = len(steps) - (1 if merge_last else 0)
     for i in range(stages):
         run_pending(run, catalog, st, steps[i], String(st.table), planner, opts)
+        var tm1 = Int(perf_counter_ns())
         var stage = clone_shell(st)
         stage.wins = List[WinSpec]()
         var shown = _shown(st.table, st.table_alias)
@@ -1365,7 +1375,7 @@ def run_stages[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: SqlS
         var r = run_plain(catalog, stage^, run.text, planner, opts)
         var rows = r.table.rows()
         var nm = register_result(run, catalog, r, "__t")
-        run.steps.append("subquery step " + String(i + 1) + ": " + nm + " (" + _commas(rows) + " rows)")
+        run.steps.append("subquery step " + String(i + 1) + ": " + nm + " (" + _commas(rows) + " rows" + _took(tm1) + ")")
         st.table = nm
         st.table_alias = carried
     var rest = List[Int]()
