@@ -2,7 +2,7 @@
 # planner's notes (which path ran), EXPLAIN and the error messages. (tests/test_mojo_sql.py compares many more queries with
 # DuckDB on generated data.)
 from std.sys import argv
-from omxcore import (Table, SharedTable, Frame, Catalog, PlannerOptions, GROUP_HASHED, GROUP_DENSE, sql, sql_with, SqlResult, INT, DECIMAL, TEXT,
+from omxcore import (Table, SharedTable, Frame, Catalog, PlannerOptions, GROUP_HASHED, GROUP_DENSE, BUILD_LEFT, BUILD_RIGHT, sql, sql_with, SqlResult, INT, DECIMAL, TEXT,
                      DATE, BOOL, FLOAT, write_parquet, scan_parquet, ZSTD, Planner, RulePlanner, PhysicalPlan, Stats, BoundQuery)
 
 
@@ -190,10 +190,33 @@ def main() raises:
     for i in range(3):
         rt.append_text(r_reg, r_names[i])
         rt.append(r_w, Int64(10 * (i + 1)))
-    cat.add_table("reg", rt^.share())
+    var reg_t = rt^.share()
+    cat.add_table("reg", reg_t)
     r = sql(cat, "SELECT r.w, count(*), sum(e.qty) FROM edited e JOIN reg r ON e.region = r.region GROUP BY r.w ORDER BY r.w")
     check(rows_of(r.table), "10 4 105\n20 2 4\n30 1 1\n", "a join over a frame")
     has_note(r, "join build side: r (3 rows")
+    has_note(r, "join path: fused: ")
+    var streamed_frame = False                                  # F-158: the frame's chunks probe one at a time (its edits seen), never read into a table
+    for n in r.notes:
+        streamed_frame = streamed_frame or "chunk by chunk" in n
+    if not streamed_frame:
+        fail("a Frame on the probe side streams")
+    var frows = sql(cat, "SELECT e.qty, e.region, r.w FROM edited e JOIN reg r ON e.region = r.region")      # F-158: a row query over the streamed Frame probe, in the frame's order
+    streamed_frame = False
+    for n in frows.notes:
+        streamed_frame = streamed_frame or "chunk by chunk" in n
+    if not streamed_frame:
+        fail("a row query over a Frame probe streams")
+    var fb = Catalog()                                          # ... and equals the join over the baked frame (edit + append + removed row)
+    fb.add_table("edited", f.bake().share())
+    fb.add_table("reg", reg_t)
+    var baked = sql(fb, "SELECT r.w, count(*), sum(e.qty) FROM edited e JOIN reg r ON e.region = r.region GROUP BY r.w ORDER BY r.w")
+    check(rows_of(r.table), rows_of(baked.table), "a join over a frame equals the join over bake()")
+    var brows = sql(fb, "SELECT e.qty, e.region, r.w FROM edited e JOIN reg r ON e.region = r.region")
+    check(rows_of(frows.table), rows_of(brows.table), "a row query over a streamed Frame probe equals bake(), in the frame's order")
+    var ftop = sql(cat, "SELECT e.qty, r.w FROM edited e JOIN reg r ON e.region = r.region ORDER BY e.qty DESC LIMIT 3")
+    var btop = sql(fb, "SELECT e.qty, r.w FROM edited e JOIN reg r ON e.region = r.region ORDER BY e.qty DESC LIMIT 3")
+    check(rows_of(ftop.table), rows_of(btop.table), "a top-k over a streamed Frame probe equals bake()")
     var jt = sql(cat, "SELECT r.w, count(*), sum(e.qty) FROM orders e JOIN reg r ON e.region = r.region GROUP BY r.w ORDER BY r.w")
     var js = sql(cat, "SELECT r.w, count(*), sum(e.qty) FROM filed e JOIN reg r ON e.region = r.region GROUP BY r.w ORDER BY r.w")
     check(rows_of(js.table), rows_of(jt.table), "a join over a scan equals the join over the table")
@@ -216,6 +239,29 @@ def main() raises:
     check(rows_of(r.table), "east 140.45 7 3 3\nNorth 5.99 2 3 1\nWest -68.75 52 3 4\nNULL 1.00 3 3 1\n", "formula columns")
     r = sql(cat, "SELECT sum(net) FROM sheet WHERE half > 1 AND net IS NOT NULL")
     check(rows_of(r.table), "72.19\n", "a formula in WHERE")
+
+    # F-158: a Frame on the BUILD side: its formula columns, edits (qty 3 -> 100), an append and a removed row are seen, equal to the join over bake()
+    var bq = "SELECT count(*), sum(o.price), sum(s.net), sum(s.half) FROM orders o JOIN sheet s ON o.qty = s.qty"
+    var bopts = PlannerOptions()
+    bopts.build_side = BUILD_RIGHT                              # the Frame builds the hash table
+    r = sql(cat, bq, bopts)
+    has_note(r, "join build side: s (")
+    var sb = Catalog()
+    sb.add_table("orders", orders())
+    sb.add_table("sheet", ff.bake().share())
+    var sbr = sql(sb, "SELECT count(*), sum(o.price), sum(s.price - s.qty), sum(s.qty // 2) FROM orders o JOIN sheet s ON o.qty = s.qty", bopts)   # (bake() keeps no formulas: they are written out)
+    check(rows_of(r.table), rows_of(sbr.table), "a join with a Frame build side (formulas) equals the join over bake()")
+    check(rows_of(r.table), "8 198.19 166.19 14\n", "a Frame build side with formula columns")
+    try:                                                        # a formula column as a join key is refused by name
+        _ = sql(cat, "SELECT count(*) FROM orders o JOIN sheet s ON o.qty = s.half", bopts)
+        fail("a formula as a join key should raise")
+    except e:
+        check(String(e), "SQL error at line 1, column 53: a join key that is a frame's formula column (`half`) is not supported yet: join on the stored columns (a formula column can be read, filtered and aggregated after the join)", "formula join key")
+    r = sql(cat, "SELECT s.* FROM orders o JOIN sheet s ON o.qty = s.qty WHERE o.qty = 5", bopts)             # s.* holds the formula columns too
+    check(String(r.table.columns()), "8", "s.* of a Frame in a join: 5 stored + 3 formula columns")
+    bopts.build_side = BUILD_LEFT                               # ... and as the probe side the same answer
+    r = sql(cat, bq, bopts)
+    check(rows_of(r.table), rows_of(sbr.table), "the same join with the Frame on the probe side")
 
     # errors say what and where
     try:

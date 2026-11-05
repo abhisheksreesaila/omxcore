@@ -15,6 +15,7 @@
 # FLOAT the float64's bits as "0x....", NULL null. On a SQL error: {"error": "the message"} and exit status 1.
 from std.sys import argv
 from std.time import perf_counter_ns
+from omxcore.wide import wide_text, wide_make
 from omxcore import (Catalog, sql, PlannerOptions, GROUP_AUTO, GROUP_DENSE, GROUP_HASHED, Frame, Table, SharedTable, read_parquet,
                      scan_parquet, scan_csv, read_csv, CsvOptions, ParquetScan, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT)
 
@@ -122,7 +123,10 @@ def json_result(t: Table, notes: List[String], explain: String, ms: Float64, tim
                 continue
             var k = t.kind(c).value
             var v = t.get(c, r)
-            if k == INT.value:
+            if t.is_wide(c):                                     # F-192: a total past int64
+                var text = wide_text(wide_make(v, t.get_high(c, r)), t.scale(c))
+                out += text if k == INT.value else '"' + text + '"'
+            elif k == INT.value:
                 out += String(v)
             elif k == DECIMAL.value:
                 out += '"' + decimal_text(v, t.scale(c)) + '"'

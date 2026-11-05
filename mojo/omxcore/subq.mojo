@@ -19,6 +19,7 @@ from .bind import Catalog, _split_and_expr, _and_chain, _has_aggregate
 from .table import Table, SharedTable, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, ColumnKind
 from .sqlfn import date_text, decimal_text
 from .floatfmt import float_text
+from .wide import wide_make, wide_text
 
 
 # ── names: what a FROM clause shows ──────────────────────────────────────────────────────────────────
@@ -232,7 +233,12 @@ def set_literal(mut st: SqlStatement, node: Int, t: Table, row: Int, c: Int) rai
     var kind = X_INT
     var text: String
     var neg = False
-    if k == INT:
+    if t.is_wide(c):                                                       # F-192: a total past int64, as the digits of the 128-bit number
+        var w = wide_make(v, t.get_high(c, row))
+        neg = w < Int128(0)
+        text = wide_text(-w if neg else w, t.scale(c))
+        kind = X_DEC if t.scale(c) > 0 else X_INT
+    elif k == INT:
         neg = v < 0
         text = String(UInt64(v) if not neg else UInt64(0) - UInt64(v))
     elif k == DECIMAL:

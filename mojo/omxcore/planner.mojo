@@ -685,6 +685,10 @@ struct RulePlanner(Planner, Copyable, Movable):
             reason = "forced by the options"
         elif opts.group == GROUP_HASHED:
             reason = "forced by the options"
+        elif dense_ok and st.kind == SRC_SCAN and st.row_groups > 1 and domain > SMALL_DOMAIN and domain * st.row_groups > SPARSE_FACTOR * max(st.rows, 1):
+            # each row group is a chunk of its own: the dense layout would be allocated and merged once per chunk, which costs more than the rows it counts
+            reason = "the domain of " + commas(domain) + " slots would be allocated and merged for each of " + commas(st.row_groups) + " row groups (" +
+                     commas(domain * st.row_groups) + " slots for " + commas(st.rows) + " rows)"
         elif dense_ok and domain <= opts.dense_limit and (domain <= SMALL_DOMAIN or domain <= SPARSE_FACTOR * max(st.rows, 1)):
             use_dense = True
             reason = "the domain of " + commas(domain) + " slots is " + ("small" if domain <= SMALL_DOMAIN else "no more than " + String(SPARSE_FACTOR) + "x the rows")

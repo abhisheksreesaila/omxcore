@@ -2,7 +2,6 @@
 turn whatever it printed (or how it died) into a result record."""
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import signal
@@ -19,8 +18,9 @@ PREFIX = "@@RESULT "
 
 def shim_dir() -> str:
     """A dir with `omxcore` -> this checkout, so subprocesses import THIS checkout's code."""
-    d = Path(tempfile.gettempdir()) / f"mxframe-bench-shim-{hashlib.sha1(str(REPO_ROOT).encode()).hexdigest()[:10]}"
-    d.mkdir(exist_ok=True)
+    sys.path.insert(0, str(SCRIPTS_DIR))
+    import scratch
+    d = scratch.shim_dir(REPO_ROOT, "bench-shim")
     link = d / "omxcore"
     if link.is_symlink() and Path(os.readlink(link)) != REPO_ROOT:
         link.unlink()

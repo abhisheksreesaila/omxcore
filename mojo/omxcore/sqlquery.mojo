@@ -15,6 +15,7 @@ Each statement then goes to the engine as the one-SELECT statement it was before
 """
 from std.time import perf_counter_ns
 from .table import Table, SharedTable, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, F32_COLUMN
+from .query import OVERFLOW_MESSAGE
 from .sql import (SqlStatement, SqlQuery, SqlExpr, SelectItem, TableRef, WinSpec, Cte, SubQuery, OrderItem, parse_query, sql_error, lower_ascii, EXPLAIN_NONE, EXPLAIN_ANALYZE,
                   SET_NONE, SET_UNION_ALL, SET_UNION, SET_INTERSECT, SET_EXCEPT, split_copy, CopyTo, CTE_AUTO, CTE_MATERIALIZED, CTE_INLINED,
                   X_SCALAR_Q, X_IN_Q, X_EXISTS_Q, X_SUBIN, X_EXISTS, X_NOT, X_COL, X_INT, X_NULL, X_CAST, X_TRUE, X_FALSE, X_IN, X_BIN, X_CALL, X_ISBOOL, JK_INNER, JK_LEFT)
@@ -164,8 +165,11 @@ def _commas(n: Int) -> String:
     return out
 
 
-def register_result(mut run: QueryRun, mut catalog: Catalog, mut r: SqlResult, prefix: String) -> String:
-    """Puts a result's table in the catalog under a fresh internal name."""
+def register_result(mut run: QueryRun, mut catalog: Catalog, mut r: SqlResult, prefix: String) raises -> String:
+    """Puts a result's table in the catalog under a fresh internal name. A table holding a total past int64 (F-192) is refused with the int64 message:
+    the later steps read int64s (a scalar subquery, which only reads the one value, takes it from the result itself)."""
+    if r.table.any_wide():
+        raise Error(OVERFLOW_MESSAGE)
     var name = run.fresh(prefix, catalog)
     catalog.add_table(name, r.take_table().share())
     return name
@@ -409,7 +413,9 @@ def run_plain_explained[P: Planner](mut run: QueryRun, mut catalog: Catalog, var
     return r^
 
 
-def register_table(mut run: QueryRun, mut catalog: Catalog, var t: Table, prefix: String) -> String:
+def register_table(mut run: QueryRun, mut catalog: Catalog, var t: Table, prefix: String) raises -> String:
+    if t.any_wide():
+        raise Error(OVERFLOW_MESSAGE)
     var name = run.fresh(prefix, catalog)
     catalog.add_table(name, t^.share())
     return name

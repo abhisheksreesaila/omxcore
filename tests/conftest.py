@@ -1,13 +1,15 @@
 """Shared pytest setup: make `import omxcore` resolve to this checkout (works in git worktrees)."""
-import hashlib
+import atexit
 import os
 import sys
-import tempfile
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
-_shim = Path(tempfile.gettempdir()) / f"omxcore-shim-{hashlib.sha1(str(_ROOT).encode()).hexdigest()[:10]}"
-_shim.mkdir(exist_ok=True)
+sys.path.insert(0, str(_ROOT / "scripts"))
+import scratch  # noqa: E402
+
+scratch.use_for_tempfile()   # F-194: tempfile, pytest's tmp_path and child processes use ~/.cache, never the shared /tmp
+_shim = scratch.shim_dir(_ROOT, "omxcore-shim")
 for _name, _target in (("omxcore", _ROOT), ("mxframe", _ROOT / "compat" / "mxframe")):   # mxframe: the forwarding module
     if not (_shim / _name).exists():
         (_shim / _name).symlink_to(_target)
@@ -20,7 +22,25 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "slow: needs TPC-H Parquet data on disk / runs long")
 
 # Tests must never write observations into the user's real calibration file.
-os.environ.setdefault("MXFRAME_CALIBRATION", str(Path(tempfile.gettempdir()) / f"mxframe-test-calibration-{os.getpid()}.json"))
+if "MXFRAME_CALIBRATION" not in os.environ:
+    _calib = scratch.root() / f"mxframe-test-calibration-{os.getpid()}.json"
+    os.environ["MXFRAME_CALIBRATION"] = str(_calib)
+    atexit.register(lambda: _calib.unlink(missing_ok=True))
+
+_litter_before = scratch.litter()
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """A run that leaves a new /tmp/mxframe-* or /tmp/omxcore-* entry fails (the controller only, not xdist workers)."""
+    if hasattr(session.config, "workerinput"):
+        return
+    new = scratch.litter() - _litter_before
+    mine = scratch.owned(new, _ROOT)
+    if new - mine:
+        print(f"\nF-194 warning: new entries in /tmp that belong to another process (not this run's pid or checkout): {sorted(new - mine)}")
+    if mine and os.environ.get("MXFRAME_LITTER_CHECK") != "0":
+        print(f"\nF-194: this run left entries in /tmp: {sorted(mine)} (switch the check off with MXFRAME_LITTER_CHECK=0)")
+        session.exitstatus = 1
 
 
 import pytest  # noqa: E402

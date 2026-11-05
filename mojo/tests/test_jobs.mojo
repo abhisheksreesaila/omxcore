@@ -713,6 +713,46 @@ def test_cancel_latency() raises:
         expect(worst < 250.0, "a cancel stops the job within about 100 ms (worst " + String(worst) + " ms): " + texts[qi])
 
 
+def test_cancel_multiway() raises:
+    """F-158: a three-table join as a job equals `sql`, and a cancel reaches it between the join's steps and tables."""
+    var t = big_table(30_000_000)                      # (30M rows: a whole run takes tens of ms, so at 4M the job finished before the cancel landed)
+    var u = Table.empty()
+    var uv = u.add_column("v", INT)
+    var ug = u.add_column("grp", INT)
+    for i in range(-1000, 1001):
+        u.append(uv, Int64(i))
+        u.append(ug, Int64(abs(i) % 5))
+    var x = Table.empty()
+    var xg = x.add_column("grp", INT)
+    var xl = x.add_column("label", INT)
+    for g in range(5):
+        x.append(xg, Int64(g))
+        x.append(xl, Int64(100 + g))
+    var cat = Catalog()
+    cat.add_table("t", t)
+    cat.add_table("u", u^.share())
+    cat.add_table("x", x^.share())
+    var text = "SELECT x.label, count(*), sum(a.w) FROM t a JOIN u b ON a.v = b.v JOIN x ON b.grp = x.grp GROUP BY x.label ORDER BY x.label"
+    var want = sql(cat, text)
+    var full = sql_job(cat, text)
+    _ = watch(full, "multiway")
+    expect(same_table(full.result().table, want.table), "a multi-way sql job == sql")
+    var hit = 0
+    var worst = 0.0
+    for k in range(6):
+        var job = sql_job(cat, text)
+        pause(500 + 1500 * k)
+        job.cancel()
+        var t0 = perf_counter_ns()
+        if job.wait() == JOB_CANCELLED:
+            hit += 1
+        worst = max(worst, Float64(perf_counter_ns() - t0) / 1e6)
+    print("cancel of a multi-way join: worst", worst, "ms,", hit, "of 6 reached a running job; a whole run takes", want.ms, "ms")
+    comptime if not SERIAL:
+        expect(hit >= 3, "the cancels reached running multi-way jobs (" + String(hit) + ")")
+    expect(worst < 400.0, "a cancel stops a multi-way join within a few hundred ms (worst " + String(worst) + " ms)")
+
+
 def main() raises:
     makedirs(DIR, exist_ok=True)
     test_compute_equals_plain()
@@ -731,4 +771,5 @@ def main() raises:
     test_save_restart_and_two_saves()
     test_permutation_job()
     test_cancel_latency()
+    test_cancel_multiway()
     print("test_jobs ok")

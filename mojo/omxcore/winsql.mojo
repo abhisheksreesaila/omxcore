@@ -20,6 +20,9 @@ from .table import Table, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT
 from .window import (WinFn, WinGroup, WinOrder, apply_windows, function_name, W_ROW_NUMBER, W_RANK, W_DENSE_RANK, W_PERCENT_RANK, W_CUME_DIST, W_NTILE, W_LAG,
                      W_LEAD, W_FIRST, W_LAST, W_NTH, W_SUM, W_COUNT, W_COUNT_STAR, W_AVG, W_MIN, W_MAX)
 from .sqleval import float_bits
+from .query import OVERFLOW_MESSAGE
+from .postwide import distinct_sorted, rank_of
+from .wide import wide_make, wide_lo, wide_hi
 from .job import JobCtl
 
 comptime WIN_TABLE = "__win"
@@ -501,8 +504,75 @@ def _read_default(var d: _Default, mut f: WinFn, t: Table) raises:
     f.def_val = -v if d.neg else v
 
 
+struct WideColumns(Movable):
+    """F-192: the columns of the rows the outer query reads that hold totals past int64 (a SUM, a window SUM). The outer query is a row query whose
+    kernel and gathers see int64s, so such a column is replaced by its ranks (equal values, equal ranks; the ranks' order is the values') for the
+    outer query, which may select it and sort by it; `fix_wide_columns` turns the ranks of the finished result back into the 128-bit values."""
+    var out: List[Int]               # the outer query's output columns that are one of them
+    var vals: List[List[Int128]]     # per such output column: the distinct values its ranks index
+
+    def __init__(out self):
+        self.out = List[Int]()
+        self.vals = List[List[Int128]]()
+
+
+def point_wide_columns(mut rows: Table, outer: SqlStatement) raises -> WideColumns:
+    """Replaces each wide column of `rows` by ranks and says which output columns of `outer` show it. A wide column the outer query uses in an
+    expression (a comparison, arithmetic ...) is refused with the int64 message."""
+    var ww = WideColumns()
+    for c in range(rows.columns()):
+        if not rows.is_wide(c):
+            continue
+        var name = rows.name(c)
+        for i in range(len(outer.exprs)):
+            for ch in _children(outer.exprs[i]):
+                if outer.exprs[ch].kind == X_COL and outer.exprs[ch].text == name:
+                    raise Error(OVERFLOW_MESSAGE)
+        var n = rows.rows()
+        var values = List[Int128](length=n, fill=Int128(0))
+        var nul = List[UInt8](length=n, fill=0)
+        for r in range(n):
+            if rows.is_null(c, r):
+                nul[r] = 1
+            else:
+                values[r] = wide_make(rows.cols[c].values[r], rows.cols[c].high[r])
+        var distinct = distinct_sorted(values, nul)
+        for r in range(n):
+            rows.cols[c].values[r] = 0 if nul[r] != 0 else Int64(rank_of(distinct, values[r]))
+        rows.cols[c].high = List[Int64]()
+        for j in range(len(outer.items)):
+            if outer.items[j].expr >= 0 and outer.exprs[outer.items[j].expr].kind == X_COL and outer.exprs[outer.items[j].expr].text == name:
+                ww.out.append(j)
+                ww.vals.append(distinct.copy())
+    return ww^
+
+
+def fix_wide_columns(mut table: Table, ww: WideColumns):
+    """The ranks in the finished table's wide output columns turned back into 128-bit values."""
+    for k in range(len(ww.out)):
+        ref col = table.cols[ww.out[k]]
+        var rows = len(col.values)
+        col.high = List[Int64](length=rows, fill=0)
+        for r in range(rows):
+            if col.is_null(r):
+                continue
+            var v = ww.vals[k][Int(col.values[r])]
+            col.values[r] = wide_lo(v)
+            col.high[r] = wide_hi(v)
+
+
 def finish_windows(mut plan: WindowPlan, mut t: Table, threads: Int, job: JobCtl, mut notes: List[String]) raises:
     """Adds the window columns to the inner result `t`."""
+    for g in plan.groups:                                               # F-192: a window function reads int64s; a total past int64 cannot be its input
+        var inputs = g.part.copy()
+        for o in g.order:
+            inputs.append(o.col)
+        for f in g.fns:
+            if f.arg >= 0:
+                inputs.append(f.arg)
+        for c in inputs:
+            if t.is_wide(c):
+                raise Error(OVERFLOW_MESSAGE)
     for i in range(len(plan.defaults)):
         var d = plan.defaults[i].copy()
         _read_default(d^, plan.groups[plan.defaults[i].group].fns[plan.defaults[i].fn_at], t)

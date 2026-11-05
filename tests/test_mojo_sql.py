@@ -250,6 +250,8 @@ def expected_group(keys, ds, mode, kinds, con, rows):
         else:
             span = con.execute(f"select max({key}) - min({key}) from t").fetchone()[0]
             domain *= (span + 1) + 1
+    if mode == "scan" and domain > 65_536 and domain * ROW_GROUPS > 4 * rows:      # F-158: each row group is a chunk: the dense layout would be allocated and merged per chunk
+        return "hashed"
     return "dense" if domain <= 4_194_304 and (domain <= 65_536 or domain <= 4 * rows) else "hashed"
 
 
@@ -439,12 +441,14 @@ def test_forcing_dense_beyond_the_limit_raises(probe, data):
     assert res["error"] == "cannot force dense groups: the domain of 10,001 slots passes the limit of 500"
 
 
-def test_sum_past_int64_raises_in_every_source(probe, data):
+def test_sum_past_int64_is_duckdbs_hugeint_in_every_source(probe, data):
+    """F-192: a total past int64 is DuckDB's HUGEINT (it raised "passed the int64 range" before), from a table and from a scan, dense and hashed."""
+    ds = data["g1m"]
     for mode in ["table", "scan"]:
-        res = run_probe(probe, "SELECT sum(id * id * id) FROM t", {"t": data["g1m"].path}, mode=mode, expect_error=True)
-        assert res["error"] == "a sum or an expression passed the int64 range (about 9.2e18)", (mode, res)
-        res = run_probe(probe, "SELECT k, sum(id * id * id) FROM t GROUP BY k", {"t": data["g1m"].path}, mode=mode, group="hashed", expect_error=True)
-        assert res["error"] == "a sum or an expression passed the int64 range (about 9.2e18)", (mode, res)
+        for sql, group in (("SELECT sum(id * id * id) FROM t", None), ("SELECT k, sum(id * id * id) FROM t GROUP BY k", "hashed"),
+                           ("SELECT k, sum(id * id * id) FROM t GROUP BY k", "dense")):
+            res = run_probe(probe, sql, {"t": ds.path}, mode=mode, group=group)
+            assert_equal(got_rows(res), ds.table.execute(sql).fetchall(), False, f"{mode}/{group}: {sql}")
 
 
 def test_empty_inputs(probe, data):
@@ -670,7 +674,9 @@ def test_a_scans_statistics_plan_like_the_table(probe, data, keys):
     for mode in ("table", "scan"):
         lines = [r[0] for r in run_probe(probe, sql, {"t": data["g8"].path}, mode=mode)["rows"]]
         plans.append(next(l for l in lines if l.startswith("  group:")))
-    assert plans[0] == plans[1], plans
+    if plans[0] != plans[1]:                      # F-158: the one difference allowed: a big domain over many row groups is hashed, not merged per chunk
+        strategy = lambda p: p.split(":")[1].split(" on ")[0].split(",")[0].strip()
+        assert (strategy(plans[0]) == "dense" and strategy(plans[1]) == "hashed" and "row groups" in plans[1]) or strategy(plans[0]) == strategy(plans[1]) == "hashed", plans
 
 
 def test_a_decimal_product_past_int64_raises(probe, data):
