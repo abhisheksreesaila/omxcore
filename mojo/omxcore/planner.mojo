@@ -355,9 +355,13 @@ struct JoinStats(Copyable, Movable):
     var ndv_a: List[Int]             # the distinct values of the equality's column in each of the two leaves (after their filters), -1 unknown
     var ndv_b: List[Int]
     var deferred: List[Bool]         # F-202: per leaf (empty: none): only counted, so its filtered rows are written unless it is the last join's probe side
+    var uniq_a: List[Bool]           # F-202: per equality: the column's values are all different in leaf `edge_a` (a key of it) ...
+    var uniq_b: List[Bool]           # ... in leaf `edge_b`
 
     def __init__(out self):
         self.deferred = List[Bool]()
+        self.uniq_a = List[Bool]()
+        self.uniq_b = List[Bool]()
         self.names = List[String]()
         self.base_rows = List[Int]()
         self.rows = List[Int]()

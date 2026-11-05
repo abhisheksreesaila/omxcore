@@ -194,7 +194,7 @@ def test_explain_analyze_shows_actual_rows_and_milliseconds_per_operator(mx, tpc
     files = {t: tpch["paths"][t] for t in tables_of(Q5)}
     out = run_mx(mx, ["sql", "EXPLAIN ANALYZE " + Q5], files)
     text = "\n".join(r[0] for r in out["rows"])
-    assert "\nActual" in "\n" + text and "scan region:" in text and "join step 1" in text and "result: 5 rows in" in text, text
+    assert "\nActual" in "\n" + text and "scan region:" in text and ("join step 1" in text or "star dimension group, join 1" in text) and "result: 5 rows in" in text, text
     assert re.search(r"scan orders: 150,000 rows, [\d,]+ after its filter", text), text
 
 

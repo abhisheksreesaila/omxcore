@@ -64,8 +64,10 @@ GROUP BY 1, 2, 3 ORDER BY 1, 2, 3"""
 def test_an_or_across_tables_filters_each_table_first(mx, data):
     res = q(mx, data, OR_PAIRS, ["da", "f", "db", "nat"], ordered=True)
     assert res["rows"], "the OR has rows to find"
-    note(res, "n1 (2 of 25 rows)")                                  # the OR implies n_name IN ('N03', 'N07') for each alias
-    note(res, "n2 (2 of 25 rows)")
+    # the OR implies nname IN ('N03', 'N07') for each alias: each is joined as 2 rows, not 25
+    import re
+    for alias in ("n1", "n2"):
+        assert any(re.search(rf"{alias}\.nk [\d,]+ in 2$", n) or re.search(rf"{alias}\.nk has [\d,]+ distinct values in 2 rows", n) for n in res["notes"]), res["notes"]
 
 
 @pytest.mark.parametrize("sql", [
@@ -150,3 +152,32 @@ def test_like_with_several_literals_equals_duckdb(mx, words, pattern):
     esc = pattern.replace("'", "''")
     check(mx, f"SELECT id, s LIKE '{esc}' AS m, s NOT LIKE '{esc}' AS n FROM w ORDER BY id", words["con"], files={"w": words["paths"]["w"]}, ordered=True)
     check(mx, f"SELECT count(*) FROM w WHERE s LIKE '{esc}'", words["con"], files={"w": words["paths"]["w"]})
+
+
+# a star from the largest table: unique keys into every dimension, and an equality between two dimension groups checked on the joined values (TPC-H Q5's shape)
+STARS = [
+    "SELECT da.an, count(*), sum(f.x) FROM f, da, db WHERE f.a = da.a AND f.b = db.b AND da.ak = db.bk GROUP BY da.an ORDER BY da.an",
+    "SELECT nat.nname, sum(f.x) FROM f, da, db, nat WHERE f.a = da.a AND f.b = db.b AND da.ak = db.bk AND da.ak = nat.nk AND f.d > date '2021-01-01' GROUP BY nat.nname ORDER BY nat.nname",
+    "SELECT db.bk, count(*) FROM f, da, db WHERE f.a = da.a AND f.b = db.b AND da.ak = db.bk AND da.seg = 2 AND db.w > 3 GROUP BY db.bk ORDER BY db.bk",
+    "SELECT count(*), min(f.d), max(f.x) FROM f, da, db WHERE f.a = da.a AND f.b = db.b AND da.ak = db.bk AND f.s = 'blue'",
+    # a dimension of a dimension, and nothing selected from the second group
+    "SELECT nat.nname, count(*) FROM f, db, da, nat WHERE f.b = db.b AND db.bk = nat.nk AND f.a = da.a AND da.seg = 1 GROUP BY nat.nname ORDER BY nat.nname",
+]
+
+
+@pytest.mark.parametrize("sql", STARS)
+def test_a_star_from_the_fact_table_equals_duckdb(mx, data, sql):
+    res = q(mx, data, sql, [t for t in ["f", "da", "db", "nat"] if f" {t}," in sql or f" {t} " in sql or sql.split(" WHERE ")[0].endswith(f" {t}")], ordered=True)
+    note(res, "a star from f")
+    note(res, "join path: fused: a star")
+
+
+def test_a_dimension_with_repeated_keys_is_not_a_star(mx, data):
+    # dup repeats its key: the planner's order stands, and the answer is the same
+    res = q(mx, data, "SELECT da.seg, count(*), sum(f.x) FROM f, da, dup WHERE f.a = da.a AND dup.a = f.a AND dup.v < 3 GROUP BY da.seg ORDER BY da.seg", ["f", "da", "dup"], ordered=True)
+    assert not [n for n in res["notes"] if "a star from" in n], res["notes"]
+
+
+def test_a_star_with_an_empty_dimension_and_null_cross_keys(mx, data):
+    q(mx, data, "SELECT count(*), sum(f.x) FROM f, nothing, db WHERE f.a = nothing.a AND f.b = db.b AND nothing.ak = db.bk", ["f", "nothing", "db"])
+    q(mx, data, "SELECT count(*) FROM f, da, db WHERE f.a = da.a AND f.b = db.b AND da.ak = db.bk AND da.ak IS NULL", ["f", "da", "db"])
