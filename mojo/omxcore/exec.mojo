@@ -599,6 +599,40 @@ def _load_chunk(src: SqlSource, mut ch: _Chunks, i: Int) raises -> SharedTable:
     return chunk^
 
 
+def _read_ahead(src: SqlSource, ch: _Chunks, first: Int, count: Int, threads: Int) raises -> List[SharedTable]:
+    """Row groups `first` .. `first + count - 1` of a scan (no frame mask), decoded at once by as many workers: the batch is a row group a worker, so a streamed
+    query holds that many row groups at a time and decodes on every core (the one-chunk-at-a-time loop decoded on one)."""
+    ref scan = src.scan.value()
+    var tabs = List[Table]()
+    for _ in range(count):
+        tabs.append(Table.empty())
+    var fails = List[Int](length=count, fill=0)
+    var msgs = List[String]()
+    for _ in range(count):
+        msgs.append(String())
+    var tp = tabs.unsafe_ptr()
+    var fp = fails.unsafe_ptr()
+    var mp = msgs.unsafe_ptr()
+
+    def read_one(k: Int) {imm}:
+        try:
+            var t = scan.read_group(ch.groups[first + k], ch.used)
+            tp[k] = t^
+        except e:
+            fp[k] = 1
+            mp[k] = String(e)
+
+    par_n(read_one, count, count)
+    var out = List[SharedTable]()
+    for k in range(count):
+        if fails[k] != 0:
+            raise Error(msgs[k])
+        var t = Table.empty()
+        swap(t, tabs[k])
+        out.append(t^.share())
+    return out^
+
+
 comptime LIE = "footer statistics wrong: "
 
 

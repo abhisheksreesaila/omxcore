@@ -19,6 +19,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, HERE)
 import gen  # noqa: E402
+sys.path.insert(0, os.path.join(ROOT, "scripts"))
+import scratch as _scratch  # noqa: E402
 
 
 def run(spec_path, data_dir, out, env):
@@ -42,7 +44,7 @@ def main():
     a = ap.parse_args()
     data_dir = os.path.join(ROOT, "data", f"tpch_sf{a.sf}")
     st = gen.stats(os.path.join(ROOT, "data", "tpch_sf1"))
-    tmp = tempfile.mkdtemp(prefix="mxab-")
+    tmp = tempfile.mkdtemp(prefix="mxab-", dir=_scratch.root())
     rows = []
     for seed in range(a.seed0, a.seed0 + a.n):
         spec = gen.make(seed, st)

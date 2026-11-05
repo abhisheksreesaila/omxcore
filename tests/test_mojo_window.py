@@ -230,11 +230,10 @@ def test_explain_shows_the_window_step_and_runs_nothing(mx, data):
     assert "Query" in text and "Scan" in text, text
 
 
-def test_an_int_sum_past_int64_raises_like_the_other_sums(mx, data):
-    import subprocess
-    r = subprocess.run([str(mx), "sql", "SELECT sum(x * 1000000000000000) OVER (ORDER BY id) AS s FROM t", "-t", f"t={data['g8'].path}"], capture_output=True)
-    assert r.returncode != 0
-    assert "a window sum passed the int64 range" in (r.stdout + r.stderr).decode(), (r.stdout + r.stderr)[-300:]
+def test_an_int_sum_past_int64_is_duckdbs_hugeint(mx, probe, data):
+    """F-192: a running sum past int64 is DuckDB's HUGEINT, in every source (it raised "a window sum passed the int64 range" before)."""
+    for mode in ("table", "scan", "frame"):
+        check(mode, data["g8"], mx, probe, "SELECT id, sum(x * 1000000000000000) OVER (ORDER BY id) AS s FROM t")
 
 
 ERRORS = [

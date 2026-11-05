@@ -19,9 +19,7 @@ import gate_common as gate  # noqa: E402
 SF = 1
 
 # query -> the engine's error today. Keep the text exact (the xfail reason is what the F-159 / F-155 reviewer greps).
-GAPS = {
-    11: "a sum or an expression passed the int64 range (about 9.2e18)",       # F-192
-}
+GAPS = {}
 
 
 @pytest.fixture(scope="module")

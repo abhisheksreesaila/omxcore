@@ -3,6 +3,7 @@ copied; INT with DECIMAL is a DECIMAL, DECIMALs of two scales the larger scale, 
 column keeps the first table's dictionary and adds the second's new words to it, so the codes of the first table stay and the second's are mapped once per word."""
 from .table import Table, SharedTable, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, ColumnKind
 from .sql import sql_error
+from .query import OVERFLOW_MESSAGE
 from .bind import pow10_checked, decimal_to_float, kind_name
 
 
@@ -42,6 +43,8 @@ def _convert(v: Int64, kind: ColumnKind, scale: Int, to_kind: Int, to_scale: Int
 
 
 def union_all(a: Table, b: Table, line: Int, col: Int) raises -> Table:
+    if a.any_wide() or b.any_wide():                                  # F-192: a total past int64 is two words per value, copied here as one
+        raise Error(OVERFLOW_MESSAGE)
     if a.columns() != b.columns():
         raise sql_error(line, col, "the operands of the set operation have " + String(a.columns()) + " and " + String(b.columns()) + " columns")
     var out = Table.empty()
