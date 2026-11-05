@@ -49,6 +49,8 @@ from .kernels.hashjoin_cpu import hj_build, PM_SEMI, PM_ANTI
 from .frame import text_ranks
 from .job import JobCtl, STAGE_PLAN, STAGE_AGGREGATE, STAGE_FINISH      # F-175
 from .window import WindowFn, Window, W_SUM, W_COUNT, W_COUNT_STAR, W_AVG, W_MIN, W_MAX      # F-168
+from .exprsql import sql_of, window_clause, call_sql, quote_name      # F-160
+from .bind import ViewSource, SqlSource, SRC_FRAME, SRC_SCAN      # F-160
 
 # plan node kinds
 comptime P_SCAN = 0
@@ -258,7 +260,7 @@ struct QuantileBins(Copyable, Movable):
         return acc^
 
 
-struct Query(Movable):
+struct Query(Movable, ViewSource):
     """A plan over one shared table, or over a session's view of it (`Query(frame)`: its edits, appended and removed
     rows, merges and formula columns, copied when the query is built), built by chaining; `compute` runs it."""
     var table: SharedTable
@@ -273,10 +275,12 @@ struct Query(Movable):
     var _window_rows: Int                # rows per window of a count_distinct / percentile / top_k query (0: as many as
                                          # fit WINDOW_BYTES); tests set it small to cut a table into several windows
     var _threads: Int                    # worker threads the CPU kernel starts (0: one a core); a float64 sum is the same for any number
+    var edits: Int                       # F-160: the frame's edit counter when `Query(frame)` copied it (0 for a table or scan): a view's cache key
     var windows: List[WindowFn]          # F-168: window functions over the rows the plan keeps (`window`; `compute_windows` in winquery.mojo runs them)
 
     def __init__(out self, table: SharedTable):
         self.windows = List[WindowFn]()
+        self.edits = 0
         self.table = table
         self.device = None
         self.scan = None
@@ -294,6 +298,7 @@ struct Query(Movable):
         columns the plan uses), runs the kernel on it on the CPU and merges the partial results, so the answer is
         `read_parquet` + the same query, exactly, and the peak memory is one row group plus the result."""
         self.windows = List[WindowFn]()
+        self.edits = 0
         self.table = scan.schema
         self.device = None
         self._window_rows = 0
@@ -308,6 +313,7 @@ struct Query(Movable):
 
     def __init__(out self, frame: Frame) raises:
         self.windows = List[WindowFn]()
+        self.edits = 0
         self.table = frame.base
         self.device = None
         self._window_rows = 0
@@ -319,6 +325,7 @@ struct Query(Movable):
         self.nodes = [PlanNode(P_SCAN, -1, List[Expr](), List[Agg](), 0)]
         self.framed = True
         self.overlay = frame.overlay()
+        self.edits = frame.edits
 
     def _top(self) -> Int:
         return len(self.nodes) - 1
@@ -334,6 +341,41 @@ struct Query(Movable):
         for f in fns:
             self.windows.append(f.copy())
         return self^
+
+    def view_sql(self, source: String) raises -> String:
+        """F-160: the plan as SQL over a source called `source`: `SELECT * [, f(...) OVER (...) AS name ...] FROM source [WHERE ...]`, the rows its `where`s keep
+        and the columns of its window functions (a `group_by` or an aggregate is not written: use SQL). It is the text of a catalog view made from a Query
+        (`Catalog.view(name, query)`) and of `compute_windows`."""
+        var where = String()
+        for node in self.nodes:
+            if node.kind == P_AGGREGATE:
+                raise Error("a Query with a group_by or an aggregate takes no window functions here: write the query in SQL (`sql()`)" if len(self.windows) > 0
+                            else "a Query with a group_by or an aggregate cannot be a view here: write the query in SQL (`Catalog.view(name, sql)`)")
+            if node.kind == P_FILTER:
+                where += (" AND " if where.byte_length() > 0 else "") + sql_of(node.exprs[0])
+        var text = String("SELECT *")
+        for i in range(len(self.windows)):
+            ref f = self.windows[i]
+            if not f.has_over:
+                raise Error("window function " + String(i) + " has no window: write `.over(Window()...)`")
+            text += ", " + call_sql(f) + " OVER (" + window_clause(f.win) + ") AS " + quote_name(f.name if f.name.byte_length() > 0 else "w" + String(i))
+        text += " FROM " + source
+        if where.byte_length() > 0:
+            text += " WHERE " + where
+        return text^
+
+    def view_source(self, name: String) -> SqlSource:
+        """F-160: the plan's data as a catalog source called `name`: the table, the frame's edits or the Parquet scan it was built over."""
+        var src = SqlSource(name, self.table)
+        if self.scan:
+            src.kind = SRC_SCAN
+            src.scan = self.scan.copy()
+        elif self.framed:
+            src.kind = SRC_FRAME
+        src.overlay = self.overlay.copy()
+        src.framed = self.framed
+        src.version = self.edits
+        return src^
 
     def _aggregate(self) -> Int:
         for i in range(len(self.nodes)):
