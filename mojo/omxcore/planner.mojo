@@ -451,6 +451,8 @@ def _plan_from(js: JoinStats, order: List[Int], opts: PlannerOptions) -> JoinPla
     plan.start = order[0]
     in_set[order[0]] = True
     var acc = js.rows[order[0]]
+    if len(js.deferred) > 0 and js.deferred[order[0]]:
+        plan.cost += js.rows[order[0]]                            # F-202: the start table is read filtered whole
     for i in range(1, len(order)):
         var leaf = order[i]
         var est = _step_estimate(js, in_set, acc, leaf)
@@ -461,7 +463,7 @@ def _plan_from(js: JoinStats, order: List[Int], opts: PlannerOptions) -> JoinPla
             build_new = True
         var c = _step_cost(acc, js.rows[leaf], max(est, 0))
         if len(js.deferred) > 0 and js.deferred[leaf] and (i < len(order) - 1 or build_new):
-            c += js.rows[leaf]                                    # F-202: read filtered: its passing rows are written (the last probe side filters in the pipeline instead)
+            c += _min_int(js.rows[leaf], max(est, 0))             # F-202: read filtered where its key has a partner (`_read_filtered_reduced`): about the step's output is written (the last probe side filters in the pipeline instead)
         plan.steps.append(JoinStep(leaf, build_new, est, c))
         plan.cost += c
         in_set[leaf] = True

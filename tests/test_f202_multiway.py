@@ -126,3 +126,27 @@ MANY_GROUPS = [
 @pytest.mark.parametrize("sql,ordered", MANY_GROUPS)
 def test_text_keys_passed_through_order_by_limit(mx, data, sql, ordered):
     q(mx, data, sql, [t for t in ["f", "da", "db"] if f" {t} " in sql or f" {t}," in sql], ordered=ordered)
+
+# LIKE patterns of several literals and `%` (TPC-H Q13's '%special%requests%'): matched by finding each literal after the one before it
+@pytest.fixture(scope="session")
+def words(tmp_path_factory):
+    d = tmp_path_factory.mktemp("f202w")
+    con = oracle_connection()
+    con.execute("""create table w as select i as id, case when i % 17 = 0 then null else
+        (['', 'a', 'ab', 'aa', 'aab', 'abab', 'special requests', 'special  requests', 'requestsspecial', 'xspecialyrequestsz', 'special', 'requests',
+          'aXbXc', 'abc', 'cba', 'a%b', 'a_b', 'café au lait', 'naïve café', 'éé', 'ba', 'bab', 'aXXb', 'the special offer requests more'])[1 + i % 24] end as s
+        from range(240) r(i)""")
+    p = d / "w.parquet"
+    con.execute(f"copy w to '{p}' (format parquet)")
+    return {"con": con, "paths": {"w": p}}
+
+
+PATTERNS = ["%special%requests%", "special%requests", "%special%requests", "special%requests%", "a%b%", "%a%b", "a%b", "a%a", "aa%a", "%a%a%", "%a%%b%", "a%%b",
+            "%café%", "%é%é%", "%naïve%café", "%X%X%", "a%X%c", "%c%b%a%", "ab%ab", "%ab%ab%", "%%a%b%%", "a_b%c", "%a%_b%"]
+
+
+@pytest.mark.parametrize("pattern", PATTERNS)
+def test_like_with_several_literals_equals_duckdb(mx, words, pattern):
+    esc = pattern.replace("'", "''")
+    check(mx, f"SELECT id, s LIKE '{esc}' AS m, s NOT LIKE '{esc}' AS n FROM w ORDER BY id", words["con"], files={"w": words["paths"]["w"]}, ordered=True)
+    check(mx, f"SELECT count(*) FROM w WHERE s LIKE '{esc}'", words["con"], files={"w": words["paths"]["w"]})

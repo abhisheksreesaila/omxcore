@@ -259,8 +259,12 @@ struct LikePattern(Copyable, Movable):
     var lo: List[Int]
     var hi: List[Int]
     var lit: List[UInt8]
-    var shape: Int             # 0 general, 1 `lit`, 2 `lit%`, 3 `%lit`, 4 `%lit%`, 5 `%` (anything): the shapes that need no backtracking
+    var shape: Int             # 0 general, 1 `lit`, 2 `lit%`, 3 `%lit`, 4 `%lit%`, 5 `%` (anything), 6 `lit%lit%...` (several literals, no `_`): the shapes that need no backtracking
     var needle: List[UInt8]    # the literal of shapes 1 to 4
+    var seg_lo: List[Int]      # shape 6: each literal's bytes are needle[seg_lo[i]:seg_hi[i]]; the first is anchored at the start unless the pattern begins with `%`, the last at the end unless it ends with one
+    var seg_hi: List[Int]
+    var anchor_start: Bool
+    var anchor_end: Bool
 
     def __init__(out self, pattern: String, escape: String, has_escape: Bool):
         self.kind = List[Int]()
@@ -269,6 +273,10 @@ struct LikePattern(Copyable, Movable):
         self.lit = List[UInt8]()
         self.shape = 0
         self.needle = List[UInt8]()
+        self.seg_lo = List[Int]()
+        self.seg_hi = List[Int]()
+        self.anchor_start = False
+        self.anchor_end = False
         var b = pattern.as_bytes()
         var e = -1
         if has_escape and escape.byte_length() > 0:
@@ -312,9 +320,31 @@ struct LikePattern(Copyable, Movable):
         while last > first and self.kind[last - 1] == 0:
             last -= 1
         var plain = True
+        var literal_runs = True                                   # only literals and `%` between the ends (F-202: `%special%requests%` and the like)
+        var n_runs = 0
+        for t in range(0, len(self.kind)):
+            literal_runs = literal_runs and self.kind[t] != 1
+            if self.kind[t] == 2 and (t == 0 or self.kind[t - 1] != 2):
+                n_runs += 1
         for t in range(first, last):
             plain = plain and self.kind[t] == 2
-        if plain:
+        if not plain and literal_runs and n_runs >= 2:
+            self.shape = 6
+            self.anchor_start = self.kind[0] == 2
+            self.anchor_end = self.kind[len(self.kind) - 1] == 2
+            var t = 0
+            while t < len(self.kind):
+                if self.kind[t] == 2:
+                    var lo = len(self.needle)
+                    while t < len(self.kind) and self.kind[t] == 2:
+                        for j in range(self.lo[t], self.hi[t]):
+                            self.needle.append(self.lit[j])
+                        t += 1
+                    self.seg_lo.append(lo)
+                    self.seg_hi.append(len(self.needle))
+                else:
+                    t += 1
+        elif plain:
             if len(self.kind) > 0 and first == last:
                 self.shape = 5                                   # only `%`
             else:
@@ -331,6 +361,8 @@ struct LikePattern(Copyable, Movable):
     def matches_bytes(self, b: Span[UInt8, _]) -> Bool:
         var n = len(b)
         var sh = self.shape
+        if sh == 6:
+            return self._segments(b)
         if sh != 0:
             var m = len(self.needle)
             if sh == 5:
@@ -375,6 +407,40 @@ struct LikePattern(Copyable, Movable):
         while pi < m and self.kind[pi] == 0:
             pi += 1
         return pi == m
+
+    def _segments(self, b: Span[UInt8, _]) -> Bool:
+        """Shape 6: each literal found after the one before it (the leftmost find leaves the most room), the first at the start and the last at the end when the pattern is anchored there."""
+        var n = len(b)
+        var pos = 0
+        var k = len(self.seg_lo)
+        for s in range(k):
+            var lo = self.seg_lo[s]
+            var m = self.seg_hi[s] - lo
+            if s == 0 and self.anchor_start:
+                if m > n or not self._seg_eq(b, 0, lo, m):
+                    return False
+                pos = m
+                continue
+            if s == k - 1 and self.anchor_end:
+                return n - m >= pos and self._seg_eq(b, n - m, lo, m)
+            var first = self.needle[lo]
+            var i = pos
+            var found = False
+            while i + m <= n:
+                if b[i] == first and self._seg_eq(b, i, lo, m):
+                    found = True
+                    break
+                i += 1
+            if not found:
+                return False
+            pos = i + m
+        return True
+
+    def _seg_eq(self, b: Span[UInt8, _], at: Int, lo: Int, m: Int) -> Bool:
+        for j in range(m):
+            if b[at + j] != self.needle[lo + j]:
+                return False
+        return True
 
     def _eq_at(self, b: Span[UInt8, _], at: Int) -> Bool:
         for j in range(len(self.needle)):
