@@ -196,6 +196,14 @@ def test_a_million_rows_in_a_million_partitions_and_in_one(mx, probe, data, mode
     check(mode, data["g1m"], mx, probe, q[1])
 
 
+@pytest.mark.parametrize("mode", ["table", "frame"])
+def test_the_oracle_runs_on_one_thread(data, mode):
+    """F-198: a DuckDB 1.5.1 connection with threads > 1 stalled for good inside `execute()` (the main thread spinning in
+    `Executor::WaitForTask` while every worker slept) on a 1.2M-row `rank() OVER (ORDER BY x DESC NULLS FIRST)`, on a loaded machine;
+    four of four processes stalled in the second round. The oracle connections stay on one thread: 5 rounds in 4 processes never stalled."""
+    assert data["g10k"].oracle(mode).execute("select current_setting('threads')").fetchone() == (1,)
+
+
 def test_threads_do_not_change_a_window_result(mx, data):
     """1 thread and 8 threads give the same rows, bit for bit (a FLOAT sum included)."""
     ds = data["g10k"]
