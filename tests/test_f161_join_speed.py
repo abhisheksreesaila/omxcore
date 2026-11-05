@@ -43,8 +43,9 @@ def data(tmp_path_factory):
     con.execute("create table dimk as select i as k, 'name' || (i % 40) as name, (i % 17) as seg, (i * 0.5)::decimal(10,1) as w from range(5000) r(i)")
     con.execute("create table repg as select i % 11 as g, i as rid, (i % 6) as v from range(2000) r(i)")                                         # 11 keys, about 180 rows each
     con.execute("create table repg2 as select i % 11 as g, i as rid, (i % 6) as v from range(300) r(i)")                                         # 11 keys, about 27 rows each
+    con.execute("create table smallg as select i as g, 'grp' || (i % 4) as gname from range(11) r(i)")
     paths = {}
-    for t, rg in [("cust", 700), ("orders", 3000), ("skew", 2500), ("nothing", 100), ("bigc", 50000), ("bigo", 40000), ("bigo2", 40000), ("bigf", 100000), ("dimk", 2000), ("repg", 500), ("repg2", 100)]:
+    for t, rg in [("cust", 700), ("orders", 3000), ("skew", 2500), ("nothing", 100), ("bigc", 50000), ("bigo", 40000), ("bigo2", 40000), ("bigf", 100000), ("dimk", 2000), ("repg", 500), ("repg2", 100), ("smallg", 100)]:
         paths[t] = d / f"{t}.parquet"
         con.execute(f"copy {t} to '{paths[t]}' (format parquet, row_group_size {rg})")
     return {"con": con, "paths": paths}
@@ -193,3 +194,36 @@ def test_a_filter_across_both_tables_is_not_moved_before_the_probe(mx, data):
 
 def test_forced_materialized_with_a_selective_filter(mx, data):
     q(mx, data, SELECTIVE[0], ["bigf", "dimk"], extra=["--join", "materialize"])
+
+
+STAR = [
+    "SELECT d.name, sg.gname, count(*), sum(f.x) FROM bigf f JOIN dimk d ON f.k = d.k JOIN smallg sg ON f.g = sg.g WHERE f.x < 50 GROUP BY d.name, sg.gname",
+    "SELECT sg.gname, count(*), sum(d.w) FROM bigf f JOIN dimk d ON f.k = d.k JOIN smallg sg ON f.g = sg.g WHERE f.x < 100 AND f.s LIKE '%e%' GROUP BY sg.gname",
+]
+
+
+@pytest.mark.parametrize("sql", STAR)
+def test_a_star_probe_filter_runs_before_the_probes(mx, data, sql):
+    res = q(mx, data, sql, ["bigf", "dimk", "smallg"])
+    assert "join path: fused: a star" in " ".join(res["notes"]), res["notes"]
+    assert FIRST in " ".join(res["notes"]), res["notes"]
+
+
+def test_tpch_q12_and_q14_expand_in_the_front_stage():
+    """TPC-H at SF 1 (DuckDB's dbgen, the gate's data): Q12 and Q14 build on the small filtered lineitem side, whose keys repeat (up to 4 and 5 rows of a key): each
+    probe row is expanded to its partners in the fused pass; both equal DuckDB. (Q10 and Q3 keep their written order; the gate has them equal too.)"""
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    import gate_common as gate
+    from gate_compare import compare_with_duckdb
+    mx = mx_binary()
+    paths = gate.table_paths(1)
+    con = gate.duck_views(paths)
+    qs = gate.queries()
+    for n in (12, 14):
+        compare_with_duckdb(mx, qs[n], paths, con, label=f"TPC-H Q{n} SF1")
+        files = {t: paths[t] for t in ("orders", "lineitem", "part")}
+        out = run_mx(mx, ["sql", "--max-rows", "0", qs[n]], files)
+        joined = " ".join(out["notes"])
+        assert "expanded to its partners" in joined and "join path: materialized" not in joined, out["notes"]

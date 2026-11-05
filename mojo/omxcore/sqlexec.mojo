@@ -1577,7 +1577,7 @@ def _build_cluster[P: Planner](q: BoundQuery, leaves: List[_Leaf], js: JoinStats
 
 
 def _run_star[P: Planner](q: BoundQuery, leaves: List[_Leaf], js: JoinStats, jp: JoinPlan, s0: Int, before: Int, probe: SharedTable, probe_gt: List[Int], conj0: List[Int],
-                          psrc: SqlSource, streamed: Bool, done: List[Bool], planner: P, opts: PlannerOptions, trust: Bool, lie: String, mut res: SqlResult, mut out: SqlResult) raises -> Bool:
+                          psrc: SqlSource, streamed: Bool, pf: Bool, done: List[Bool], planner: P, opts: PlannerOptions, trust: Bool, lie: String, mut res: SqlResult, mut out: SqlResult) raises -> Bool:
     """Steps `s0` to the last as one star: the probe table (the rows joined so far, or a table read unfiltered whose filter `conj0` runs in the pipeline) meets each
     dimension (a table, or a group of tables joined with each other first) through a map built on the dimension's unique keys, all in one pass over the probe rows
     (no joined row is written, no intermediate table). False (nothing changed but notes) when a dimension's keys are not unique or are hashed: the steps run one by one."""
@@ -1721,7 +1721,9 @@ def _run_star[P: Planner](q: BoundQuery, leaves: List[_Leaf], js: JoinStats, jp:
         var template = ArcPointer(stream_template(ps))
         out = _run_sql_once(cat2, jq, planner, opts, trust, lie, template)
     else:
-        var fj = ArcPointer(FusedJoin(probe, dim_tabs^, vstage^, vreal^, stages^))
+        var fjv = FusedJoin(probe, dim_tabs^, vstage^, vreal^, stages^)
+        fjv.pred_first = pf and len(conj0) > 0
+        var fj = ArcPointer(fjv^)
         out = _run_sql_once(cat2, jq, planner, opts, trust, lie, fj)
     res.actuals.append("star (" + names + "): " + commas(psrc_rows) + " probe rows, " + _ms(Float64(perf_counter_ns() - t_star) / 1e6) + " ms including the aggregate")
     return True
@@ -1807,7 +1809,7 @@ def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPl
                 gtable.append(start + c)
         elif _can_defer(catalog, q, t, opts.fuse and not _any_hol(q)):
             counted = _count_side[P](catalog, q, t, planner, opts, trust)          # its rows are only counted for now
-            is_deferred = counted * DEFER_PASS_DEN >= base_rows
+            is_deferred = counted * DEFER_PASS_DEN >= base_rows or len(q.resid) == 0       # (a selective filter too when no condition across tables joins it: the pipeline filters before the probe, F-161)
             table = src_table
             for g in gcols:
                 cols.append(g - start)
@@ -1894,17 +1896,19 @@ def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPl
             var sp_conj_text = List[String]()
             var sp_src = SqlSource("", Table.empty().share())
             var sp_streamed = False
+            var sp_pf = False                                          # the probe table's selective filter runs before the probe (F-161)
             if si == 0:
                 sp_table = leaves[jp.start].table
                 sp_gt = leaves[jp.start].gtable.copy()
                 if leaves[jp.start].deferred:
+                    sp_pf = leaves[jp.start].rows * DEFER_PASS_DEN < leaves[jp.start].base_rows and not leaves[jp.start].streamed
                     sp_conj = q.leaf_conj[jp.start].copy()
                     sp_conj_text = q.leaf_conj_text[jp.start].copy()
                 if leaves[jp.start].streamed:
                     sp_src = catalog.sources[q.sources[jp.start]].copy()
                     sp_streamed = True
             var star_out = SqlResult()
-            if _run_star[P](q, leaves, js, jp, si, joined, sp_table, sp_gt, sp_conj, sp_src, sp_streamed, done, planner, opts, trust, lie, res, star_out):
+            if _run_star[P](q, leaves, js, jp, si, joined, sp_table, sp_gt, sp_conj, sp_src, sp_streamed, sp_pf, done, planner, opts, trust, lie, res, star_out):
                 for nt in star_out.notes:
                     res.notes.append(nt)
                 for a in star_out.actuals:
