@@ -139,11 +139,11 @@ struct Catalog(Movable):
 
     def view_runs(self) -> Int:
         """F-160: how many times a view's SQL has really run (a read served from the cache is not a run): what tests count."""
-        return self.cache[].runs
+        return self.cache[].runs()
 
     def view_hits(self) -> Int:
         """F-160: how many reads of a view were served from the cache."""
-        return self.cache[].hits
+        return self.cache[].hits()
 
     def view_index(self, name: String) -> Int:
         var key = lower_ascii(name)

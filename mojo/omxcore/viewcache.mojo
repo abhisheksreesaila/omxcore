@@ -10,6 +10,7 @@ while a view runs). `runs` counts the views that really ran and `hits` the reads
 """
 from std.atomic import Atomic
 from std.memory import Pointer
+from std.memory.alloc import unsafe_alloc
 from std.ffi import external_call
 from .table import SharedTable, TEXT
 from .job import THREADS
@@ -44,29 +45,54 @@ struct CacheEntry(Movable):
         self.used = used
 
 
-struct ResultCache(Movable):
+struct _CacheState(Movable):
+    """What the lock guards. It lives on the heap and is reached only through a raw pointer made after the lock is taken (see `ResultCache`)."""
     var entries: List[CacheEntry]
     var budget: Int
     var bytes: Int
     var tick: Int
     var runs: Int
     var hits: Int
-    var lock: List[Int64]
 
-    def __init__(out self, budget: Int = DEFAULT_CACHE_BYTES):
+    def __init__(out self, budget: Int):
         self.entries = List[CacheEntry]()
         self.budget = budget
         self.bytes = 0
         self.tick = 0
         self.runs = 0
         self.hits = 0
-        self.lock = List[Int64](length=1, fill=0)
 
-    def _lock(self) -> Pointer[Int64, MutUntrackedOrigin]:
-        return Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=Int(self.lock.unsafe_ptr()))
+
+struct ResultCache(Movable):
+    """Two heap blocks: the lock word and the `_CacheState` it guards, held here as addresses (F-199).
+
+    The state is NOT a field of this struct on purpose. Two threads call these methods on the same cache at once, and a method that takes `mut self`
+    (or reads fields through `self`) tells the compiler it is the only one touching them: it may then keep `self.entries` in registers or move its
+    loads and stores across the lock's atomic operations, whatever fences stand there. That made `two_jobs_share_the_cache` crash about 3 runs in 150:
+    a thread worked on a list another thread had grown and freed. A pointer made from an address after the lock is taken carries no such promise, so
+    the lock orders every access to the state."""
+    var state: Int
+    var lock: Int
+
+    def __init__(out self, budget: Int = DEFAULT_CACHE_BYTES):
+        var st = unsafe_alloc[_CacheState](1)
+        st.unsafe_write(_CacheState(budget))
+        self.state = Int(st)
+        var l = unsafe_alloc[Int64](1)
+        l[0] = 0
+        self.lock = Int(l)
+
+    def __del__(deinit self):
+        var st = Pointer[_CacheState, MutAnyOrigin](unsafe_from_address=self.state)
+        _ = st.take_pointee()
+        st.free()
+        Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=self.lock).free()
+
+    def _state(self) -> Pointer[_CacheState, MutAnyOrigin]:
+        return Pointer[_CacheState, MutAnyOrigin](unsafe_from_address=self.state)
 
     def acquire(self):
-        var l = self._lock()
+        var l = Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=self.lock)
         while True:
             var free = Int64(0)
             if Atomic[Scalar[DType.int64]].compare_exchange(l, free, 1):
@@ -75,56 +101,74 @@ struct ResultCache(Movable):
                 _ = external_call["sched_yield", Int32]()
 
     def release(self):
-        Atomic[Scalar[DType.int64]].store(self._lock(), 0)
+        Atomic[Scalar[DType.int64]].store(Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=self.lock), 0)
 
-    def find(mut self, key: String) -> Optional[SharedTable]:
+    def runs(self) -> Int:
+        """How many views really ran (a result `put` here)."""
+        self.acquire()
+        var n = self._state()[].runs
+        self.release()
+        return n
+
+    def hits(self) -> Int:
+        """How many reads were served from here."""
+        self.acquire()
+        var n = self._state()[].hits
+        self.release()
+        return n
+
+    def find(self, key: String) -> Optional[SharedTable]:
         """The kept result under `key` (counted as a hit and made the most recent), or None."""
         self.acquire()
+        var st = self._state()
         var out = Optional[SharedTable]()
-        for i in range(len(self.entries)):
-            if self.entries[i].key == key:
-                self.tick += 1
-                self.entries[i].used = self.tick
-                self.hits += 1
-                out = self.entries[i].table
+        for i in range(len(st[].entries)):
+            if st[].entries[i].key == key:
+                st[].tick += 1
+                st[].entries[i].used = st[].tick
+                st[].hits += 1
+                out = st[].entries[i].table
                 break
         self.release()
         return out
 
-    def put(mut self, var key: String, table: SharedTable, var inputs: List[SharedTable]):
+    def put(self, var key: String, table: SharedTable, var inputs: List[SharedTable]):
         """Keeps a result that was computed (counted as a run), then drops the least recently used past the budget."""
         self.acquire()
-        self.runs += 1
+        var st = self._state()
+        st[].runs += 1
         var bytes = table_bytes(table)
-        if bytes <= self.budget:
-            for i in range(len(self.entries)):
-                if self.entries[i].key == key:
-                    self.bytes -= self.entries[i].bytes
-                    _ = self.entries.pop(i)
+        if bytes <= st[].budget:
+            for i in range(len(st[].entries)):
+                if st[].entries[i].key == key:
+                    st[].bytes -= st[].entries[i].bytes
+                    _ = st[].entries.pop(i)
                     break
-            self.tick += 1
-            self.entries.append(CacheEntry(key^, table, inputs^, bytes, self.tick))
-            self.bytes += bytes
+            st[].tick += 1
+            st[].entries.append(CacheEntry(key^, table, inputs^, bytes, st[].tick))
+            st[].bytes += bytes
             self._trim()
         self.release()
 
-    def _trim(mut self):
-        while self.bytes > self.budget and len(self.entries) > 0:
+    def _trim(self):
+        var st = self._state()
+        while st[].bytes > st[].budget and len(st[].entries) > 0:
             var oldest = 0
-            for i in range(1, len(self.entries)):
-                if self.entries[i].used < self.entries[oldest].used:
+            for i in range(1, len(st[].entries)):
+                if st[].entries[i].used < st[].entries[oldest].used:
                     oldest = i
-            self.bytes -= self.entries[oldest].bytes
-            _ = self.entries.pop(oldest)
+            st[].bytes -= st[].entries[oldest].bytes
+            _ = st[].entries.pop(oldest)
 
-    def set_budget(mut self, budget: Int):
+    def set_budget(self, budget: Int):
         self.acquire()
-        self.budget = budget
+        self._state()[].budget = budget
         self._trim()
         self.release()
 
-    def clear(mut self):
+    def clear(self):
         self.acquire()
-        self.entries = List[CacheEntry]()
-        self.bytes = 0
+        var st = self._state()
+        st[].entries = List[CacheEntry]()
+        st[].bytes = 0
         self.release()
