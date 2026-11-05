@@ -1062,6 +1062,14 @@ struct _Binder(Movable):
                 self.q.resid.append(e)
                 self.q.resid_text.append(self.st.render(c))
                 self.q.resid_mask.append(m)
+                # F-202: what the condition implies for one table alone (an OR of ANDs: `(a.x = 1 AND b.y = 2) OR (a.x = 2 AND b.y = 1)` implies
+                # `a.x IN (1, 2)` and `b.y IN (2, 1)`) filters that table first; the condition itself is still checked once the tables are joined
+                for t in range(n):
+                    if (m >> t) & 1 != 0:
+                        var im = self.implied_for(e, t)
+                        if im >= 0 and im != e:
+                            self.q.leaf_conj[t].append(im)
+                            self.q.leaf_conj_text[t].append("implied by " + self.st.render(c))
         # connected by equalities
         var seen = List[Bool](length=n, fill=False)
         seen[0] = True
@@ -1078,6 +1086,29 @@ struct _Binder(Movable):
         for t in range(n):
             if not seen[t]:
                 raise sql_error(self.st.right_line, self.st.right_col, "`" + self.tab_label(t) + "` is not joined to the other tables by an equality in ON or WHERE (a cross join is not supported)")
+
+    def implied_for(mut self, e: Int, t: Int) -> Int:
+        """F-202: a condition on table `t` alone that every row passing `e` passes (-1: none). A part reading only `t` is itself; an AND keeps what either side implies;
+        an OR needs both sides to imply something (the OR of the two). A row passes a WHERE only when `e` is TRUE, so some OR branch is TRUE with all its parts TRUE."""
+        var m = self.sides(e)
+        if m == (1 << t):
+            return e
+        var op = self.q.rexprs[e].op
+        if op != B_AND and op != B_OR:
+            return -1
+        var a = self.q.rexprs[e].a
+        var b = self.q.rexprs[e].b
+        var l = self.implied_for(a, t)
+        var r = self.implied_for(b, t)
+        if op == B_AND:
+            if l < 0:
+                return r
+            if r < 0:
+                return l
+        elif l < 0 or r < 0:
+            return -1
+        self.q.rexprs.append(BExpr(op, BOOL.value, 0, l, r, 0, "", 0, 0))
+        return len(self.q.rexprs) - 1
 
     def tab_label(self, t: Int) -> String:
         return self.tab_alias[t] if self.tab_alias[t].byte_length() > 0 else self.tab_names[t]

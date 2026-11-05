@@ -14,6 +14,7 @@ the changed and appended rows; a scan is one chunk per row group. Each chunk's p
 min / max combine; hashed groups merge by key) folds into one.
 """
 from std.time import perf_counter_ns
+from std.math import exp, log
 from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, F32_COLUMN
 from .frame import NULL_EDIT, text_ranks, _radix_order
 from .job import JobCtl, STAGE_PLAN, STAGE_AGGREGATE, STAGE_FINISH      # F-175
@@ -1671,6 +1672,18 @@ def _read_filtered[P: Planner](mut catalog: Catalog, q: BoundQuery, t: Int, mut 
     res.actuals.append("read " + _label(q, t) + " filtered: " + commas(tab.rows()) + " rows, " + _ms(Float64(perf_counter_ns() - t_m) / 1e6) + " ms")
 
 
+def _ndv_after_filter(l: _Leaf, ndv: Int) -> Int:
+    """F-202: the distinct values of a column of a leaf that is only counted (its table is unfiltered): `ndv` values spread over `base_rows` rows, `rows` of them kept
+    at random, leave ndv x (1 - (1 - rows / base_rows) ^ (base_rows / ndv)) of them."""
+    if not l.deferred or l.rows >= l.base_rows or ndv <= 1 or l.base_rows <= 0:
+        return ndv
+    if l.rows <= 0:
+        return 0
+    var per = Float64(l.base_rows) / Float64(ndv)
+    var keep = Float64(ndv) * (1.0 - exp(per * log(1.0 - Float64(l.rows) / Float64(l.base_rows))))
+    return max(1, min(ndv, Int(keep + 0.5)))
+
+
 def _copy_leaf(l: _Leaf) -> _Leaf:
     return _Leaf(l.table, l.cols.copy(), l.gcols.copy(), l.gtable.copy(), l.rows, l.base_rows, l.deferred, l.streamed)
 
@@ -1962,7 +1975,7 @@ def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPl
                 gtable.append(start + c)
         elif _can_defer(catalog, q, t, opts.fuse and not _any_hol(q)):
             counted = _count_side[P](catalog, q, t, planner, opts, trust)          # its rows are only counted for now
-            is_deferred = counted * DEFER_PASS_DEN >= base_rows
+            is_deferred = True                                         # F-202: always: read filtered only if the order does not make it the last join's probe side
             table = src_table
             for g in gcols:
                 cols.append(g - start)
@@ -1992,6 +2005,7 @@ def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPl
         js.names.append(_label(q, t))
         js.base_rows.append(base_rows)
         js.rows.append(rows)
+        js.deferred.append(is_deferred and not is_streamed)
         res.actuals.append("scan " + _label(q, t) + ": " + commas(base_rows) + " rows, " + commas(rows) + " after " + ("its filter" if len(q.leaf_conj[t]) > 0 else "no filter") +
                            " (" + String(len(gcols)) + " columns kept" + (", counted: its filter may run in the last join's pipeline" if is_deferred else "") + "), " + _ms(Float64(perf_counter_ns() - t_leaf) / 1e6) + " ms")
         leaves.append(_Leaf(table, cols^, gcols^, gtable^, rows, base_rows, is_deferred, is_streamed))
@@ -2001,8 +2015,8 @@ def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPl
         var tb = table_of_column(q, q.edge_b[k])
         js.edge_a.append(ta)
         js.edge_b.append(tb)
-        js.ndv_a.append(-1 if leaves[ta].streamed else column_ndv(leaves[ta].table, leaves[ta].cols[_position(leaves[ta].gcols, q.edge_a[k])], threads))
-        js.ndv_b.append(-1 if leaves[tb].streamed else column_ndv(leaves[tb].table, leaves[tb].cols[_position(leaves[tb].gcols, q.edge_b[k])], threads))
+        js.ndv_a.append(-1 if leaves[ta].streamed else _ndv_after_filter(leaves[ta], column_ndv(leaves[ta].table, leaves[ta].cols[_position(leaves[ta].gcols, q.edge_a[k])], threads)))
+        js.ndv_b.append(-1 if leaves[tb].streamed else _ndv_after_filter(leaves[tb], column_ndv(leaves[tb].table, leaves[tb].cols[_position(leaves[tb].gcols, q.edge_b[k])], threads)))
     for k in range(len(q.edge_a)):
         res.notes.append("statistics: " + _label(q, js.edge_a[k]) + "." + q.src_name(q.edge_a[k]) + " has " + (commas(js.ndv_a[k]) if js.ndv_a[k] >= 0 else String("an unknown number of")) + " distinct values in " + commas(js.rows[js.edge_a[k]]) +
                          " rows, " + _label(q, js.edge_b[k]) + "." + q.src_name(q.edge_b[k]) + " " + (commas(js.ndv_b[k]) if js.ndv_b[k] >= 0 else String("an unknown number")) + " in " + commas(js.rows[js.edge_b[k]]))

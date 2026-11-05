@@ -354,8 +354,10 @@ struct JoinStats(Copyable, Movable):
     var edge_b: List[Int]
     var ndv_a: List[Int]             # the distinct values of the equality's column in each of the two leaves (after their filters), -1 unknown
     var ndv_b: List[Int]
+    var deferred: List[Bool]         # F-202: per leaf (empty: none): only counted, so its filtered rows are written unless it is the last join's probe side
 
     def __init__(out self):
+        self.deferred = List[Bool]()
         self.names = List[String]()
         self.base_rows = List[Int]()
         self.rows = List[Int]()
@@ -458,6 +460,8 @@ def _plan_from(js: JoinStats, order: List[Int], opts: PlannerOptions) -> JoinPla
         elif opts.build_side == BUILD_RIGHT:
             build_new = True
         var c = _step_cost(acc, js.rows[leaf], max(est, 0))
+        if len(js.deferred) > 0 and js.deferred[leaf] and (i < len(order) - 1 or build_new):
+            c += js.rows[leaf]                                    # F-202: read filtered: its passing rows are written (the last probe side filters in the pipeline instead)
         plan.steps.append(JoinStep(leaf, build_new, est, c))
         plan.cost += c
         in_set[leaf] = True
