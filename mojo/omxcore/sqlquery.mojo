@@ -28,6 +28,7 @@ from .parquet import write_parquet, ZSTD, SNAPPY, UNCOMPRESSED, DEFAULT_ROW_GROU
 from .viewkey import view_key
 from .sink import ResultSink
 from std.memory.alloc import unsafe_alloc
+from std.os.path import dirname, isdir
 
 
 struct _Cte(Copyable, Movable):
@@ -1258,6 +1259,9 @@ def try_inline[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st: SqlS
 def _copy_to[P: Planner](mut catalog: Catalog, cp: CopyTo, planner: P, options: PlannerOptions) raises -> SqlResult:
     """F-160: `COPY (query) TO 'file.parquet' [(FORMAT PARQUET, COMPRESSION zstd|snappy|uncompressed, ROW_GROUP_SIZE n)]`: `sql_to_parquet` for the query. The result
     is one row, `Count`: the rows written, as DuckDB's COPY says."""
+    var dir = dirname(cp.path)
+    if dir.byte_length() > 0 and not isdir(dir):                  # (Mojo's open would create the folders: COPY, like DuckDB's, does not)
+        raise Error("couldn't write `" + cp.path + "`: the directory `" + dir + "` does not exist")
     var codec = ZSTD
     if cp.compression == "snappy":
         codec = SNAPPY

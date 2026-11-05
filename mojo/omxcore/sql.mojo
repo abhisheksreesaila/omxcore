@@ -1871,6 +1871,11 @@ def _byte_pos(b: Span[Byte, _], upto: Int) -> Tuple[Int, Int]:
     return (line, col)
 
 
+def _tail_error(t: Token, base: Tuple[Int, Int], message: String) -> Error:
+    """An error at a token of the text that follows the query of a COPY, placed in the whole text (the tail was lexed on its own)."""
+    return sql_error(t.line + base[0] - 1, t.col + (base[1] - 1 if t.line == 1 else 0), message)
+
+
 def split_copy(text: String) raises -> Optional[CopyTo]:
     """F-160: `COPY (query) TO 'file' [(FORMAT PARQUET, COMPRESSION zstd|snappy|uncompressed, ROW_GROUP_SIZE n)]` as its parts, or None when the text is not a COPY.
     Parquet is the only format: `FORMAT PARQUET`, or a file name that ends in `.parquet`; any other raises, naming it. The query is found by matching the parentheses
@@ -1926,13 +1931,14 @@ def split_copy(text: String) raises -> Optional[CopyTo]:
         var p = _byte_pos(b, open_at)
         raise sql_error(p[0], p[1], "this parenthesis is never closed")
     var query = String(text[byte=open_at + 1:i - 1])
+    var base = _byte_pos(b, i)
     var toks = lex_sql(String(text[byte=i:]))
     var t = 0
     if toks[t].kind != T_IDENT or toks[t].up != "TO":
-        raise sql_error(toks[t].line, toks[t].col, "COPY (query) needs TO 'file.parquet' after the query")
+        raise _tail_error(toks[t], base, "COPY (query) needs TO 'file.parquet' after the query")
     t += 1
     if toks[t].kind != T_STR:
-        raise sql_error(toks[t].line, toks[t].col, "COPY ... TO needs the file name as a string: TO 'file.parquet'")
+        raise _tail_error(toks[t], base, "COPY ... TO needs the file name as a string: TO 'file.parquet'")
     var out = CopyTo(query^, toks[t].text)
     t += 1
     var parquet = False
@@ -1940,40 +1946,40 @@ def split_copy(text: String) raises -> Optional[CopyTo]:
         t += 1
         while toks[t].kind != T_EOF and not (toks[t].kind == T_SYM and toks[t].text == ")"):
             if toks[t].kind != T_IDENT:
-                raise sql_error(toks[t].line, toks[t].col, "COPY options are FORMAT PARQUET, COMPRESSION and ROW_GROUP_SIZE")
+                raise _tail_error(toks[t], base, "COPY options are FORMAT PARQUET, COMPRESSION and ROW_GROUP_SIZE")
             var opt = toks[t].up
             var at = t
             t += 1
             if toks[t].kind == T_EOF or toks[t].kind == T_SYM:
-                raise sql_error(toks[at].line, toks[at].col, "the COPY option " + opt + " needs a value")
+                raise _tail_error(toks[at], base, "the COPY option " + opt + " needs a value")
             var val = toks[t].up if toks[t].kind == T_IDENT else toks[t].text
             if opt == "FORMAT":
                 if upper_ascii(val) != "PARQUET":
-                    raise sql_error(toks[t].line, toks[t].col, "COPY writes Parquet only: FORMAT " + val + " is not supported")
+                    raise _tail_error(toks[t], base, "COPY writes Parquet only: FORMAT " + val + " is not supported")
                 parquet = True
             elif opt == "COMPRESSION":
                 var v = lower_ascii(val)
                 if v != "zstd" and v != "snappy" and v != "uncompressed":
-                    raise sql_error(toks[t].line, toks[t].col, "COMPRESSION is zstd, snappy or uncompressed, found " + val)
+                    raise _tail_error(toks[t], base, "COMPRESSION is zstd, snappy or uncompressed, found " + val)
                 out.compression = v
             elif opt == "ROW_GROUP_SIZE":
                 if toks[t].kind != T_INT:
-                    raise sql_error(toks[t].line, toks[t].col, "ROW_GROUP_SIZE is a number of rows, found " + val)
+                    raise _tail_error(toks[t], base, "ROW_GROUP_SIZE is a number of rows, found " + val)
                 out.row_group_rows = Int(toks[t].text)
             else:
-                raise sql_error(toks[at].line, toks[at].col, "the COPY option " + opt + " is not supported (FORMAT, COMPRESSION, ROW_GROUP_SIZE)")
+                raise _tail_error(toks[at], base, "the COPY option " + opt + " is not supported (FORMAT, COMPRESSION, ROW_GROUP_SIZE)")
             t += 1
             if toks[t].kind == T_SYM and toks[t].text == ",":
                 t += 1
         if not (toks[t].kind == T_SYM and toks[t].text == ")"):
-            raise sql_error(toks[t].line, toks[t].col, "the COPY options are never closed (expected `)`)")
+            raise _tail_error(toks[t], base, "the COPY options are never closed (expected `)`)")
         t += 1
     if toks[t].kind == T_SYM and toks[t].text == ";":
         t += 1
     if toks[t].kind != T_EOF:
-        raise sql_error(toks[t].line, toks[t].col, "nothing may follow COPY ... TO 'file' (found `" + toks[t].text + "`)")
+        raise _tail_error(toks[t], base, "nothing may follow COPY ... TO 'file' (found `" + toks[t].text + "`)")
     if not parquet and not (out.path.endswith(".parquet") or out.path.endswith(".pq")):
-        raise sql_error(toks[0].line, toks[0].col, "COPY writes Parquet only: name the file `x.parquet` or write (FORMAT PARQUET)")
+        raise _tail_error(toks[1], base, "COPY writes Parquet only: name the file `x.parquet` or write (FORMAT PARQUET)")
     return out^
 
 
