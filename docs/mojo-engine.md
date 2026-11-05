@@ -130,6 +130,11 @@ NULLs (three-valued logic, a NULL group, aggregates of nothing are NULL); text s
 between the parser and the executor, and a planner behind a trait (reading only statistics) picks dense or hashed
 grouping, top-k heaps or a full sort, and early stops; `EXPLAIN` shows every decision and why.
 
+Steps for apps (F-160): `catalog.view(name, sql | Query)` names a query that later queries read like a table; `preview(cat, name, rows)` is
+its first rows with the LIMIT inside the view; a result cache keyed by the view's plan text and the versions of its inputs (frame edits, file size and
+mtime, upstream views) means an edit re-runs exactly the views below it; `COPY (query) TO 'f.parquet'` writes any query through the Parquet writer.
+Details: `docs/omxcore-mojo-api.md`.
+
 | 5M / 1.2M rows | omxcore | DuckDB |
 |---|---|---|
 | 8 groups, 4 aggregates | 8 ms | 6 ms |
