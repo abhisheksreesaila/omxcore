@@ -687,6 +687,8 @@ def run_pending[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st: Sql
         var on = -1
         var ok = True
         for i in range(1):                                                      # the first key only: a cut is a superset filter, and several keys would be packed on every row of D's table
+            # (after a flatten the node's text is the flat table's own column name, `name_2` when two tables had one of that name, so the lookup in `cur` is
+            # exact; a name `cur` lacks skips the cut and D stays whole, which is only slower)
             var oname = st.exprs[s.rk_outer[i]].text
             var has = False
             for c in range(catalog.sources[ci].table.columns()):
@@ -1257,6 +1259,16 @@ def _read_columns(st: SqlStatement, sc: Scope, e: Int) -> List[Int]:
                     seen = True
             if not seen:
                 cols.append(f[1])
+    for u in st.join_using:                                                     # JOIN ... USING (k): the key is read by the join, not by an expression
+        var key = lower_ascii(u)
+        for c in range(len(sc.cols[e])):
+            if sc.cols[e][c] == key:
+                var seen = False
+                for x in cols:
+                    if x == c:
+                        seen = True
+                if not seen:
+                    cols.append(c)
     if len(cols) == 0:
         cols.append(0)
     return cols^
@@ -1393,12 +1405,25 @@ def run_stages[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: SqlS
         plain = List[Int]()
     if not flattened and len(plain) > 0:
         # a step with a D to cut wants the outer rows after the statement's own filters: they are written first when few (D's cut is then to those rows' keys)
-        var inner_rows = 0
+        # (each step is judged by its own inner table and its own threshold; the count is skipped when the outer table is already small against it,
+        # since D is then cut by the table's own keys, and when no step has an inner table big enough to gain)
+        var outer_rows = 0
+        var ot = catalog.find(st.table)
+        if ot >= 0:
+            outer_rows = catalog.sources[ot].rows()
+        var inner_rows = 0                                                      # the most outer rows a step's own inner table and threshold let a written-first outer have
+        var already = False
         for i in range(len(steps)):
             if steps[i].kid >= 0 and len(steps[i].rk_inner) > 0:
                 var kt = catalog.find(run.stmts[steps[i].kid].table)
                 if kt >= 0:
-                    inner_rows = max(inner_rows, catalog.sources[kt].rows())
+                    var den = REDUCE_DEN_ALT if steps[i].alt_node >= 0 else REDUCE_DEN
+                    var rows_i = catalog.sources[kt].rows()
+                    if outer_rows * den < rows_i:
+                        already = True
+                    inner_rows = max(inner_rows, (rows_i - 1) // den)
+        if already:
+            inner_rows = 0
         if inner_rows > 0:
             var cs = SqlStatement(st.text)
             cs.exprs = st.exprs.copy()
@@ -1414,7 +1439,7 @@ def run_stages[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: SqlS
             var tmc = Int(perf_counter_ns())
             var rc = run_plain(catalog, cs^, run.text, planner, opts)
             var cnt = Int(rc.table.get(0, 0))
-            if cnt * REDUCE_DEN_ALT < inner_rows:
+            if cnt < inner_rows:
                 var ps = clone_shell(st)
                 ps.wins = List[WinSpec]()
                 var sc0 = scope_of(st, catalog)

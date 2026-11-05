@@ -149,6 +149,29 @@ def test_exists_over_an_inner_table_with_no_rows_and_few_outer_rows(mx, data, ne
     assert res["rows"][0][0] == (0 if neg == "" else 300)
 
 
+def test_a_pushed_step_keeps_the_columns_of_a_using_join(mx, data):
+    res = q(mx, data, """SELECT o.ok, c.nation FROM ord o JOIN cust c USING (ck)
+        WHERE o.ok IN (SELECT ok FROM fact WHERE qty >= 90 GROUP BY ok) ORDER BY o.ok""", ["ord", "cust", "fact"], ordered=True)
+    note(res, PUSHED)
+
+
+def test_a_pushed_step_keeps_the_columns_of_an_on_join_and_a_comma_join(mx, data):
+    for sql in ["""SELECT o.ok, c.nation FROM ord o JOIN cust c ON o.ck = c.ck
+                  WHERE o.ok IN (SELECT ok FROM fact WHERE qty >= 90 GROUP BY ok) ORDER BY o.ok""",
+                """SELECT o.ok, c.nation FROM ord o, cust c WHERE o.ck = c.ck
+                  AND o.ok IN (SELECT ok FROM fact WHERE qty >= 90 GROUP BY ok) ORDER BY o.ok"""]:
+        res = q(mx, data, sql, ["ord", "cust", "fact"], ordered=True)
+        note(res, PUSHED)
+
+
+def test_a_correlation_on_the_second_of_two_tables_that_share_a_column_name(mx, data):
+    # ord and fact both have `ok`, ord and cust both `ck`: the flat table renames the second (`ck_2`), and D is cut by that column
+    res = q(mx, data, """SELECT count(*), sum(f.qty) FROM ord o, fact f, cust c
+        WHERE o.ok = f.ok AND c.ck = o.ck AND f.cust = c.ck AND f.qty * 8 > (SELECT max(g.qty) FROM fact g WHERE g.cust = c.ck AND g.qty > 5)""",
+          ["ord", "fact", "cust"])
+    assert res["rows"][0][0] > 0
+
+
 TWO_KEYS = """SELECT count(*), sum(ps.avail) FROM ps WHERE ps.pk IN (SELECT pk FROM ps WHERE avail > {a})
     AND ps.avail > (SELECT 0.5 * sum(li.qty) FROM li WHERE li.pk = ps.pk AND li.sk = ps.sk AND li.d >= DATE '2020-06-01' AND li.d < DATE '2021-06-01')"""
 
