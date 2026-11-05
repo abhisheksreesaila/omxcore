@@ -1844,8 +1844,145 @@ struct _Parser(Movable):
         return id
 
 
+struct CopyTo(Movable):
+    """F-160: `COPY (query) TO 'file.parquet' [(options)]`, taken apart: the query's text, the file, and the options the writer takes."""
+    var query: String
+    var path: String
+    var compression: String           # "", "zstd", "snappy" or "uncompressed"
+    var row_group_rows: Int           # 0: the writer's default
+
+    def __init__(out self, var query: String, var path: String):
+        self.query = query^
+        self.path = path^
+        self.compression = String()
+        self.row_group_rows = 0
+
+
+def _byte_pos(b: Span[Byte, _], upto: Int) -> Tuple[Int, Int]:
+    """Line and column (from 1) of byte `upto`."""
+    var line = 1
+    var col = 1
+    for i in range(upto):
+        if b[i] == UInt8(10):
+            line += 1
+            col = 1
+        elif (b[i] & UInt8(0xC0)) != UInt8(0x80):
+            col += 1
+    return (line, col)
+
+
+def split_copy(text: String) raises -> Optional[CopyTo]:
+    """F-160: `COPY (query) TO 'file' [(FORMAT PARQUET, COMPRESSION zstd|snappy|uncompressed, ROW_GROUP_SIZE n)]` as its parts, or None when the text is not a COPY.
+    Parquet is the only format: `FORMAT PARQUET`, or a file name that ends in `.parquet`; any other raises, naming it. The query is found by matching the parentheses
+    (strings, quoted names and comments skipped), so any query the engine reads can be inside."""
+    var b = text.as_bytes()
+    var n = len(b)
+    var i = 0
+    while i < n and (b[i] == UInt8(32) or b[i] == UInt8(9) or b[i] == UInt8(10) or b[i] == UInt8(13)):
+        i += 1
+    var word = "copy".as_bytes()
+    if i + 4 > n:
+        return None
+    for k in range(4):
+        if (b[i + k] | UInt8(32)) != word[k]:
+            return None
+    if i + 4 < n and not (b[i + 4] == UInt8(32) or b[i + 4] == UInt8(9) or b[i + 4] == UInt8(10) or b[i + 4] == UInt8(13) or b[i + 4] == UInt8(40)):
+        return None
+    i += 4
+    while i < n and (b[i] == UInt8(32) or b[i] == UInt8(9) or b[i] == UInt8(10) or b[i] == UInt8(13)):
+        i += 1
+    if i >= n or b[i] != UInt8(40):
+        var p = _byte_pos(b, min(i, n))
+        raise sql_error(p[0], p[1], "COPY takes a query in parentheses: COPY (SELECT ...) TO 'file.parquet'")
+    var open_at = i
+    var depth = 1
+    i += 1
+    while i < n and depth > 0:
+        var c = b[i]
+        if c == UInt8(39) or c == UInt8(34):                                    # a string or a quoted name: up to its closing quote ('' / "" escape)
+            i += 1
+            while i < n:
+                if b[i] == c:
+                    if i + 1 < n and b[i + 1] == c:
+                        i += 2
+                        continue
+                    break
+                i += 1
+        elif c == UInt8(45) and i + 1 < n and b[i + 1] == UInt8(45):             # -- comment
+            while i < n and b[i] != UInt8(10):
+                i += 1
+            continue
+        elif c == UInt8(47) and i + 1 < n and b[i + 1] == UInt8(42):             # /* comment */
+            i += 2
+            while i + 1 < n and not (b[i] == UInt8(42) and b[i + 1] == UInt8(47)):
+                i += 1
+            i += 1
+        elif c == UInt8(40):
+            depth += 1
+        elif c == UInt8(41):
+            depth -= 1
+        i += 1
+    if depth > 0:
+        var p = _byte_pos(b, open_at)
+        raise sql_error(p[0], p[1], "this parenthesis is never closed")
+    var query = String(text[byte=open_at + 1:i - 1])
+    var toks = lex_sql(String(text[byte=i:]))
+    var t = 0
+    if toks[t].kind != T_IDENT or toks[t].up != "TO":
+        raise sql_error(toks[t].line, toks[t].col, "COPY (query) needs TO 'file.parquet' after the query")
+    t += 1
+    if toks[t].kind != T_STR:
+        raise sql_error(toks[t].line, toks[t].col, "COPY ... TO needs the file name as a string: TO 'file.parquet'")
+    var out = CopyTo(query^, toks[t].text)
+    t += 1
+    var parquet = False
+    if toks[t].kind == T_SYM and toks[t].text == "(":
+        t += 1
+        while toks[t].kind != T_EOF and not (toks[t].kind == T_SYM and toks[t].text == ")"):
+            if toks[t].kind != T_IDENT:
+                raise sql_error(toks[t].line, toks[t].col, "COPY options are FORMAT PARQUET, COMPRESSION and ROW_GROUP_SIZE")
+            var opt = toks[t].up
+            var at = t
+            t += 1
+            if toks[t].kind == T_EOF or toks[t].kind == T_SYM:
+                raise sql_error(toks[at].line, toks[at].col, "the COPY option " + opt + " needs a value")
+            var val = toks[t].up if toks[t].kind == T_IDENT else toks[t].text
+            if opt == "FORMAT":
+                if upper_ascii(val) != "PARQUET":
+                    raise sql_error(toks[t].line, toks[t].col, "COPY writes Parquet only: FORMAT " + val + " is not supported")
+                parquet = True
+            elif opt == "COMPRESSION":
+                var v = lower_ascii(val)
+                if v != "zstd" and v != "snappy" and v != "uncompressed":
+                    raise sql_error(toks[t].line, toks[t].col, "COMPRESSION is zstd, snappy or uncompressed, found " + val)
+                out.compression = v
+            elif opt == "ROW_GROUP_SIZE":
+                if toks[t].kind != T_INT:
+                    raise sql_error(toks[t].line, toks[t].col, "ROW_GROUP_SIZE is a number of rows, found " + val)
+                out.row_group_rows = Int(toks[t].text)
+            else:
+                raise sql_error(toks[at].line, toks[at].col, "the COPY option " + opt + " is not supported (FORMAT, COMPRESSION, ROW_GROUP_SIZE)")
+            t += 1
+            if toks[t].kind == T_SYM and toks[t].text == ",":
+                t += 1
+        if not (toks[t].kind == T_SYM and toks[t].text == ")"):
+            raise sql_error(toks[t].line, toks[t].col, "the COPY options are never closed (expected `)`)")
+        t += 1
+    if toks[t].kind == T_SYM and toks[t].text == ";":
+        t += 1
+    if toks[t].kind != T_EOF:
+        raise sql_error(toks[t].line, toks[t].col, "nothing may follow COPY ... TO 'file' (found `" + toks[t].text + "`)")
+    if not parquet and not (out.path.endswith(".parquet") or out.path.endswith(".pq")):
+        raise sql_error(toks[0].line, toks[0].col, "COPY writes Parquet only: name the file `x.parquet` or write (FORMAT PARQUET)")
+    return out^
+
+
 def parse_query(text: String) raises -> SqlQuery:
-    """The syntax trees of one query (SELECT, EXPLAIN SELECT, WITH, UNION ...): the statements it is made of, the one the text ends with last."""
+    """The syntax trees of one query (SELECT, EXPLAIN SELECT, WITH, UNION ...): the statements it is made of, the one the text ends with last. A
+    `COPY (query) TO 'file'` is read as its query (so the files it names are found: `query_files`)."""
+    var cp = split_copy(text)
+    if cp:
+        return parse_query(cp.value().query)
     var toks = lex_sql(text)
     if len(toks) == 1:
         raise sql_error(1, 1, "the statement is empty")

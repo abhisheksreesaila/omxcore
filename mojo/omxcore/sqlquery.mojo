@@ -16,7 +16,7 @@ Each statement then goes to the engine as the one-SELECT statement it was before
 from std.time import perf_counter_ns
 from .table import Table, SharedTable, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, F32_COLUMN
 from .sql import (SqlStatement, SqlQuery, SqlExpr, SelectItem, TableRef, WinSpec, Cte, SubQuery, OrderItem, parse_query, sql_error, lower_ascii, EXPLAIN_NONE, EXPLAIN_ANALYZE,
-                  SET_NONE, SET_UNION_ALL, SET_UNION, SET_INTERSECT, SET_EXCEPT, CTE_AUTO, CTE_MATERIALIZED, CTE_INLINED,
+                  SET_NONE, SET_UNION_ALL, SET_UNION, SET_INTERSECT, SET_EXCEPT, split_copy, CopyTo, CTE_AUTO, CTE_MATERIALIZED, CTE_INLINED,
                   X_SCALAR_Q, X_IN_Q, X_EXISTS_Q, X_SUBIN, X_EXISTS, X_NOT, X_COL, X_INT, X_NULL, X_CAST, X_TRUE, X_FALSE, X_IN, X_BIN, X_CALL, X_ISBOOL, JK_INNER, JK_LEFT)
 from .bind import Catalog, _split_and_expr, _and_chain, _has_aggregate
 from .subq import (SIDE_OUTER, side_of, Scope, scope_of, Flat, flatten, flat_source, clone_shell, collect, is_subquery_node, add_node, column_node, equal_node, and_node,
@@ -24,7 +24,8 @@ from .subq import (SIDE_OUTER, side_of, Scope, scope_of, Flat, flatten, flat_sou
 from .setops import union_all
 from .planner import Planner, RulePlanner, PlannerOptions
 from .sqlexec import SqlResult, run_plain
-from .parquet import write_parquet, ZSTD, DEFAULT_ROW_GROUP
+from .parquet import write_parquet, ZSTD, SNAPPY, UNCOMPRESSED, DEFAULT_ROW_GROUP
+from .viewkey import view_key
 from .sink import ResultSink
 from std.memory.alloc import unsafe_alloc
 
@@ -219,12 +220,24 @@ def _resolve_slot[P: Planner](mut run: QueryRun, mut catalog: Catalog, name: Str
 
 def _view_slot[P: Planner](mut run: QueryRun, mut catalog: Catalog, vi: Int, name: String, alias: String, planner: P,
                            opts: PlannerOptions) raises -> Tuple[String, String]:
-    """A named view of the catalog: its SQL runs (in a run of its own) and the result is read as a table."""
-    var text = catalog.view_text(vi)
+    """A named view of the catalog: its result comes from the catalog's cache when its plan and inputs are unchanged (F-160, `viewkey.mojo`), else its SQL
+    runs (in a run of its own) and the result is kept; either way it is read as a table."""
+    var inputs = List[SharedTable]()
+    var key = view_key(catalog, vi, inputs)
+    var nm = run.fresh("__v", catalog)
+    var hit = catalog.cache[].find(key)
+    if hit:
+        catalog.add_table(nm, hit.value())
+        run.steps.append("view " + name + ": read from the cache (" + _commas(hit.value().rows()) + " rows)")
+        return (nm, alias if alias.byte_length() > 0 else name)
     var vcat = catalog.without_view(vi)
-    var r = sql_with(vcat, text, planner, opts)
-    var rows = r.table.rows()
-    var nm = register_result(run, catalog, r, "__v")
+    var vopts = opts.copy()
+    vopts.sink = None                                   # a view's rows are a table, whatever file the outer query writes
+    var r = sql_with(vcat, catalog.view_text(vi), planner, vopts)
+    var shared = r.take_table().share()
+    var rows = shared.rows()
+    catalog.cache[].put(key^, shared, inputs^)
+    catalog.add_table(nm, shared)
     run.steps.append("view " + name + ": evaluated in place (" + _commas(rows) + " rows)")
     return (nm, alias if alias.byte_length() > 0 else name)
 
@@ -1242,8 +1255,29 @@ def try_inline[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st: SqlS
     return True
 
 
+def _copy_to[P: Planner](mut catalog: Catalog, cp: CopyTo, planner: P, options: PlannerOptions) raises -> SqlResult:
+    """F-160: `COPY (query) TO 'file.parquet' [(FORMAT PARQUET, COMPRESSION zstd|snappy|uncompressed, ROW_GROUP_SIZE n)]`: `sql_to_parquet` for the query. The result
+    is one row, `Count`: the rows written, as DuckDB's COPY says."""
+    var codec = ZSTD
+    if cp.compression == "snappy":
+        codec = SNAPPY
+    elif cp.compression == "uncompressed":
+        codec = UNCOMPRESSED
+    var r = sql_to_parquet_with(catalog, cp.query, cp.path, planner, options, "", codec, cp.row_group_rows if cp.row_group_rows > 0 else DEFAULT_ROW_GROUP)
+    r.notes.append("COPY: " + _commas(r.rows_written) + " rows written to " + cp.path)
+    var out = Table.empty()
+    var c = out.add_column("Count", INT)
+    out.append(c, Int64(r.rows_written))
+    r.table = out^
+    r.rows_written = -1
+    return r^
+
+
 def sql_with[P: Planner](mut catalog: Catalog, text: String, planner: P, options: PlannerOptions = PlannerOptions()) raises -> SqlResult:
     """`sql` with the physical planner of your choice (anything that implements `Planner`)."""
+    var cp = split_copy(text)
+    if cp:
+        return _copy_to(catalog, cp.value(), planner, options)
     var q = parse_query(text)
     var plain = len(q.stmts) == 1
     if plain:
@@ -1265,6 +1299,32 @@ def sql_with[P: Planner](mut catalog: Catalog, text: String, planner: P, options
 def sql(mut catalog: Catalog, text: String, options: PlannerOptions = PlannerOptions()) raises -> SqlResult:
     """Runs one SELECT (or EXPLAIN SELECT, WITH, UNION ...) over the catalog's sources with the rule-based planner. The result owns its table."""
     return sql_with(catalog, text, RulePlanner(), options)
+
+
+def preview(mut catalog: Catalog, name: String, rows: Int = 100, options: PlannerOptions = PlannerOptions()) raises -> SqlResult:
+    """F-160: the first `rows` rows of view `name` (the sheet's preview of one step). The LIMIT goes into the view's own query, so the engine stops
+    there (a scan stops reading, a sort keeps a top-N) instead of building the whole view first; the views it reads come from the cache when unchanged.
+    The preview itself is not kept. A view that has a LIMIT or OFFSET of its own is wrapped (`SELECT * FROM (...) LIMIT n`), so the answer is the same."""
+    var vi = catalog.view_index(name)
+    if vi < 0:
+        raise Error("`" + name + "` is not a view of this catalog: add it with Catalog.view(name, sql)")
+    if rows < 0:
+        raise Error("preview takes 0 or more rows, found " + String(rows))
+    var text = catalog.view_text(vi)
+    var q = parse_query(text)
+    var body = String(text.strip())
+    while body.endswith(";"):
+        var shorter = String(body[byte=:body.byte_length() - 1].rstrip())
+        body = shorter^
+    var limited = False
+    if len(q.stmts) > 0:
+        ref root = q.stmts[len(q.stmts) - 1]
+        limited = root.limit >= 0 or root.offset > 0 or root.explain != EXPLAIN_NONE
+    var pushed = body + "\nLIMIT " + String(rows) if not limited else "SELECT * FROM (" + body + "\n) AS preview LIMIT " + String(rows)
+    var vcat = catalog.without_view(vi)
+    var r = sql_with(vcat, pushed, RulePlanner(), options)
+    r.notes.append("preview " + name + ": LIMIT " + String(rows) + " pushed into the view's query")
+    return r^
 
 
 def sql_to_parquet_with[P: Planner](mut catalog: Catalog, text: String, path: String, planner: P, options: PlannerOptions = PlannerOptions(),
