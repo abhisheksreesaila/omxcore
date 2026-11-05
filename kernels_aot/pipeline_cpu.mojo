@@ -882,6 +882,7 @@ struct Prog(Copyable, Movable):
     var n_body: Int
     var n_aggs: Int
     var pred_reg: Int
+    var pred_first: Bool   # F-161 (header word 8): a fused run's predicate reads only the probe table's columns: it runs before the front stage, which probes the rows that pass
     var nl: Int      # partial lanes per (agg, group)
     var ovf: LP      # set to 1 by any integer sum (OP_AGG_ISUM) that passes int64; the caller's flag cell
 
@@ -905,6 +906,7 @@ struct Prog(Copyable, Movable):
         self.n_body = Int(code[4])
         self.n_aggs = Int(code[5])
         self.pred_reg = Int(code[6])
+        self.pred_first = Int(code[8]) != 0
         if not has_gids:
             self.nl = W
         elif n_groups <= LANE_GROUPS:       # a function of the group count alone: the order in which a
@@ -1331,6 +1333,22 @@ def _find_chunk(p: Prog, row: Int) -> Int:
     return lo
 
 
+comptime WS_BYTES_MASK = (1 << 32) - 1
+# The `ws_bytes` argument of a fused run carries, above bit 32, the most partners one probe row can expand to (F-161; 0 or 1: none). A morsel then takes
+# MORSEL // that many probe rows, so the rows it puts out (a staged morsel's slot, a hashed morsel's group table) never pass MORSEL.
+
+
+@always_inline
+def morsel_rows(ws_arg: Int) -> Int:
+    var rep = ws_arg >> 32
+    return MORSEL if rep <= 1 else max(MORSEL // rep, VEC)
+
+
+comptime FRONT_PRESEL = 1 << 41          # a front stage's `n` argument: `sel` already lists the rows to probe (the predicate ran first, Prog.pred_first); the count is in the low 32 bits
+comptime FRONT_MORE_SHIFT = 40           # a fused front stage's return value: the rows kept in the low 32 bits; above FRONT_MORE_SHIFT a bit says the block has
+comptime FRONT_COUNT_MASK = (1 << 32) - 1   # more rounds (the front is called again with the same arguments and puts out the next rows)
+
+
 def _process_range[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool, mode: Int,
                    FR: def(Int, Int, Int, IP, BP) -> Int, fused: Bool](
     p: Prog, regs: FP, sel: IP, gscratch: IP, pv: FP, pc: LP, lo: Int, hi: Int, encode: E,
@@ -1351,52 +1369,71 @@ def _process_range[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
         var i0 = pos
         while i0 < stop:
             var n = min(VEC, stop - i0)
-            var nsel = n
-            var use_sel = False
-            var bcols = cols
-            comptime if fused:
-                nsel = front(k, i0, n, sel, ws)
-                bcols = LP(unsafe_from_address=Int(ws))
-                use_sel = nsel < n
-                if nsel > 0 and p.pred_reg >= 0:
-                    _run_ops(p, regs, bcols, p.n_pro, p.n_pred, i0, sel, use_sel, nsel)
-                    var pr = regs + p.pred_reg * VEC
-                    var kk = 0
-                    for j in range(nsel):
-                        sel[kk] = sel[j] if use_sel else Int32(j)
-                        kk += 1 if pr[j] != 0.0 else 0
-                    nsel = kk
+            var first_round = True
+            var more = True       # a front stage that expands a row to several partners (F-161) hands a block out in rounds: it sets the FRONT_MORE bit and is called again
+            while more:
+                more = False
+                var nsel = n
+                var use_sel = False
+                var bcols = cols
+                comptime if fused:
+                    var pre = p.pred_first and p.pred_reg >= 0       # the predicate (probe columns only) runs on the whole block, the front stage probes the rows that pass
+                    if pre and not first_round:
+                        nsel = front(k, i0, n, sel, ws)               # (a later round of the same block: the rows are the front stage's own)
+                    elif pre:
+                        _run_ops(p, regs, cols, p.n_pro, p.n_pred, i0, sel, False, n)
+                        var pr0 = regs + p.pred_reg * VEC
+                        var kk0 = 0
+                        for i in range(n):
+                            sel[kk0] = Int32(i)
+                            kk0 += 1 if pr0[i] != 0.0 else 0
+                        nsel = front(k, i0, kk0 | FRONT_PRESEL, sel, ws) if kk0 > 0 else 0
+                    else:
+                        nsel = front(k, i0, n, sel, ws)
+                    first_round = False
+                    more = (nsel >> FRONT_MORE_SHIFT) != 0
+                    nsel = nsel & FRONT_COUNT_MASK
+                    bcols = LP(unsafe_from_address=Int(ws))
                     use_sel = nsel < n
-            else:
-                if p.pred_reg >= 0:
-                    _run_ops(p, regs, cols, p.n_pro, p.n_pred, i0, sel, False, n)
-                    var pr = regs + p.pred_reg * VEC
-                    var kk = 0
-                    for i in range(n):
-                        sel[kk] = Int32(i)
-                        kk += 1 if pr[i] != 0.0 else 0
-                    nsel = kk
-                    use_sel = nsel < n
-            if nsel > 0:
-                _run_ops(p, regs, bcols, p.n_pro + p.n_pred, p.n_body, i0, sel, use_sel, nsel)
-                var gp = gscratch
-                comptime if keyed:
-                    if not encode(k, i0, sel, nsel, use_sel, gscratch, regs):
-                        return False
+                    if nsel > 0 and p.pred_reg >= 0 and not pre:
+                        _run_ops(p, regs, bcols, p.n_pro, p.n_pred, i0, sel, use_sel, nsel)
+                        var pr = regs + p.pred_reg * VEC
+                        var kk = 0
+                        for j in range(nsel):
+                            sel[kk] = sel[j] if use_sel else Int32(j)
+                            kk += 1 if pr[j] != 0.0 else 0
+                        nsel = kk
+                        use_sel = nsel < n
                 else:
-                    if p.has_gids:
-                        var gsrc = p.gids + i0
-                        if use_sel:
-                            for j in range(nsel):
-                                gscratch[j] = gsrc[Int(sel[j])]
-                        else:
-                            gp = gsrc
-                comptime if mode == 2:
-                    _stage(p, regs, gp, nsel, pv, pc)
-                elif mode == 1:
-                    _accumulate_shared(p, regs, gp, nsel, pv, pc)
-                else:
-                    _accumulate(p, regs, gp, nsel, pv, pc)
+                    if p.pred_reg >= 0:
+                        _run_ops(p, regs, cols, p.n_pro, p.n_pred, i0, sel, False, n)
+                        var pr = regs + p.pred_reg * VEC
+                        var kk = 0
+                        for i in range(n):
+                            sel[kk] = Int32(i)
+                            kk += 1 if pr[i] != 0.0 else 0
+                        nsel = kk
+                        use_sel = nsel < n
+                if nsel > 0:
+                    _run_ops(p, regs, bcols, p.n_pro + p.n_pred, p.n_body, i0, sel, use_sel, nsel)
+                    var gp = gscratch
+                    comptime if keyed:
+                        if not encode(k, i0, sel, nsel, use_sel, gscratch, regs):
+                            return False
+                    else:
+                        if p.has_gids:
+                            var gsrc = p.gids + i0
+                            if use_sel:
+                                for j in range(nsel):
+                                    gscratch[j] = gsrc[Int(sel[j])]
+                            else:
+                                gp = gsrc
+                    comptime if mode == 2:
+                        _stage(p, regs, gp, nsel, pv, pc)
+                    elif mode == 1:
+                        _accumulate_shared(p, regs, gp, nsel, pv, pc)
+                    else:
+                        _accumulate(p, regs, gp, nsel, pv, pc)
             i0 += n
         pos = stop
     return True
@@ -1427,11 +1464,13 @@ def _pipeline_run[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
     code_a: Int, consts_a: Int, set_bytes_a: Int, set_meta_a: Int,
     tbl_a: Int, n_chunks: Int, dtypes_a: Int, gids_a: Int, n_groups: Int,
     start: Int, end: Int, out_vals_a: Int, out_cnt_a: Int, threads: Int, encode: E,
-    front: FR, ws_bytes: Int, repro: Bool, ovf: LP,
+    front: FR, ws_arg: Int, repro: Bool, ovf: LP,
 ) -> Int:
     """The interpreter over rows [start, end). `keyed`: no group-id array; the group ids of the rows
     that pass the predicate are made per VEC block by `encode` (see _process_range), so keys of
     filtered-out rows are never read and no n_rows-sized array is written. -5 when `encode` fails."""
+    var ws_bytes = ws_arg & WS_BYTES_MASK
+    var MR = morsel_rows(ws_arg)             # probe rows per morsel (MORSEL, less when the front stage expands rows)
     var code = _ip(code_a)
     if Int(code[0]) != 0x4d585031:
         return -1
@@ -1467,8 +1506,8 @@ def _pipeline_run[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
     # keyed aggregate and every fused join under FUSED_MIN groups, where a table per morsel costs 10-20%
     # more; the defined order runs the global aggregate (no groups: as fast) and fused joins from
     # FUSED_MIN groups (up to 2x faster than the atomic shared output it replaces).
-    var nt0 = max(1, min(threads if threads > 0 else 1, (total + MORSEL - 1) // MORSEL))
-    var mo0 = (total + MORSEL - 1) // MORSEL
+    var nt0 = max(1, min(threads if threads > 0 else 1, (total + MR - 1) // MR))
+    var mo0 = (total + MR - 1) // MR
     var legacy = has_gids and not repro and (not fused or G < FUSED_MIN)
     # the table path needs a wave of tables (two per worker, or all of them when fewer) and a count table
     # per worker inside the budget; one wave when all tables fit
@@ -1480,7 +1519,7 @@ def _pipeline_run[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
         NL = p.nl
         var per_worker = (A + 1) * G * NL * 8
         var nthreads = threads if threads > 0 else 1
-        var morsels = (total + MORSEL - 1) // MORSEL
+        var morsels = (total + MR - 1) // MR
         nthreads = min(nthreads, morsels)
         if per_worker > 0:
             # every worker initializes and merges a partial per group: with many groups, fewer workers
@@ -1529,16 +1568,16 @@ def _pipeline_run[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
             _run_ops(p, regs, p.tbl, 0, p.n_pro, 0, sel, False, VEC)
             while True:
                 var m = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
-                var lo = start + m * MORSEL
+                var lo = start + m * MR
                 if lo >= end:
                     break
                 var ok = True
                 if shared:
                     ok = _process_range[keyed=keyed, mode=1, fused=fused](
-                        p, regs, sel, gscratch, pv, pc, lo, min(lo + MORSEL, end), encode, front, ws)
+                        p, regs, sel, gscratch, pv, pc, lo, min(lo + MR, end), encode, front, ws)
                 else:
                     ok = _process_range[keyed=keyed, mode=0, fused=fused](
-                        p, regs, sel, gscratch, pv, pc, lo, min(lo + MORSEL, end), encode, front, ws)
+                        p, regs, sel, gscratch, pv, pc, lo, min(lo + MR, end), encode, front, ws)
                 if not ok:
                     failed[0] = 1
                     break
@@ -1694,10 +1733,10 @@ def _pipeline_run[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
                 var i = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
                 if i >= Int(ctl[1]):
                     break
-                var lo = start + (Int(ctl[0]) + i) * MORSEL
+                var lo = start + (Int(ctl[0]) + i) * MR
                 sc[0] = 0
                 if not _process_range[keyed=keyed, mode=2, fused=fused](
-                    p, regs, sel, gscratch, sv, sc, lo, min(lo + MORSEL, end), encode, front, ws):
+                    p, regs, sel, gscratch, sv, sc, lo, min(lo + MR, end), encode, front, ws):
                     failed[0] = 1
                     break
                 var n = Int(sc[0])
@@ -1848,11 +1887,11 @@ def _pipeline_run[E: def(Int, Int, IP, Int, Bool, IP, FP) -> Bool, keyed: Bool,
             var j = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
             if j >= Int(ctl[1]):
                 break
-            var lo = start + (Int(ctl[0]) + j) * MORSEL
+            var lo = start + (Int(ctl[0]) + j) * MR
             var pv = pv_all + j * pv_stride
             _init_values(p, pv)
             if not _process_range[keyed=keyed, mode=0, fused=fused](
-                p, regs, sel, gscratch, pv, pc, lo, min(lo + MORSEL, end), encode, front, ws):
+                p, regs, sel, gscratch, pv, pc, lo, min(lo + MR, end), encode, front, ws):
                 failed[0] = 1
                 break
 

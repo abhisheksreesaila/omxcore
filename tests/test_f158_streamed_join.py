@@ -151,10 +151,10 @@ def test_not_in_with_a_NULL_in_the_build_side_equals_duckdb(mx, data):
 
 def test_repeated_build_keys_fall_back_to_materialized_without_a_probe_budget(mx, data):
     """The probe scan (1M rows) is not the build side: the fallback must not charge it to the join budget (it did, and blamed the wrong table)."""
-    sql = "SELECT count(*) FROM rep a JOIN bigb b ON a.k = b.k"
+    sql = "SELECT a.v, b.w FROM rep a JOIN bigb b ON a.k = b.k"          # (rows: an aggregate over repeated keys is fused since F-161)
     for stream in ["never", "always"]:
-        res = q(mx, data, sql, ["rep", "bigb"], extra=["--stream", stream, "--join-budget", "100000"])
-        assert res["rows"] == [[5000]], res
+        res = q(mx, data, sql, ["rep", "bigb"], extra=["--stream", stream, "--join-budget", "400000"])
+        assert res["row_count"] == 5000, res
         if stream == "always":
             assert "join path: materialized" in note(res, "join path"), res["notes"]
 

@@ -47,7 +47,7 @@ from _fpenv import par, par_n, start_pool
 from std.atomic import Atomic
 from std.ffi import external_call
 
-from pipeline_cpu import Prog, _run_ops, _process_range, _worker_state, _no_front, _ibits, _iadd, _is_iext, _iext, _fill_identity, VEC, MORSEL, MAX_REGS
+from pipeline_cpu import Prog, _run_ops, _process_range, _worker_state, _no_front, _ibits, _iadd, _is_iext, _iext, _fill_identity, VEC, MORSEL, MAX_REGS, WS_BYTES_MASK, morsel_rows
 
 comptime FP = Pointer[Float64, MutUntrackedOrigin]
 comptime IP = Pointer[Int32, MutUntrackedOrigin]
@@ -263,12 +263,14 @@ def _flush(p: Prog, hs: LP, nk: Int, cap: Int, lanes: Int, nparts: Int, pshift: 
 def hash_aggregate[KW: def(Int, Int, IP, Int, Bool, LP, FP, BP) -> Bool,
                    FR: def(Int, Int, Int, IP, BP) -> Int, fused: Bool](
     code_a: Int, consts_a: Int, set_bytes_a: Int, set_meta_a: Int, tbl_a: Int, n_chunks: Int, dtypes_a: Int,
-    nk: Int, n_rows: Int, threads: Int, repro: Bool, keyw: KW, front: FR, ws_bytes: Int, res: LP,
+    nk: Int, n_rows: Int, threads: Int, repro: Bool, keyw: KW, front: FR, ws_arg: Int, res: LP,
     rec_limit: Int,
 ) -> Int:
     var code = _ip(code_a)
     if Int(code[0]) != 0x4d585031:
         return -1
+    var ws_bytes = ws_arg & WS_BYTES_MASK
+    var MR = morsel_rows(ws_arg)             # probe rows per morsel (MORSEL, less when the front stage expands rows: F-161)
     var cap = (MORSEL + VEC) if repro else DEF_CAP
     var lanes = 1 if repro else DEF_LANES
     var ovf = unsafe_alloc[Int64](1)                  # set by an integer sum that passes int64 (pipeline_cpu._iadd)
@@ -280,7 +282,7 @@ def hash_aggregate[KW: def(Int, Int, IP, Int, Bool, LP, FP, BP) -> Bool,
     p.nl = lanes
     var A = p.n_aggs
     var rw = 3 + A + nk
-    var morsels = (n_rows + MORSEL - 1) // MORSEL
+    var morsels = (n_rows + MR - 1) // MR
     var nt = max(1, min(threads if threads > 0 else 1, morsels))
     var nparts = 1
     while nparts < MAX_PARTS and nparts * PART_ROWS < n_rows:
@@ -385,13 +387,13 @@ def hash_aggregate[KW: def(Int, Int, IP, Int, Bool, LP, FP, BP) -> Bool,
 
         while True:
             var m = Int(Atomic[Scalar[DType.int64]].fetch_add(counter, 1))
-            var lo = m * MORSEL
+            var lo = m * MR
             if lo >= n_rows or Int(hs[S_OVER]) != 0 or Int(failed[0]) != 0:
                 break
             if repro:
                 hs[S_SEG] = Int64(m) << 20
             if not _process_range[keyed=True, mode=0, fused=fused](
-                p, regs, sel, gscratch, pv, pc, lo, min(lo + MORSEL, n_rows), enc, front, ws):
+                p, regs, sel, gscratch, pv, pc, lo, min(lo + MR, n_rows), enc, front, ws):
                 failed[0] = 1
                 break
             if repro:
