@@ -102,6 +102,11 @@ the plan's work per row, per core, per column uploaded, and records why it chose
 On a big CPU, streaming from disk is decode-bound, so the CPU wins; the GPU pays where data is already on it or cores
 are few. A failed GPU query always gives its device memory back.
 
+SQL reaches the same machinery (F-191): `mx sql --device cpu|gpu|auto` and `PlannerOptions.device` run the aggregate stage of a
+single-table integer / DECIMAL query through the builder's GPU programs (and its pieces for a table over the budget). AUTO is
+the CPU unless the table has `gpu_min_rows` rows (1,000,000); everything the GPU kernel does not run stays on the CPU and the
+notes and the JSON `device` say which device ran and why.
+
 ## 📊 Aggregates (F-133, F-148)
 
 The core aggregation is one bytecode kernel, run per block on every core. Holistic aggregates add their own algorithms:

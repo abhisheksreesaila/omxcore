@@ -434,10 +434,12 @@ cat.add_scan("big", scan_parquet(path))      # a Parquet file, read a row group 
 var r = sql(cat, "SELECT region, sum(revenue) AS total FROM orders WHERE qty > 2 GROUP BY region HAVING count(*) > 5 ORDER BY total DESC LIMIT 10")
 r.table                                      # an owned Table: INT, DECIMAL, TEXT, DATE, BOOL and FLOAT
 r.notes                                      # what the planner decided and what ran, one line each
-r.explain; r.ms; r.device (CPU); r.fallback_reason ("")
+r.explain; r.ms; r.device (CPU or GPU: where the aggregate stage ran); r.fallback_reason (why the CPU answered when the GPU or AUTO was asked, else "")
 var e = sql(cat, "EXPLAIN SELECT ...")       # the plan as a one-column Table `plan` (also `e.explain`); nothing runs
 var o = PlannerOptions(); o.group = GROUP_HASHED          # GROUP_AUTO, GROUP_DENSE or GROUP_HASHED; o.dense_limit; o.threads
 var h = sql(cat, "SELECT ...", o)
+var g = PlannerOptions(); g.device = GPU                  # F-191: CPU, GPU or AUTO (the default); g.gpu_min_rows (AUTO's threshold, default 1,000,000); g.device_table (a DeviceTable already on the device)
+var on_gpu = sql(cat, "SELECT region, sum(qty) FROM orders WHERE price > 0 GROUP BY region", g)     # on_gpu.device == GPU; the notes end with `device: GPU (...)`
 ```
 
 **The dialect** is a subset of DuckDB's; anything else raises `SQL error at line L, column C: <what>`, naming the construct
@@ -795,7 +797,12 @@ mx schema <file> [--rows N]
 - **Files.** `FROM 'orders.parquet'` and `FROM 'orders.csv'` open the file named in the query; `-t name=path` registers a file under a name (`FROM name`). A Parquet file is streamed a row group at a
   time when it is over a quarter of the machine's memory (or `--stream always`; `--stream never` reads it whole; `--memory BYTES` changes the memory it compares with), otherwise read into memory.
   The notes say which. A CSV is read whole, and as UTF-8 only: a file with a byte that is not UTF-8 (Latin-1 `caf\xe9`) or a UTF-16 byte order mark is an error naming the byte and line, with a hint to re-save it (`iconv -f LATIN1 -t UTF-8`); a UTF-8 byte order mark is skipped. The result is therefore always valid UTF-8. The advanced switches `--group auto|dense|hashed`, `--dense-limit N` and `--threads N` are F-150's `PlannerOptions`.
-- **Device.** SQL runs on the CPU. `--device gpu` is accepted and the notes say it ran on the CPU; `device` in the result is `"cpu"`.
+- **Device (F-191).** `--device auto` (the default) answers on the CPU unless the table has `--gpu-min-rows` rows (default 1,000,000, the builder's AUTO rule) and the GPU programs run the query; `--device cpu` never touches
+  the GPU; `--device gpu` runs what it can and says what fell back. What runs on the GPU is the aggregate stage of a query over one table (or over the rows a join materialized) whose instructions are the integer / DECIMAL
+  / DATE ones the builder's GPU kernel runs (filters, CASE, sums, counts, min / max, dense or no groups), through the builder's own `_run_gpu` and, for a table over the GPU budget, its pieces (F-196), so results equal the CPU's
+  (a total past int64 is settled in 128 bits as on the CPU). Everything else stays on the CPU with the reason: FLOAT columns and float arithmetic, hashed groups, text functions, dates, IN lists and casts, count(DISTINCT) /
+  median / quantiles, a fused join, a frame or a Parquet / CSV scan (a scan is read a row group at a time on the CPU). With no `DeviceTable` attached (`PlannerOptions.device_table`) the table is uploaded for the one query.
+  The last `device:` note and the JSON `device` (`"cpu"` or `"gpu"`) say which device ran and why; `fallback_reason` (Mojo) holds the reason.
 - **Result (stdout, one JSON object).**
   `{"columns":[{"name","kind","scale"}],"rows":[[...]],"row_count","truncated","ms","device","notes"}`.
   `kind` is INT, DECIMAL, TEXT, DATE, BOOL or FLOAT. An INT is a JSON integer. **A DECIMAL is a JSON number whose text is exact** (`1234.50`, scale digits kept): parse it with a decimal parser

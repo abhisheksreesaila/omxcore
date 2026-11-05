@@ -13,6 +13,8 @@ What it decides today: the group strategy.
 - hashed: key words go through per-worker hash tables and a partitioned merge (`hashagg_cpu`): any keys, any range.
 """
 from .job import JobCtl                                   # F-175
+from .query import AUTO, AUTO_GPU_MIN_ROWS                # F-191: the SQL path's device
+from .gpu import DeviceTable
 from .sink import ResultSink                              # F-167
 from .table import TEXT, BOOL, FLOAT
 from .plan import LogicalPlan, P_SORT, P_LIMIT
@@ -57,12 +59,20 @@ struct PlannerOptions(Copyable, Movable):
     var sort_run_rows: Int                   # a test's override: rows per sorted run (> 0 forces the spilling sort, even when every row fits one run)
     var spill_dir: String                    # the folder the runs are written in ("": the TMPDIR environment variable, else /tmp)
     var sink: Optional[ResultSink]         # `sql_to_parquet`: where a spilled sort's merged rows go instead of a result table
+    # F-191: the device. AUTO (default) answers on the CPU unless the table has `gpu_min_rows` rows or more (the builder's AUTO rule); CPU never touches the GPU;
+    # GPU runs what the GPU programs run (a single table's integer / DECIMAL / DATE aggregates) and the notes say what fell back to the CPU
+    var device: Int                          # CPU, GPU or AUTO (query.mojo's)
+    var gpu_min_rows: Int                    # AUTO's row threshold (AUTO_GPU_MIN_ROWS; a test lowers it instead of building a big table)
+    var device_table: Optional[DeviceTable]  # the table's copy already on the device (as `Query.on_device`); None: the table is uploaded for this query
 
     def __init__(out self):
         self.sort_budget = 0
         self.sort_run_rows = 0
         self.spill_dir = String()
         self.sink = None
+        self.device = AUTO
+        self.gpu_min_rows = AUTO_GPU_MIN_ROWS
+        self.device_table = None
         self.job = JobCtl()
         self.written_order = False
         self.join_order = List[Int]()
