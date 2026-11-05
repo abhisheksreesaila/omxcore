@@ -21,7 +21,7 @@ from .sql import (SqlStatement, SqlQuery, SqlExpr, SelectItem, TableRef, WinSpec
                   X_SCALAR_Q, X_IN_Q, X_EXISTS_Q, X_SUBIN, X_EXISTS, X_NOT, X_COL, X_INT, X_NULL, X_CAST, X_TRUE, X_FALSE, X_IN, X_BIN, X_CALL, X_ISBOOL, JK_INNER, JK_LEFT)
 from .bind import Catalog, _split_and_expr, _and_chain, _has_aggregate
 from .subq import (SIDE_OUTER, side_of, Scope, scope_of, Flat, flatten, flat_source, clone_shell, collect, is_subquery_node, add_node, column_node, equal_node, and_node,
-                   copy_expr, hidden_tag, set_literal, set_typed_null, literal_node, statement_is_correlated, analyze, build_exists_source, build_value_source, group_by_keys, key_name)
+                   copy_expr, hidden_tag, find_entry, Correlation, set_items, set_literal, set_typed_null, literal_node, statement_is_correlated, analyze, build_exists_source, build_value_source, group_by_keys, key_name)
 from .setops import union_all
 from .planner import Planner, RulePlanner, PlannerOptions
 from .sqlexec import SqlResult, run_plain
@@ -151,6 +151,10 @@ def _rename_columns(mut t: Table, names: List[String], line: Int, col: Int) rais
         if t.cols[c].name in t.by_name:
             raise sql_error(line, col, "column `" + t.cols[c].name + "` is named twice")
         t.by_name[t.cols[c].name] = c
+
+
+def _took(t0: Int) -> String:
+    return ", " + String(Int(Float64(Int(perf_counter_ns()) - t0) / 1e6)) + " ms"
 
 
 def _commas(n: Int) -> String:
@@ -587,17 +591,138 @@ def _numeric_column(catalog: Catalog, table: String, name: String) -> Bool:
 
 struct Step(Movable):
     """One condition of a WHERE that holds a correlated (or IN) subquery, ready to run on the outer rows: the condition (an expression of the outer statement's
-    pool), the table D it joins (empty for none), the join's condition and whether the join is a LEFT one."""
+    pool), the table D it joins (empty for none), the join's condition and whether the join is a LEFT one.
+
+    A correlated step's D is not run when the step is made: `kid` is D's statement, `pd` the name its table will have, and `run_pending` runs it when the
+    step's stage comes, against the outer rows the stages before it left (see there). `rk_inner` are the bare key columns of D's table, `rk_outer` the
+    outer statement's nodes for the same keys."""
     var conj: Int
     var d: String
     var join_on: Int
     var left: Bool
+    var kid: Int
+    var pd: String
+    var rk_inner: List[String]
+    var rk_outer: List[Int]
+    var note_pre: String
+    var note_post: String
+    var vname: String
+    var fix: Int
+    var alt_node: Int                # an EXISTS the statement reads as a semi join of the inner table itself (F-154); when D is run, the node reads D instead (alt_sub)
+    var alt_sub: Int
 
     def __init__(out self, conj: Int, d: String, join_on: Int, left: Bool):
         self.conj = conj
         self.d = d
         self.join_on = join_on
         self.left = left
+        self.kid = -1
+        self.pd = String()
+        self.rk_inner = List[String]()
+        self.rk_outer = List[Int]()
+        self.note_pre = String()
+        self.note_post = String()
+        self.vname = String()
+        self.fix = -1
+        self.alt_node = -1
+        self.alt_sub = -1
+
+    def pend(mut self, kid: Int, pd: String, rk_inner: List[String], rk_outer: List[Int], note_pre: String, note_post: String):
+        self.kid = kid
+        self.pd = pd
+        self.rk_inner = rk_inner.copy()
+        self.rk_outer = rk_outer.copy()
+        self.note_pre = note_pre
+        self.note_post = note_post
+
+    def copy_of(self, conj: Int = -2) -> Step:
+        var c = Step(self.conj if conj == -2 else conj, self.d, self.join_on, self.left)
+        c.pend(self.kid, self.pd, self.rk_inner, self.rk_outer, self.note_pre, self.note_post)
+        c.vname = self.vname
+        c.fix = self.fix
+        c.alt_node = self.alt_node
+        c.alt_sub = self.alt_sub
+        return c^
+
+
+def _bare_keys(k: SqlStatement, cor: Correlation) -> List[String]:
+    """The names of the key columns of D's table when every key is one (the keys a reduction can use), else none."""
+    var out = List[String]()
+    if k.has_right or len(k.extra) > 0 or k.table_kid >= 0 or len(k.ctes) > 0:
+        return out^
+    for e in range(len(k.exprs)):
+        if is_subquery_node(k.exprs[e].kind) or k.exprs[e].kind == X_SUBIN or k.exprs[e].kind == X_EXISTS:
+            return List[String]()
+    for ke in cor.key_in:
+        if k.exprs[ke].kind != X_COL:
+            return List[String]()
+        out.append(k.exprs[ke].text)
+    return out^
+
+
+# D is cut to the keys the outer rows have when those are fewer than half of D's source rows: a semi join of D's table with the outer rows (presence marks
+# built on the few, the many probe), before D groups or distincts what is left.
+comptime REDUCE_DEN = 2
+comptime REDUCE_DEN_ALT = 8                  # a semi join with the inner table itself is replaced by D (cut) only when the outer rows are fewer than an eighth of the inner table's
+
+
+def run_pending[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st: SqlStatement, s: Step, cur: String, planner: P, opts: PlannerOptions) raises:
+    """Runs the D of a step that was left pending, against `cur`, the table of the outer rows the step applies to (the stages before it have filtered it)."""
+    if s.kid < 0:
+        return
+    var t0 = Int(perf_counter_ns())
+    var k = run.take(s.kid)
+    var reduced = False
+    var ci = catalog.find(cur)
+    var ki = catalog.find(k.table)
+    var den = REDUCE_DEN_ALT if s.alt_node >= 0 else REDUCE_DEN
+    if s.alt_node >= 0 and not (ci >= 0 and ki >= 0 and catalog.sources[ci].rows() * den < catalog.sources[ki].rows()):
+        run.stmts[s.kid] = k^                                                   # (the semi join with the inner table itself stays: D would not be cut)
+        return
+    if len(s.rk_inner) > 0 and ci >= 0 and ki >= 0 and catalog.sources[ci].rows() * den < catalog.sources[ki].rows():
+        var sub = SubQuery()
+        sub.table = cur
+        sub.line = k.table_line
+        sub.col = k.table_col
+        var on = -1
+        var ok = True
+        for i in range(1):                                                      # the first key only: a cut is a superset filter, and several keys would be packed on every row of D's table
+            # (after a flatten the node's text is the flat table's own column name, `name_2` when two tables had one of that name, so the lookup in `cur` is
+            # exact; a name `cur` lacks skips the cut and D stays whole, which is only slower)
+            var oname = st.exprs[s.rk_outer[i]].text
+            var has = False
+            for c in range(catalog.sources[ci].table.columns()):
+                if lower_ascii(catalog.sources[ci].table.name(c)) == lower_ascii(oname):
+                    has = True
+            if not has:
+                ok = False
+                break
+            var a = column_node(k, s.rk_inner[i], "#0", k.table_line, k.table_col)
+            var b = column_node(k, oname, "#1", k.table_line, k.table_col)
+            on = and_node(k, on, equal_node(k, a, b, k.table_line, k.table_col))
+        if ok:
+            sub.where = on
+            k.subs.append(sub^)
+            k.exprs.append(SqlExpr(X_EXISTS, String("EXISTS"), String(), -1, -1, -1, List[Int](), False, k.table_line, k.table_col))
+            k.exprs[len(k.exprs) - 1].items.append(len(k.subs) - 1)
+            k.where = and_node(k, k.where, len(k.exprs) - 1)
+            reduced = True
+    run.stmts[s.kid] = k^
+    if s.alt_node >= 0:
+        st.exprs[s.alt_node].items[0] = s.alt_sub
+    var r = exec_statement(run, catalog, s.kid, planner, opts)
+    var rows = r.table.rows()
+    if r.table.any_wide():
+        raise Error(OVERFLOW_MESSAGE)
+    catalog.add_table(s.pd, r.take_table().share())
+    run.steps.append(s.note_pre + s.pd + " (" + _commas(rows) + s.note_post + (" (cut to the keys of the " + _commas(catalog.sources[ci].rows()) + " outer rows)" if reduced else "") + _took(t0))
+    if s.fix >= 0 and _numeric_column(catalog, s.pd, s.vname):
+        # `x = D.__v` between columns of two tables would be taken for a join key (and an INT against a FLOAT cannot be one): `__v + 0` is an expression
+        var line = st.exprs[s.fix].line
+        var col = st.exprs[s.fix].col
+        st.exprs.append(st.exprs[s.fix].copy())
+        st.exprs.append(SqlExpr(X_INT, String("0"), String(), -1, -1, -1, List[Int](), False, line, col))
+        st.exprs[s.fix] = SqlExpr(X_BIN, String("+"), String(), len(st.exprs) - 2, len(st.exprs) - 1, -1, List[Int](), False, line, col)
 
 
 def _prepare_kid[P: Planner](mut run: QueryRun, mut catalog: Catalog, kid: Int, planner: P, opts: PlannerOptions) raises:
@@ -633,6 +758,7 @@ def _substitute[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st: Sql
     var line = st.exprs[n].line
     var col = st.exprs[n].col
     var neg = st.exprs[n].flag
+    var tm = Int(perf_counter_ns())
     var t = _run_kid(run, catalog, kid, planner, opts)
     if kind == X_EXISTS_Q:
         var has = t.rows() > 0
@@ -648,7 +774,7 @@ def _substitute[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st: Sql
             set_typed_null(st, n, t.kind(0), t.scale(0), line, col)
         else:
             set_literal(st, n, t, 0, 0)
-        run.steps.append("scalar subquery: " + _commas(t.rows()) + " row, a constant")
+        run.steps.append("scalar subquery: " + _commas(t.rows()) + " row, a constant" + _took(tm))
         return
     if t.rows() > MAX_IN_LIST:
         raise sql_error(line, col, "IN (SELECT ...) here returned " + _commas(t.rows()) + " rows, more than the " + _commas(MAX_IN_LIST) +
@@ -728,13 +854,14 @@ def _native_in[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st: SqlS
         st.exprs[n].items.append(at)
         run.steps.append("subquery IN: " + run.stmts[kid].table + ", a semi join")
         return
+    var tm = Int(perf_counter_ns())
     var r = exec_statement(run, catalog, kid, planner, opts)
     if r.table.columns() != 1:
         raise sql_error(line, col, "a subquery in IN must return one column, this one returns " + String(r.table.columns()))
     var cname = r.table.name(0)
     var rows = r.table.rows()
     var d = register_result(run, catalog, r, "__d")
-    run.steps.append("subquery IN: " + d + " (" + _commas(rows) + " rows), a semi join")
+    run.steps.append("subquery IN: " + d + " (" + _commas(rows) + " rows" + _took(tm) + "), a semi join")
     var sub = SubQuery()
     sub.table = d
     sub.line = line
@@ -766,21 +893,53 @@ def _correlated_exists[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut 
             st.exprs[n].items = List[Int]()
             st.exprs[n].items.append(at)
             run.steps.append("subquery EXISTS: " + run.stmts[kid].table + ", a semi join")
-            return Step(-1, String(), -1, False)
+            var native = Step(-1, String(), -1, False)
+            if len(cor0.inner_conj) > 0 and len(_bare_keys(run.stmts[kid], cor0)) > 0:
+                # The inner table has a filter of its own, so that semi join would first write the filtered table. When the outer rows turn out to be few
+                # (run_pending), D, the inner table's distinct keys among theirs, replaces it: the inner table is scanned and probed, nothing is written.
+                var k2 = run.take(kid)
+                var cor2 = analyze(k2, scope_of(k2, catalog), sc, True, "EXISTS")
+                var rk2 = _bare_keys(k2, cor2)
+                build_exists_source(k2, cor2, tag)
+                run.stmts[kid] = k2^
+                var d2 = run.fresh("__d", catalog)
+                var dsub = SubQuery()
+                dsub.table = d2
+                dsub.line = line
+                dsub.col = col
+                var on2 = -1
+                var okeys2 = List[Int]()
+                for i in range(len(cor2.key_in)):
+                    var dk = column_node(st, key_name(i, tag), d2, line, col)
+                    var oc = column_node(st, cor2.key_name[i], cor2.key_qual[i], line, col)
+                    okeys2.append(oc)
+                    on2 = and_node(st, on2, equal_node(st, dk, oc, line, col))
+                dsub.where = on2
+                st.subs.append(dsub^)
+                native.pend(kid, d2, rk2, okeys2, "subquery EXISTS: ", " keys), a semi join")
+                native.alt_node = n
+                native.alt_sub = len(st.subs) - 1
+            return native^
     var k = run.take(kid)
     var inner = scope_of(k, catalog)
     var cor = analyze(k, inner, sc, True, "EXISTS")
+    var rk = _bare_keys(k, cor)
     build_exists_source(k, cor, tag)
     run.stmts[kid] = k^
-    var r = exec_statement(run, catalog, kid, planner, opts)
-    var rows = r.table.rows()
     var keys = len(cor.key_in)
+    var rows = 0
     var lo = -1
     var hi = -1
-    if keys == 0 and cor.theta_in >= 0:                                         # no key: D is one row, its two values are constants
+    var d: String
+    if keys > 0:                                                                # D runs when its stage comes (run_pending), cut to the outer rows' keys
+        d = run.fresh("__d", catalog)
+    else:                                                                       # no key: D is one row, its two values are constants
+        var r = exec_statement(run, catalog, kid, planner, opts)
+        rows = r.table.rows()
         lo = literal_node(st, r.table, 0, 0, line, col)
         hi = literal_node(st, r.table, 0, 1, line, col)
-    var d = register_result(run, catalog, r, "__d")
+        d = register_result(run, catalog, r, "__d")
+    var okeys = List[Int]()
     if cor.theta_in < 0:                                                        # keys only: the semi (anti) join of F-154 against D
         var sub = SubQuery()
         sub.table = d
@@ -790,14 +949,16 @@ def _correlated_exists[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut 
         for i in range(keys):
             var dk = column_node(st, key_name(i, tag), d, line, col)
             var oc = column_node(st, cor.key_name[i], cor.key_qual[i], line, col)
+            okeys.append(oc)
             on = and_node(st, on, equal_node(st, dk, oc, line, col))
         sub.where = on
         st.subs.append(sub^)
         st.exprs[n].kind = X_EXISTS
         st.exprs[n].items = List[Int]()
         st.exprs[n].items.append(len(st.subs) - 1)
-        run.steps.append("subquery EXISTS: " + d + " (" + _commas(rows) + " keys), a semi join")
-        return Step(-1, String(), -1, False)
+        var step = Step(-1, String(), -1, False)
+        step.pend(kid, d, rk, okeys, "subquery EXISTS: ", " keys), a semi join")
+        return step^
     # one inequality: D holds the min and max of the inner side per key; the outer row is kept by what they say
     var o = column_node(st, cor.theta_name, cor.theta_qual, line, col)
     var cond: Int
@@ -817,13 +978,22 @@ def _correlated_exists[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut 
     for i in range(keys):
         var dk = column_node(st, key_name(i, tag), d, line, col)
         var oc = column_node(st, cor.key_name[i], cor.key_qual[i], line, col)
+        okeys.append(oc)
         on = and_node(st, on, equal_node(st, oc, dk, line, col))
     var absent = flag != negated
-    run.steps.append("subquery " + ("NOT EXISTS" if absent else "EXISTS") + ": " + d + " (" + _commas(rows) + " keys with their min and max), a " + ("left join" if absent else "join"))
+    var pre = "subquery " + ("NOT EXISTS" if absent else "EXISTS") + ": "
+    var post = " keys with their min and max), a " + ("left join" if absent else "join")
+    var step: Step
     if absent:
         st.exprs.append(SqlExpr(X_ISBOOL, String("TRUE"), String(), cond, -1, -1, List[Int](), True, line, col))
-        return Step(len(st.exprs) - 1, d if keys > 0 else String(), on, True)
-    return Step(cond, d if keys > 0 else String(), on, False)
+        step = Step(len(st.exprs) - 1, d if keys > 0 else String(), on, True)
+    else:
+        step = Step(cond, d if keys > 0 else String(), on, False)
+    if keys > 0:
+        step.pend(kid, d, rk, okeys, pre, post)
+    else:
+        run.steps.append(pre + d + " (" + _commas(rows) + post)
+    return step^
 
 
 def _correlated_in[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st: SqlStatement, n: Int, negated: Bool, sc: Scope, planner: P,
@@ -842,20 +1012,21 @@ def _correlated_in[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st: 
         raise sql_error(line, col, "a subquery in IN must return one column")
     var inner = scope_of(k, catalog)
     var cor = analyze(k, inner, sc, False, "IN")
+    var rk = _bare_keys(k, cor)
     build_value_source(k, cor, k.items[0].expr, tag)
     k.distinct = True
     run.stmts[kid] = k^
-    var r = exec_statement(run, catalog, kid, planner, opts)
-    var rows = r.table.rows()
-    var d = register_result(run, catalog, r, "__d")
+    var d = run.fresh("__d", catalog)                                           # D runs when its stage comes (run_pending)
     var sub = SubQuery()
     sub.table = d
     sub.line = line
     sub.col = col
     var on = -1
+    var okeys = List[Int]()
     for i in range(len(cor.key_in)):
         var dk = column_node(st, key_name(i, tag), d, line, col)
         var oc = column_node(st, cor.key_name[i], cor.key_qual[i], line, col)
+        okeys.append(oc)
         on = and_node(st, on, equal_node(st, dk, oc, line, col))
     var dv = column_node(st, "__v" + tag, d, line, col)
     on = and_node(st, on, equal_node(st, dv, left, line, col))
@@ -865,8 +1036,9 @@ def _correlated_in[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st: 
     st.exprs[n].items = List[Int]()
     st.exprs[n].items.append(len(st.subs) - 1)
     st.exprs[n].flag = False
-    run.steps.append("subquery IN: " + d + " (" + _commas(rows) + " rows), a semi join on the correlation and the value")
-    return Step(-1, String(), -1, False)
+    var step = Step(-1, String(), -1, False)
+    step.pend(kid, d, rk, okeys, "subquery IN: ", " rows), a semi join on the correlation and the value")
+    return step^
 
 
 def _correlated_scalar[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st: SqlStatement, n: Int, conj: Int, sc: Scope, planner: P,
@@ -892,16 +1064,17 @@ def _correlated_scalar[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut 
             calls += 1
     if calls > 0 and not is_count:
         raise sql_error(line, col, "a correlated scalar subquery with COUNT inside an expression is not supported yet (an empty group is 0, not NULL)")
+    var rk = _bare_keys(k, cor)
     build_value_source(k, cor, value, tag)
     group_by_keys(k, cor)
     run.stmts[kid] = k^
-    var r = exec_statement(run, catalog, kid, planner, opts)
-    var rows = r.table.rows()
-    var d = register_result(run, catalog, r, "__d")
+    var d = run.fresh("__d", catalog)                                           # D runs when its stage comes (run_pending)
     var on = -1
+    var okeys = List[Int]()
     for i in range(len(cor.key_in)):
         var dk = column_node(st, key_name(i, tag), d, line, col)
         var oc = column_node(st, cor.key_name[i], cor.key_qual[i], line, col)
+        okeys.append(oc)
         on = and_node(st, on, equal_node(st, oc, dk, line, col))
     var cmp = st.exprs[conj].kind == X_BIN and (st.exprs[conj].text == "=" or st.exprs[conj].text == "<>" or st.exprs[conj].text == "<" or
                                                  st.exprs[conj].text == "<=" or st.exprs[conj].text == ">" or st.exprs[conj].text == ">=") and \
@@ -916,15 +1089,14 @@ def _correlated_scalar[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut 
         items.append(len(st.exprs) - 2)
         items.append(len(st.exprs) - 1)
         st.exprs[n] = SqlExpr(X_CALL, String("COALESCE"), String(), 0, -1, -1, items^, False, line, col)
-    elif cmp and st.exprs[conj].text == "=" and _numeric_column(catalog, d, "__v" + tag):
-        # `x = D.__v` between columns of two tables would be taken for a join key (and an INT against a FLOAT cannot be one): `__v + 0` is an expression, compared as SQL compares
-        st.exprs.append(vnode^)
-        st.exprs.append(SqlExpr(X_INT, String("0"), String(), -1, -1, -1, List[Int](), False, line, col))
-        st.exprs[n] = SqlExpr(X_BIN, String("+"), String(), len(st.exprs) - 2, len(st.exprs) - 1, -1, List[Int](), False, line, col)
     else:
         st.exprs[n] = vnode^
-    run.steps.append("correlated scalar subquery: " + d + " (" + _commas(rows) + " keys), a " + ("left join" if left else "join"))
-    return Step(conj, d, on, left)
+    var step = Step(conj, d, on, left)
+    step.pend(kid, d, rk, okeys, "correlated scalar subquery: ", " keys), a " + ("left join" if left else "join"))
+    if not is_count and cmp and st.exprs[conj].text == "=":
+        step.fix = n                                                            # (once D is known: an `=` against a numeric D.__v is written `__v + 0`, run_pending)
+        step.vname = "__v" + tag
+    return step^
 
 
 def lower_subqueries[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st: SqlStatement, planner: P, opts: PlannerOptions) raises -> List[Step]:
@@ -988,10 +1160,10 @@ def lower_subqueries[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st
             steps.append(Step(conj[ci], String(), -1, False))
         elif form_node[ci] == n and kind == X_EXISTS_Q:
             var s = _correlated_exists(run, catalog, st, n, form_not[ci], sc, planner, opts)
-            steps.append(Step(conj[ci] if s.conj < 0 else s.conj, s.d, s.join_on, s.left))
+            steps.append(s.copy_of(conj[ci] if s.conj < 0 else s.conj))
         elif form_node[ci] == n and kind == X_IN_Q:
             var s = _correlated_in(run, catalog, st, n, form_not[ci], sc, planner, opts)
-            steps.append(Step(conj[ci], s.d, s.join_on, s.left))
+            steps.append(s.copy_of(conj[ci]))
         elif kind == X_SCALAR_Q:
             steps.append(_correlated_scalar(run, catalog, st, n, conj[ci], sc, planner, opts))
         else:
@@ -1011,14 +1183,201 @@ def _shown(table: String, alias: String) -> String:
     return alias if alias.byte_length() > 0 else table
 
 
-def run_stages[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: SqlStatement, var steps: List[Step], planner: P, opts: PlannerOptions,
+# A step is pushed down to the one outer table it reads when its table D is small beside that table: the table is filtered (and joined to D) before the
+# outer tables are joined, so what the joins read is the few rows that pass instead of every row (Q18: 624 orders of 15,000,000, not a 60,000,000-row join).
+comptime PUSH_DEN = 16
+
+
+def _step_entries(st: SqlStatement, sc: Scope, s: Step) -> List[Int]:
+    """The tables of the outer FROM (their entries in the scope) that a step reads; -2 among them when a column names more than one table."""
+    var refs = List[Int]()
+    collect(st, s.conj, refs)
+    if s.join_on >= 0:
+        collect(st, s.join_on, refs)
+    var under = List[Int]()
+    collect(st, s.conj, under)
+    for u in under:
+        if st.exprs[u].kind == X_SUBIN or st.exprs[u].kind == X_EXISTS:
+            ref sub = st.subs[st.exprs[u].items[0]]
+            for o in sub.outer:
+                refs.append(o)
+            if len(sub.inner) == 0:                                             # D's own subquery: its condition names the outer columns (and D's, which find nothing)
+                collect(st, sub.where, refs)
+    var out = List[Int]()
+    for r in refs:
+        if st.exprs[r].kind != X_COL:
+            continue
+        var f = find_entry(sc, st.exprs[r].text2, st.exprs[r].text)
+        if f[0] == -1:
+            continue
+        var seen = False
+        for o in out:
+            if o == f[0]:
+                seen = True
+        if not seen:
+            out.append(f[0])
+    return out^
+
+
+def _entry_table(st: SqlStatement, e: Int) -> Tuple[String, String, Bool, Int, Int]:
+    if e == 0:
+        return (st.table, st.table_alias, st.table_is_file, st.table_line, st.table_col)
+    if e == 1:
+        return (st.right_table, st.right_alias, st.right_is_file, st.right_line, st.right_col)
+    ref x = st.extra[e - 2]
+    return (x.name, x.alias, x.is_file, x.line, x.col)
+
+
+def _only_reads(st: SqlStatement, sc: Scope, c: Int, e: Int) -> Bool:
+    var under = List[Int]()
+    collect(st, c, under)
+    var any = False
+    for u in under:
+        if st.exprs[u].kind == X_COL:
+            var f = find_entry(sc, st.exprs[u].text2, st.exprs[u].text)
+            if f[0] != e:
+                return False
+            any = True
+    return any
+
+
+def _read_columns(st: SqlStatement, sc: Scope, e: Int) -> List[Int]:
+    """The columns of table `e` of the FROM that any expression of the statement reads (the first column when none: a stage needs one to carry its rows)."""
+    var skip = List[Bool](length=len(st.exprs), fill=False)
+    for sub in st.subs:
+        for x in sub.inner:
+            skip[x] = True
+    var cols = List[Int]()
+    for n in range(len(st.exprs)):
+        if st.exprs[n].kind != X_COL or skip[n]:
+            continue
+        var f = find_entry(sc, st.exprs[n].text2, st.exprs[n].text)
+        if f[0] == e:
+            var seen = False
+            for c in cols:
+                if c == f[1]:
+                    seen = True
+            if not seen:
+                cols.append(f[1])
+    for u in st.join_using:                                                     # JOIN ... USING (k): the key is read by the join, not by an expression
+        var key = lower_ascii(u)
+        for c in range(len(sc.cols[e])):
+            if sc.cols[e][c] == key:
+                var seen = False
+                for x in cols:
+                    if x == c:
+                        seen = True
+                if not seen:
+                    cols.append(c)
+    if len(cols) == 0:
+        cols.append(0)
+    return cols^
+
+
+def _push_steps[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st: SqlStatement, mut steps: List[Step], planner: P, opts: PlannerOptions) raises:
+    """Steps that read one table of a joined FROM, and whose D is small beside it, run on that table before the joins: the stage is the table's own
+    filters and the step (joined to D), over the columns the statement reads; the statement then reads the stage's table in its place."""
+    if not (st.has_right or len(st.extra) > 0) or len(steps) == 0 or st.join_kind != JK_INNER:
+        return                                                                  # (a table of an outer join is filtered after the join, not before)
+    for it in st.items:
+        if it.star:
+            return
+    var keep = List[Bool]()
+    for si in range(len(steps)):
+        keep.append(True)
+        var sc = scope_of(st, catalog)
+        var es = _step_entries(st, sc, steps[si])
+        if len(es) != 1 or es[0] < 0:
+            continue
+        var e = es[0]
+        var tt = _entry_table(st, e)
+        var ti = catalog.find(tt[0])
+        var small = steps[si].d                                                 # the table the step reads besides this one: D, or the subquery's table
+        if small.byte_length() == 0:
+            var under = List[Int]()
+            collect(st, steps[si].conj, under)
+            for u in under:
+                if st.exprs[u].kind == X_SUBIN or st.exprs[u].kind == X_EXISTS:
+                    small = st.subs[st.exprs[u].items[0]].table
+        var di = catalog.find(small)
+        if ti < 0 or di < 0 or catalog.sources[di].rows() * PUSH_DEN >= catalog.sources[ti].rows():
+            continue
+        var cols = _read_columns(st, sc, e)
+        var shown = _shown(tt[0], tt[1])
+        var stage = SqlStatement(st.text)
+        stage.exprs = st.exprs.copy()
+        stage.subs = st.subs.copy()
+        stage.table = tt[0]
+        stage.table_alias = tt[1]
+        stage.table_is_file = tt[2]
+        stage.table_line = tt[3]
+        stage.table_col = tt[4]
+        var exprs = List[Int]()
+        var names = List[String]()
+        for c in cols:
+            exprs.append(column_node(stage, sc.real[e][c], shown, tt[3], tt[4]))
+            names.append(sc.real[e][c])
+        set_items(stage, exprs, names)
+        var plain = List[Int]()
+        _split_and_expr(st, st.where, plain)
+        var rest = List[Int]()
+        var w = steps[si].conj
+        for p in plain:
+            if _only_reads(st, sc, p, e):
+                w = and_node(stage, p, w)
+            else:
+                rest.append(p)
+        st.where = _and_chain(st, rest)
+        stage.where = w
+        if steps[si].d.byte_length() > 0:
+            stage.has_right = True
+            stage.right_table = steps[si].d
+            stage.join_kind = JK_LEFT if steps[si].left else JK_INNER
+            stage.join_on = steps[si].join_on
+        var r = run_plain(catalog, stage^, run.text, planner, opts)
+        var rows = r.table.rows()
+        var nm = register_result(run, catalog, r, "__t")
+        run.steps.append("subquery step on " + shown + ": " + nm + " (" + _commas(rows) + " rows), before the tables are joined")
+        if e == 0:
+            st.table = nm
+            st.table_alias = shown
+            st.table_is_file = False
+        elif e == 1:
+            st.right_table = nm
+            st.right_alias = shown
+            st.right_is_file = False
+        else:
+            st.extra[e - 2].name = nm
+            st.extra[e - 2].alias = shown
+            st.extra[e - 2].is_file = False
+        keep[si] = False
+    var left = List[Step]()
+    for si in range(len(steps)):
+        if keep[si]:
+            left.append(steps[si].copy_of())
+    steps = left^
+
+
+
+def run_stages[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: SqlStatement, var steps_in: List[Step], planner: P, opts: PlannerOptions,
                            final_opts: PlannerOptions, explain: Int) raises -> SqlResult:
     """The statement with correlated subqueries, one step at a time over the outer rows: with several tables the outer rows are first made one table; each step is a
     query over the table the step before made (joined with its D when it has one); the last step joins the statement's own query."""
+    var steps = List[Step]()                                                    # the steps that need no D run first (they filter the outer rows D is then cut to)
+    for i in range(len(steps_in)):
+        if steps_in[i].kid < 0:
+            steps.append(steps_in[i].copy_of())
+    for i in range(len(steps_in)):
+        if steps_in[i].kid >= 0:
+            steps.append(steps_in[i].copy_of())
+    _push_steps(run, catalog, st, steps, planner, opts)
+    if len(steps) == 0:
+        return run_plain_explained(run, catalog, st^, planner, final_opts, explain)
     var plain = List[Int]()
     _split_and_expr(st, st.where, plain)
     var flattened = st.has_right or len(st.extra) > 0
     if flattened:
+        var tm0 = Int(perf_counter_ns())
         var orig = clone_shell(st)
         var sc = scope_of(st, catalog)
         var flat = Flat()
@@ -1028,7 +1387,7 @@ def run_stages[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: SqlS
         var r0 = run_plain(catalog, t0^, run.text, planner, opts)
         var rows0 = r0.table.rows()
         var name0 = register_result(run, catalog, r0, "__t")
-        run.steps.append("outer tables read by a subquery: " + name0 + " (" + _commas(rows0) + " rows)")
+        run.steps.append("outer tables read by a subquery: " + name0 + " (" + _commas(rows0) + " rows" + _took(tm0) + ")")
         for si in range(len(st.subs)):                                          # a subquery's outer references name the flat table (its own columns may share a name)
             for e in st.subs[si].outer:
                 st.exprs[e].text2 = name0
@@ -1044,6 +1403,62 @@ def run_stages[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: SqlS
         st.join_kind = JK_INNER
         st.extra = List[TableRef]()
         plain = List[Int]()
+    if not flattened and len(plain) > 0:
+        # a step with a D to cut wants the outer rows after the statement's own filters: they are written first when few (D's cut is then to those rows' keys)
+        # (each step is judged by its own inner table and its own threshold; the count is skipped when the outer table is already small against it,
+        # since D is then cut by the table's own keys, and when no step has an inner table big enough to gain)
+        var outer_rows = 0
+        var ot = catalog.find(st.table)
+        if ot >= 0:
+            outer_rows = catalog.sources[ot].rows()
+        var inner_rows = 0                                                      # the most outer rows a step's own inner table and threshold let a written-first outer have
+        var already = False
+        for i in range(len(steps)):
+            if steps[i].kid >= 0 and len(steps[i].rk_inner) > 0:
+                var kt = catalog.find(run.stmts[steps[i].kid].table)
+                if kt >= 0:
+                    var den = REDUCE_DEN_ALT if steps[i].alt_node >= 0 else REDUCE_DEN
+                    var rows_i = catalog.sources[kt].rows()
+                    if outer_rows * den < rows_i:
+                        already = True
+                    inner_rows = max(inner_rows, (rows_i - 1) // den)
+        if already:
+            inner_rows = 0
+        if inner_rows > 0:
+            var cs = SqlStatement(st.text)
+            cs.exprs = st.exprs.copy()
+            cs.subs = st.subs.copy()
+            cs.table = st.table
+            cs.table_alias = st.table_alias
+            cs.table_is_file = st.table_is_file
+            cs.table_line = st.table_line
+            cs.table_col = st.table_col
+            cs.exprs.append(SqlExpr(X_CALL, String("COUNT"), String(), 1, -1, -1, List[Int](), False, st.table_line, st.table_col))
+            cs.items.append(SelectItem(len(cs.exprs) - 1, String("c"), True, st.table_line, st.table_col))
+            cs.where = _and_chain(cs, plain)
+            var tmc = Int(perf_counter_ns())
+            var rc = run_plain(catalog, cs^, run.text, planner, opts)
+            var cnt = Int(rc.table.get(0, 0))
+            if cnt < inner_rows:
+                var ps = clone_shell(st)
+                ps.wins = List[WinSpec]()
+                var sc0 = scope_of(st, catalog)
+                var pcols = _read_columns(st, sc0, 0)
+                var pexprs = List[Int]()
+                var pnames = List[String]()
+                var shown0 = _shown(st.table, st.table_alias)
+                for c in pcols:
+                    pexprs.append(column_node(ps, sc0.real[0][c], shown0, st.table_line, st.table_col))
+                    pnames.append(sc0.real[0][c])
+                set_items(ps, pexprs, pnames)
+                ps.where = _and_chain(ps, plain)
+                var rp = run_plain(catalog, ps^, run.text, planner, opts)
+                var np = register_result(run, catalog, rp, "__t")
+                run.steps.append("outer rows after the statement's filters: " + np + " (" + _commas(cnt) + " rows" + _took(tmc) + "), written first so that a subquery's table is cut to their keys")
+                st.table = np
+                st.table_alias = shown0
+                st.table_is_file = False
+                plain = List[Int]()
     var carried = String() if flattened else _shown(st.table, st.table_alias)
     var merge_last = True
     for it in st.items:
@@ -1051,6 +1466,8 @@ def run_stages[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: SqlS
             merge_last = False
     var stages = len(steps) - (1 if merge_last else 0)
     for i in range(stages):
+        run_pending(run, catalog, st, steps[i], String(st.table), planner, opts)
+        var tm1 = Int(perf_counter_ns())
         var stage = clone_shell(st)
         stage.wins = List[WinSpec]()
         var shown = _shown(st.table, st.table_alias)
@@ -1070,7 +1487,7 @@ def run_stages[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: SqlS
         var r = run_plain(catalog, stage^, run.text, planner, opts)
         var rows = r.table.rows()
         var nm = register_result(run, catalog, r, "__t")
-        run.steps.append("subquery step " + String(i + 1) + ": " + nm + " (" + _commas(rows) + " rows)")
+        run.steps.append("subquery step " + String(i + 1) + ": " + nm + " (" + _commas(rows) + " rows" + _took(tm1) + ")")
         st.table = nm
         st.table_alias = carried
     var rest = List[Int]()
@@ -1079,6 +1496,7 @@ def run_stages[P: Planner](mut run: QueryRun, mut catalog: Catalog, var st: SqlS
             rest.append(p)
     if merge_last:
         var last = len(steps) - 1
+        run_pending(run, catalog, st, steps[last], String(st.table), planner, opts)
         rest.append(steps[last].conj)
         if steps[last].d.byte_length() > 0:
             st.has_right = True

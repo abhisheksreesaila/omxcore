@@ -30,7 +30,7 @@ from .bind import (BoundQuery, BExpr, B_WLIT, B_DIV, B_I2F, B_FDIV, B_FMOD, B_LE
                    B_IDIV, B_IMOD, B_NEG, B_RESCALE, B_CMP, B_AND, B_OR, B_NOT, B_ISNULL, B_IN, C_LT, C_GE, C_LE, C_GT, C_EQ,
                    C_NE, F_SUM, F_MIN, F_MAX, F_AVG, pow10_checked,
                    B_STR, B_CASE, B_COALESCE, B_DISTINCT, B_CAST, B_DATEPART, B_DATETRUNC, B_ADDMONTHS, B_DATEDIFF, B_BOOLIS, B_TFN, B_CONCAT, B_QBIN, DERIVED_BASE)
-from .sqlfn import (TFn, CaseTables, parse_text, reverse_is_exact, date_text, decimal_text, date_part, date_trunc_days, add_months, date_diff_days, TF_LOWER, TF_UPPER, TF_LIKE, TF_REVERSE, DP_YEAR, DP_MONTH, DP_DAY, DP_DOW, DP_ISODOW, DP_DOY, DP_QUARTER, DP_EPOCH,
+from .sqlfn import (TFn, CaseTables, parse_text, reverse_is_exact, date_text, decimal_text, date_part, date_trunc_days, add_months, date_diff_days, TF_LOWER, TF_UPPER, TF_LIKE, TF_REVERSE, TF_SUBSTR, TF_TRIM, TF_LEFT, TF_RIGHT, TF_REPLACE, DP_YEAR, DP_MONTH, DP_DAY, DP_DOW, DP_ISODOW, DP_DOY, DP_QUARTER, DP_EPOCH,
                     DP_DECADE, DP_WEEK, DP_ISOYEAR, DP_CENTURY, DP_MILLENNIUM)
 from .planner import PhysicalPlan, G_DENSE, G_HASHED
 
@@ -295,6 +295,63 @@ def _words_bool(t: TFn, base: Int, nbase: Int, extra: Int, nextra: Int, out_addr
         par_n(work, tasks, tasks)
 
 
+def _words_text(t: TFn, base: Int, nbase: Int, extra: Int, nextra: Int, out_addr: Int) -> List[String]:
+    """The words a text function answers over a dictionary (each once, in the order they first come) and out[k] = the code of word k's answer. In parallel: every
+    task answers its own run of words into a dictionary of its own, then the runs' dictionaries are merged in order, so the result is the one a single loop makes."""
+    var n = nbase + nextra
+    var tasks = max(1, min(core_count(), n // 16384))
+    var parts = List[List[String]]()
+    for _ in range(tasks):
+        parts.append(List[String]())
+    var parts_addr = Int(parts.unsafe_ptr())
+
+    def work(i: Int) {imm}:
+        var a = n * i // tasks
+        var b = n * (i + 1) // tasks
+        var bp = UnsafePointer[String, MutAnyOrigin](unsafe_from_address=base)
+        var ep = UnsafePointer[String, MutAnyOrigin](unsafe_from_address=extra)
+        var outp = UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=out_addr)
+        var pp = UnsafePointer[List[String], MutAnyOrigin](unsafe_from_address=parts_addr)
+        var seen = Dict[String, Int]()
+        var words = List[String]()
+        for k in range(a, b):
+            var w: String
+            if k < nbase:
+                w = t.to_text(bp[k])
+            else:
+                w = t.to_text(ep[k - nbase])
+            var hit = seen.get(w)
+            if hit:
+                outp[k] = Int64(hit.value())
+            else:
+                seen[w] = len(words)
+                outp[k] = Int64(len(words))
+                words.append(w)
+        pp[i] = words^
+
+    if tasks == 1:
+        work(0)
+    else:
+        par_n(work, tasks, tasks)
+    _ = parts.unsafe_ptr()                                          # (the list lives to here: the tasks wrote through its address)
+    var words = List[String]()
+    var seen = Dict[String, Int]()
+    var outp = UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=out_addr)
+    for i in range(tasks):
+        var map = List[Int](length=len(parts[i]), fill=0)
+        for j in range(len(parts[i])):
+            var hit = seen.get(parts[i][j])
+            if hit:
+                map[j] = hit.value()
+            else:
+                seen[parts[i][j]] = len(words)
+                map[j] = len(words)
+                words.append(parts[i][j])
+        for k in range(n * i // tasks, n * (i + 1) // tasks):
+            outp[k] = Int64(map[Int(outp[k])])
+    return words^
+
+
 def _words_int(t: TFn, base: Int, nbase: Int, extra: Int, nextra: Int, out_addr: Int):
     """out[k] = the integer the text function (length, strpos) answers for word k, in parallel over the words."""
     var n = nbase + nextra
@@ -359,6 +416,7 @@ struct _Emitter(Movable):
     var case_tabs: Optional[CaseTables]
     var ents: Dict[Int, List[Int64]]     # F-156: per derived TEXT / INT node, its per-word table (code or answer per code of the dictionary it reads)
     var undecided: Dict[Int, List[UInt8]]    # ... and per node whose function DuckDB does not answer by code points (reverse), the words it is not decided for
+    var tsig: Dict[String, Int]          # a text function's signature (function, arguments, the dictionary it reads) -> the node that made its table (the same call written twice is answered once)
     var unions: Dict[Int, TextUnion]     # ... and per CASE / COALESCE over words, its dictionary
     var guard: Int                   # F-156: the register that says where the expression being emitted is live (a CASE branch), -1 for everywhere
 
@@ -367,6 +425,7 @@ struct _Emitter(Movable):
         self.case_tabs = None
         self.ents = Dict[Int, List[Int64]]()
         self.undecided = Dict[Int, List[UInt8]]()
+        self.tsig = Dict[String, Int]()
         self.unions = Dict[Int, TextUnion]()
         self.guard = -1
         self.p = p^
@@ -682,12 +741,28 @@ struct _Emitter(Movable):
             var t = self.make_tfn(x)
             var d = self.rx[x.a].src
             var n = self.dicts.count(d)
+            var sig = String(t.func) + "|" + String(t.flags) + "|" + String(d) + "|" + String(n)
+            for q in t.strs:
+                sig += "|s" + String(q.byte_length()) + ":" + q
+            for q in t.ints:
+                sig += "|i" + String(q)
+            var prior = self.tsig.get(sig)
+            if prior and prior.value() in self.ents and prior.value() not in self.undecided:      # the same call answered before: its table and its words
+                var e1 = prior.value()
+                self.derive_words(e, self.dicts.store[].words[self.rx[e1].src - DERIVED_BASE].copy())
+                self.ents[e] = self.ents[e1].copy()
+                return
             var ents = List[Int64](length=n, fill=0)
             var words = List[String]()
+            var parallel = t.func == TF_SUBSTR or t.func == TF_TRIM or t.func == TF_LEFT or t.func == TF_RIGHT or t.func == TF_REPLACE
+            if parallel:
+                var wp = self.dicts.word_ptrs(d)
+                words = _words_text(t, wp[0], wp[1], wp[2], wp[3], Int(ents.unsafe_ptr()))
+                _ = ents.unsafe_ptr()
             var seen = Dict[String, Int]()
             var unk = List[UInt8](length=max(n, 1), fill=0)
             var any_unk = False
-            for k in range(n):
+            for k in range(n if not parallel else 0):
                 var src_word = self.dicts.word(d, k)
                 if t.func == TF_REVERSE and not reverse_is_exact(src_word):
                     unk[k] = 1
@@ -702,6 +777,7 @@ struct _Emitter(Movable):
                     words.append(w)
             self.derive_words(e, words^)
             self.ents[e] = ents^
+            self.tsig[sig] = e
             if any_unk:
                 self.undecided[e] = unk^
             self.p.text_tabs += 1
