@@ -1697,8 +1697,13 @@ Needs: F-155 · Size: L · engine-first; F-058's losses are joins
 
 - Review: PASS (round expansion counts each partner once, LEFT unmatched once, NULL keys, morsel bound, no weakened tests, kernel hashes match). Minor, open: the outer-join / join tests pick the expected path by SQL text (`"count(" in sql`); give the parametrization an explicit path field.
 
-## F-199 `mojo/tests/test_views.mojo` segfaults about 3 runs in 150 (String._add in a job thread) [todo] (found 2026-11-05 by the F-161 developer, on main after F-160)
-- [ ] find the race (F-160's shared view cache behind a spin lock, `two_jobs_share_the_cache`, or the job thread's string notes) and fix the cause; test_views passes 300 runs in a row
+## F-199 `mojo/tests/test_views.mojo` segfaults about 3 runs in 150 (String._add in a job thread) [done 2026-11-05] (found 2026-11-05 by the F-161 developer, on main after F-160)
+- [x] find the race (F-160's shared view cache behind a spin lock, `two_jobs_share_the_cache`, or the job thread's string notes) and fix the cause; test_views passes 300 runs in a row
+- Built: `ResultCache`'s entries and counters were plain fields changed through `mut self` by two job threads under a spin lock; the compiler may keep them in registers across the lock (a no-SQL repro crashed ~6%). The guarded state now lives in a heap block reached through a pointer taken after the lock (as job.mojo / fan.mojo do); lessons line. Test `two_jobs_share_the_cache_round_after_round` (400 rounds: old engine fails 54/60, new 0); 300 serial + 12x100 parallel runs, 0 crashes.
+- Review: PASS. Follow-up F-200.
+
+## F-200 `parquet.mojo` `ensure_words` changes plain fields through a `ref` under a hand-made lock (the F-199 pattern) [todo] (F-199 review, 2026-11-05)
+- [ ] `info.dicts` / `info.widx` behind `build_lock` (parquet.mojo ~2894): move the guarded state behind a pointer taken after the lock, or prove it safe with a many-round two-thread test
 
 ## F-162 M8 gate: TPC-H 22 and the random suite through `mx sql` equal DuckDB [todo]
 - Harness built 2026-10-28 (review PASS): `tests/test_mx_tpch_gate.py` (22 queries through `mx sql`, a gap xfails only with its exact engine error), `tests/test_mx_random_gate.py` (80 seeds), `scripts/gate_scoreboard.py` (quiet-night timing, `--stream never`, median of 3 fresh processes, failures count as losses), `docs/bench/f162-coverage.md`. On main: 8/22 equal DuckDB, 80/80 random; the 14 gaps are F-159 shapes, Q16 / Q21 (subquery beside a join, two subqueries), Q14 (F-190). `mx sql --device gpu|auto` runs the CPU (F-191).
