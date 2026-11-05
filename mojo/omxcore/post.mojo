@@ -167,8 +167,13 @@ def _run_post(q: BoundQuery, keys: List[ValCol], aggs: List[ValCol], dicts: Dict
         for o in range(len(q2.routs)):
             var node = q2.routs[o]
             if q2.rexprs[node].op == B_COL and q2.rexprs[node].kind == TEXT.value and Int(q2.rexprs[node].value) < nk and _refs_of(q2, node) == 1:
-                lazy[o] = Int(q2.rexprs[node].value)
-                n_lazy += 1
+                var readers = 0                                      # (another node reading the same key, such as ORDER BY's own, makes it needed)
+                for i in range(len(q2.rexprs)):
+                    if q2.rexprs[i].op == B_COL and q2.rexprs[i].value == q2.rexprs[node].value:
+                        readers += 1
+                if readers == 1:
+                    lazy[o] = Int(q2.rexprs[node].value)
+                    n_lazy += 1
     var is_lazy_key = List[Bool](length=nk, fill=False)
     for o in range(len(lazy)):
         if lazy[o] >= 0:

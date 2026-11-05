@@ -1684,6 +1684,39 @@ def _ndv_after_filter(l: _Leaf, ndv: Int) -> Int:
     return max(1, min(ndv, Int(keep + 0.5)))
 
 
+def _read_filtered_reduced[P: Planner](mut catalog: Catalog, q: BoundQuery, t: Int, mut leaves: List[_Leaf], cur_table: SharedTable, lkey: List[Int], rkey: List[Int],
+                                       planner: P, opts: PlannerOptions, trust: Bool, mut res: SqlResult) raises:
+    """F-202: a counted leaf read filtered when the rows joined so far (`cur_table`, joined to it on `lkey` / `rkey`) are known: the leaf's rows with a partner
+    among them are marked first (a presence probe over its key column, the join's own hash table), and the filter runs over the marked rows only. A leaf
+    whose partners are most of it is read plainly."""
+    var t_m = perf_counter_ns()
+    var keys = JoinKeys()
+    normalize_keys(cur_table, leaves[t].table, lkey, rkey, keys, opts.threads)
+    var n = leaves[t].table.rows()
+    if not keys.verify and cur_table.rows() > 0:
+        var m = hj_build(keys.bk_addr, keys.bo_addr, cur_table.rows(), opts.threads)
+        var pick = select_rows(m, keys, n, PM_SEMI, opts.threads)
+        if pick.n * 2 < n:
+            var mask = List[UInt8](length=(n + 7) // 8 + 8, fill=0)
+            var rows = Pointer[Int32, MutUntrackedOrigin](unsafe_from_address=pick.probe_a)
+            for i in range(pick.n):
+                var r = Int(rows[i])
+                mask[r >> 3] |= UInt8(1) << UInt8(r & 7)
+            var src = q.sources[t]
+            catalog.sources[src].overlay.mask = mask^
+            var before = pick.n
+            try:
+                _read_filtered[P](catalog, q, t, leaves, planner, opts, trust, res)
+            except e:
+                catalog.sources[src].overlay.mask = List[UInt8]()
+                raise e^
+            catalog.sources[src].overlay.mask = List[UInt8]()
+            res.notes.append("runtime join filter: " + _label(q, t) + " is read only where its key has a partner among the " + commas(cur_table.rows()) + " rows joined so far (" + commas(before) + " of " + commas(n) + " rows), " +
+                             _ms(Float64(perf_counter_ns() - t_m) / 1e6) + " ms")
+            return
+    _read_filtered[P](catalog, q, t, leaves, planner, opts, trust, res)
+
+
 def _copy_leaf(l: _Leaf) -> _Leaf:
     return _Leaf(l.table, l.cols.copy(), l.gcols.copy(), l.gtable.copy(), l.rows, l.base_rows, l.deferred, l.streamed)
 
@@ -2043,8 +2076,12 @@ def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPl
                 break
     # a leaf that was only counted is read filtered now, unless it is the last join's probe side (its filter then runs in that join's pipeline)
     var last_leaf = jp.steps[len(jp.steps) - 1].leaf
+    var lazy = List[Bool](length=n, fill=False)                  # F-202: read when its step comes, from the rows joined by then (`_read_filtered_reduced`)
+    for j in range(len(jp.steps) - 1):
+        if j < (star_s0 if star_s0 >= 0 else len(jp.steps) - 1) and jp.steps[j].leaf != jp.start and not leaves[jp.steps[j].leaf].streamed:
+            lazy[jp.steps[j].leaf] = True
     for t in range(n):
-        if leaves[t].deferred and not (t == last_leaf and not jp.steps[len(jp.steps) - 1].build_new) and not (t == jp.start and star_s0 == 0):
+        if leaves[t].deferred and not lazy[t] and not (t == last_leaf and not jp.steps[len(jp.steps) - 1].build_new) and not (t == jp.start and star_s0 == 0):
             _read_filtered[P](catalog, q, t, leaves, planner, opts, trust, res)
     # the steps
     var done = List[Bool](length=len(q.resid), fill=False)
@@ -2091,6 +2128,21 @@ def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPl
         var t_step = perf_counter_ns()
         ref step = jp.steps[si]
         var lf = step.leaf
+        if leaves[lf].deferred:
+            var rk = List[Int]()
+            var lk = List[Int]()
+            for k in range(len(q.edge_a)):
+                var ga = q.edge_a[k]
+                var gb = q.edge_b[k]
+                var ta = table_of_column(q, ga)
+                var tb = table_of_column(q, gb)
+                if ta == lf and (joined >> tb) & 1 != 0:
+                    lk.append(cur_pos[_position(cur_g, gb)])
+                    rk.append(leaves[lf].cols[_position(leaves[lf].gcols, ga)])
+                elif tb == lf and (joined >> ta) & 1 != 0:
+                    lk.append(cur_pos[_position(cur_g, ga)])
+                    rk.append(leaves[lf].cols[_position(leaves[lf].gcols, gb)])
+            _read_filtered_reduced[P](catalog, q, lf, leaves, cur_table, lk, rk, planner, opts, trust, res)
         var after = joined | (1 << lf)
         var keep = needed_after(q, after, done)
         var lkey = List[Int]()
