@@ -1,0 +1,1202 @@
+{
+ "SF1/Q1": {
+  "sql": "SELECT\n    l_returnflag,\n    l_linestatus,\n    sum(l_quantity) AS sum_qty,\n    sum(l_extendedprice) AS sum_base_price,\n    sum(l_extendedprice * (1 - l_discount)) AS sum_disc_price,\n    sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,\n    avg(l_quantity) AS avg_qty,\n    avg(l_extendedprice) AS avg_price,\n    avg(l_discount) AS avg_disc,\n    count(*) AS count_order\nFROM\n    lineitem\nWHERE\n    l_shipdate <= CAST('1998-09-02' AS date)\nGROUP BY\n    l_returnflag,\n    l_linestatus\nORDER BY\n    l_returnflag,\n    l_linestatus",
+  "tables": [
+   "lineitem"
+  ],
+  "duckdb": {
+   "ms": [
+    20.154361001914367,
+    19.442124001216143,
+    18.379977002041414
+   ],
+   "device_note": "",
+   "rows": 4
+  },
+  "cpu": {
+   "ms": [
+    16.100145,
+    16.407454,
+    16.382194
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 4,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q2": {
+  "sql": "SELECT\n    s_acctbal,\n    s_name,\n    n_name,\n    p_partkey,\n    p_mfgr,\n    s_address,\n    s_phone,\n    s_comment\nFROM\n    part,\n    supplier,\n    partsupp,\n    nation,\n    region\nWHERE\n    p_partkey = ps_partkey\n    AND s_suppkey = ps_suppkey\n    AND p_size = 15\n    AND p_type LIKE '%BRASS'\n    AND s_nationkey = n_nationkey\n    AND n_regionkey = r_regionkey\n    AND r_name = 'EUROPE'\n    AND ps_supplycost = (\n        SELECT\n            min(ps_supplycost)\n        FROM\n            partsupp,\n            supplier,\n            nation,\n            region\n        WHERE\n            p_partkey = ps_partkey\n            AND s_suppkey = ps_suppkey\n            AND s_nationkey = n_nationkey\n            AND n_regionkey = r_regionkey\n            AND r_name = 'EUROPE')\nORDER BY\n    s_acctbal DESC,\n    n_name,\n    s_name,\n    p_partkey\nLIMIT 100",
+  "tables": [
+   "nation",
+   "part",
+   "partsupp",
+   "region",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    16.96284199715592,
+    14.2490410071332,
+    14.112681004917249
+   ],
+   "device_note": "",
+   "rows": 100
+  },
+  "cpu": {
+   "ms": [
+    18.304587,
+    17.683829,
+    16.699122
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 100,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q3": {
+  "sql": "SELECT\n    l_orderkey,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue,\n    o_orderdate,\n    o_shippriority\nFROM\n    customer,\n    orders,\n    lineitem\nWHERE\n    c_mktsegment = 'BUILDING'\n    AND c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND o_orderdate < CAST('1995-03-15' AS date)\n    AND l_shipdate > CAST('1995-03-15' AS date)\nGROUP BY\n    l_orderkey,\n    o_orderdate,\n    o_shippriority\nORDER BY\n    revenue DESC,\n    o_orderdate\nLIMIT 10",
+  "tables": [
+   "customer",
+   "lineitem",
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    14.990718002081849,
+    14.776808995520696,
+    33.80000399192795
+   ],
+   "device_note": "",
+   "rows": 10
+  },
+  "cpu": {
+   "ms": [
+    31.73366,
+    34.039343,
+    86.701821
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 10,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q4": {
+  "sql": "SELECT\n    o_orderpriority,\n    count(*) AS order_count\nFROM\n    orders\nWHERE\n    o_orderdate >= CAST('1993-07-01' AS date)\n    AND o_orderdate < CAST('1993-10-01' AS date)\n    AND EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem\n        WHERE\n            l_orderkey = o_orderkey\n            AND l_commitdate < l_receiptdate)\nGROUP BY\n    o_orderpriority\nORDER BY\n    o_orderpriority",
+  "tables": [
+   "lineitem",
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    14.963907990022562,
+    16.016695008147508,
+    16.14229400001932
+   ],
+   "device_note": "",
+   "rows": 5
+  },
+  "cpu": {
+   "ms": [
+    36.249935,
+    41.105138,
+    40.005392
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 5,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q5": {
+  "sql": "SELECT\n    n_name,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue\nFROM\n    customer,\n    orders,\n    lineitem,\n    supplier,\n    nation,\n    region\nWHERE\n    c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND l_suppkey = s_suppkey\n    AND c_nationkey = s_nationkey\n    AND s_nationkey = n_nationkey\n    AND n_regionkey = r_regionkey\n    AND r_name = 'ASIA'\n    AND o_orderdate >= CAST('1994-01-01' AS date)\n    AND o_orderdate < CAST('1995-01-01' AS date)\nGROUP BY\n    n_name\nORDER BY\n    revenue DESC",
+  "tables": [
+   "customer",
+   "lineitem",
+   "nation",
+   "orders",
+   "region",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    14.06621199566871,
+    14.529839987517335,
+    13.55255399539601
+   ],
+   "device_note": "",
+   "rows": 5
+  },
+  "cpu": {
+   "ms": [
+    51.228124,
+    40.932419,
+    42.201095
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 5,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q6": {
+  "sql": "SELECT\n    sum(l_extendedprice * l_discount) AS revenue\nFROM\n    lineitem\nWHERE\n    l_shipdate >= CAST('1994-01-01' AS date)\n    AND l_shipdate < CAST('1995-01-01' AS date)\n    AND l_discount BETWEEN 0.05\n    AND 0.07\n    AND l_quantity < 24",
+  "tables": [
+   "lineitem"
+  ],
+  "duckdb": {
+   "ms": [
+    7.039794989395887,
+    6.459317010012455,
+    6.926775997271761
+   ],
+   "device_note": "",
+   "rows": 1
+  },
+  "cpu": {
+   "ms": [
+    11.739569,
+    10.999532,
+    12.063668
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 1,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q7": {
+  "sql": "SELECT\n    supp_nation,\n    cust_nation,\n    l_year,\n    sum(volume) AS revenue\nFROM (\n    SELECT\n        n1.n_name AS supp_nation,\n        n2.n_name AS cust_nation,\n        extract(year FROM l_shipdate) AS l_year,\n        l_extendedprice * (1 - l_discount) AS volume\n    FROM\n        supplier,\n        lineitem,\n        orders,\n        customer,\n        nation n1,\n        nation n2\n    WHERE\n        s_suppkey = l_suppkey\n        AND o_orderkey = l_orderkey\n        AND c_custkey = o_custkey\n        AND s_nationkey = n1.n_nationkey\n        AND c_nationkey = n2.n_nationkey\n        AND ((n1.n_name = 'FRANCE'\n                AND n2.n_name = 'GERMANY')\n            OR (n1.n_name = 'GERMANY'\n                AND n2.n_name = 'FRANCE'))\n        AND l_shipdate BETWEEN CAST('1995-01-01' AS date)\n        AND CAST('1996-12-31' AS date)) AS shipping\nGROUP BY\n    supp_nation,\n    cust_nation,\n    l_year\nORDER BY\n    supp_nation,\n    cust_nation,\n    l_year",
+  "tables": [
+   "customer",
+   "lineitem",
+   "nation",
+   "orders",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    20.468970004003495,
+    18.25411699246615,
+    16.664112990838476
+   ],
+   "device_note": "",
+   "rows": 4
+  },
+  "cpu": {
+   "ms": [
+    134.912164,
+    98.45663,
+    129.240314
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 4,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q8": {
+  "sql": "SELECT\n    o_year,\n    sum(\n        CASE WHEN nation = 'BRAZIL' THEN\n            volume\n        ELSE\n            0\n        END) / sum(volume) AS mkt_share\nFROM (\n    SELECT\n        extract(year FROM o_orderdate) AS o_year,\n        l_extendedprice * (1 - l_discount) AS volume,\n        n2.n_name AS nation\n    FROM\n        part,\n        supplier,\n        lineitem,\n        orders,\n        customer,\n        nation n1,\n        nation n2,\n        region\n    WHERE\n        p_partkey = l_partkey\n        AND s_suppkey = l_suppkey\n        AND l_orderkey = o_orderkey\n        AND o_custkey = c_custkey\n        AND c_nationkey = n1.n_nationkey\n        AND n1.n_regionkey = r_regionkey\n        AND r_name = 'AMERICA'\n        AND s_nationkey = n2.n_nationkey\n        AND o_orderdate BETWEEN CAST('1995-01-01' AS date)\n        AND CAST('1996-12-31' AS date)\n        AND p_type = 'ECONOMY ANODIZED STEEL') AS all_nations\nGROUP BY\n    o_year\nORDER BY\n    o_year",
+  "tables": [
+   "customer",
+   "lineitem",
+   "nation",
+   "orders",
+   "part",
+   "region",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    15.533047000644729,
+    16.61177301139105,
+    16.051934988354333
+   ],
+   "device_note": "",
+   "rows": 2
+  },
+  "cpu": {
+   "ms": [
+    32.11603,
+    32.431068,
+    32.864776
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 2,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q9": {
+  "sql": "SELECT\n    nation,\n    o_year,\n    sum(amount) AS sum_profit\nFROM (\n    SELECT\n        n_name AS nation,\n        extract(year FROM o_orderdate) AS o_year,\n        l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity AS amount\n    FROM\n        part,\n        supplier,\n        lineitem,\n        partsupp,\n        orders,\n        nation\n    WHERE\n        s_suppkey = l_suppkey\n        AND ps_suppkey = l_suppkey\n        AND ps_partkey = l_partkey\n        AND p_partkey = l_partkey\n        AND o_orderkey = l_orderkey\n        AND s_nationkey = n_nationkey\n        AND p_name LIKE '%green%') AS profit\nGROUP BY\n    nation,\n    o_year\nORDER BY\n    nation,\n    o_year DESC",
+  "tables": [
+   "lineitem",
+   "nation",
+   "orders",
+   "part",
+   "partsupp",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    61.864386007073335,
+    63.79791899234988,
+    61.48798800131772
+   ],
+   "device_note": "",
+   "rows": 175
+  },
+  "cpu": {
+   "ms": [
+    74.919031,
+    72.3021,
+    73.263157
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 175,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q10": {
+  "sql": "SELECT\n    c_custkey,\n    c_name,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue,\n    c_acctbal,\n    n_name,\n    c_address,\n    c_phone,\n    c_comment\nFROM\n    customer,\n    orders,\n    lineitem,\n    nation\nWHERE\n    c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND o_orderdate >= CAST('1993-10-01' AS date)\n    AND o_orderdate < CAST('1994-01-01' AS date)\n    AND l_returnflag = 'R'\n    AND c_nationkey = n_nationkey\nGROUP BY\n    c_custkey,\n    c_name,\n    c_acctbal,\n    c_phone,\n    n_name,\n    c_address,\n    c_comment\nORDER BY\n    revenue DESC\nLIMIT 20",
+  "tables": [
+   "customer",
+   "lineitem",
+   "nation",
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    34.60576999350451,
+    41.372046995093115,
+    40.612020005937666
+   ],
+   "device_note": "",
+   "rows": 20
+  },
+  "cpu": {
+   "ms": [
+    90.989195,
+    83.664521,
+    94.351083
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 20,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q11": {
+  "sql": "SELECT\n    ps_partkey,\n    sum(ps_supplycost * ps_availqty) AS value\nFROM\n    partsupp,\n    supplier,\n    nation\nWHERE\n    ps_suppkey = s_suppkey\n    AND s_nationkey = n_nationkey\n    AND n_name = 'GERMANY'\nGROUP BY\n    ps_partkey\nHAVING\n    sum(ps_supplycost * ps_availqty) > (\n        SELECT\n            sum(ps_supplycost * ps_availqty) * 0.0001000000\n        FROM\n            partsupp,\n            supplier,\n            nation\n        WHERE\n            ps_suppkey = s_suppkey\n            AND s_nationkey = n_nationkey\n            AND n_name = 'GERMANY')\nORDER BY\n    value DESC",
+  "tables": [
+   "nation",
+   "partsupp",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    6.958087004022673,
+    7.450153992976993,
+    7.095764987752773
+   ],
+   "device_note": "",
+   "rows": 1048
+  },
+  "cpu": {
+   "ms": [
+    23.390559,
+    34.66179,
+    17.515889
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 1048,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q12": {
+  "sql": "SELECT\n    l_shipmode,\n    sum(\n        CASE WHEN o_orderpriority = '1-URGENT'\n            OR o_orderpriority = '2-HIGH' THEN\n            1\n        ELSE\n            0\n        END) AS high_line_count,\n    sum(\n        CASE WHEN o_orderpriority <> '1-URGENT'\n            AND o_orderpriority <> '2-HIGH' THEN\n            1\n        ELSE\n            0\n        END) AS low_line_count\nFROM\n    orders,\n    lineitem\nWHERE\n    o_orderkey = l_orderkey\n    AND l_shipmode IN ('MAIL', 'SHIP')\n    AND l_commitdate < l_receiptdate\n    AND l_shipdate < l_commitdate\n    AND l_receiptdate >= CAST('1994-01-01' AS date)\n    AND l_receiptdate < CAST('1995-01-01' AS date)\nGROUP BY\n    l_shipmode\nORDER BY\n    l_shipmode",
+  "tables": [
+   "lineitem",
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    14.84308899671305,
+    14.756729011423886,
+    14.819758987869136
+   ],
+   "device_note": "",
+   "rows": 2
+  },
+  "cpu": {
+   "ms": [
+    32.580308,
+    36.892782,
+    100.89614
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 2,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q13": {
+  "sql": "SELECT\n    c_count,\n    count(*) AS custdist\nFROM (\n    SELECT\n        c_custkey,\n        count(o_orderkey)\n    FROM\n        customer\n    LEFT OUTER JOIN orders ON c_custkey = o_custkey\n    AND o_comment NOT LIKE '%special%requests%'\nGROUP BY\n    c_custkey) AS c_orders (c_custkey,\n        c_count)\nGROUP BY\n    c_count\nORDER BY\n    custdist DESC,\n    c_count DESC",
+  "tables": [
+   "customer",
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    36.75494299386628,
+    31.845639998209663,
+    31.109092000406235
+   ],
+   "device_note": "",
+   "rows": 42
+  },
+  "cpu": {
+   "ms": [
+    111.972072,
+    114.815162,
+    115.2459
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 42,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q14": {
+  "sql": "SELECT\n    100.00 * sum(\n        CASE WHEN p_type LIKE 'PROMO%' THEN\n            l_extendedprice * (1 - l_discount)\n        ELSE\n            0\n        END) / sum(l_extendedprice * (1 - l_discount)) AS promo_revenue\nFROM\n    lineitem,\n    part\nWHERE\n    l_partkey = p_partkey\n    AND l_shipdate >= date '1995-09-01'\n    AND l_shipdate < CAST('1995-10-01' AS date)",
+  "tables": [
+   "lineitem",
+   "part"
+  ],
+  "duckdb": {
+   "ms": [
+    15.219296998111531,
+    15.888355002971366,
+    15.686364989960566
+   ],
+   "device_note": "",
+   "rows": 1
+  },
+  "cpu": {
+   "ms": [
+    13.993261,
+    14.61285,
+    14.663879
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 1,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q15": {
+  "sql": "WITH revenue AS (\n    SELECT\n        l_suppkey AS supplier_no,\n        sum(l_extendedprice * (1 - l_discount)) AS total_revenue\n    FROM\n        lineitem\n    WHERE\n        l_shipdate >= CAST('1996-01-01' AS date)\n      AND l_shipdate < CAST('1996-04-01' AS date)\n    GROUP BY\n        supplier_no\n)\nSELECT\n    s_suppkey,\n    s_name,\n    s_address,\n    s_phone,\n    total_revenue\nFROM\n    supplier,\n    revenue\nWHERE\n    s_suppkey = supplier_no\n    AND total_revenue = (\n        SELECT\n            max(total_revenue)\n        FROM revenue)\nORDER BY\n    s_suppkey",
+  "tables": [
+   "lineitem",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    12.554686007206328,
+    9.16287800646387,
+    11.02418199297972
+   ],
+   "device_note": "",
+   "rows": 1
+  },
+  "cpu": {
+   "ms": [
+    9.079318,
+    8.246382,
+    8.316991
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 1,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q16": {
+  "sql": "SELECT\n    p_brand,\n    p_type,\n    p_size,\n    count(DISTINCT ps_suppkey) AS supplier_cnt\nFROM\n    partsupp,\n    part\nWHERE\n    p_partkey = ps_partkey\n    AND p_brand <> 'Brand#45'\n    AND p_type NOT LIKE 'MEDIUM POLISHED%'\n    AND p_size IN (49, 14, 23, 45, 19, 3, 36, 9)\n    AND ps_suppkey NOT IN (\n        SELECT\n            s_suppkey\n        FROM\n            supplier\n        WHERE\n            s_comment LIKE '%Customer%Complaints%')\nGROUP BY\n    p_brand,\n    p_type,\n    p_size\nORDER BY\n    supplier_cnt DESC,\n    p_brand,\n    p_type,\n    p_size",
+  "tables": [
+   "part",
+   "partsupp",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    28.40719099913258,
+    29.30038901104126,
+    42.03515399422031
+   ],
+   "device_note": "",
+   "rows": 18314
+  },
+  "cpu": {
+   "ms": [
+    32.957076,
+    28.73855,
+    27.849223
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 18314,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q17": {
+  "sql": "SELECT\n    sum(l_extendedprice) / 7.0 AS avg_yearly\nFROM\n    lineitem,\n    part\nWHERE\n    p_partkey = l_partkey\n    AND p_brand = 'Brand#23'\n    AND p_container = 'MED BOX'\n    AND l_quantity < (\n        SELECT\n            0.2 * avg(l_quantity)\n        FROM\n            lineitem\n        WHERE\n            l_partkey = p_partkey)",
+  "tables": [
+   "lineitem",
+   "part"
+  ],
+  "duckdb": {
+   "ms": [
+    17.88972799840849,
+    16.516121992026456,
+    21.516235996386968
+   ],
+   "device_note": "",
+   "rows": 1
+  },
+  "cpu": {
+   "ms": [
+    58.575097,
+    47.700824,
+    63.31639
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 1,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q18": {
+  "sql": "SELECT\n    c_name,\n    c_custkey,\n    o_orderkey,\n    o_orderdate,\n    o_totalprice,\n    sum(l_quantity)\nFROM\n    customer,\n    orders,\n    lineitem\nWHERE\n    o_orderkey IN (\n        SELECT\n            l_orderkey\n        FROM\n            lineitem\n        GROUP BY\n            l_orderkey\n        HAVING\n            sum(l_quantity) > 300)\n    AND c_custkey = o_custkey\n    AND o_orderkey = l_orderkey\nGROUP BY\n    c_name,\n    c_custkey,\n    o_orderkey,\n    o_orderdate,\n    o_totalprice\nORDER BY\n    o_totalprice DESC,\n    o_orderdate\nLIMIT 100",
+  "tables": [
+   "customer",
+   "lineitem",
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    44.68186499434523,
+    47.49823600286618,
+    45.81015100120567
+   ],
+   "device_note": "",
+   "rows": 57
+  },
+  "cpu": {
+   "ms": [
+    672.468636,
+    684.476105,
+    670.576242
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 57,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q19": {
+  "sql": "SELECT\n    sum(l_extendedprice * (1 - l_discount)) AS revenue\nFROM\n    lineitem,\n    part\nWHERE (p_partkey = l_partkey\n    AND p_brand = 'Brand#12'\n    AND p_container IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG')\n    AND l_quantity >= 1\n    AND l_quantity <= 1 + 10\n    AND p_size BETWEEN 1 AND 5\n    AND l_shipmode IN ('AIR', 'AIR REG')\n    AND l_shipinstruct = 'DELIVER IN PERSON')\n    OR (p_partkey = l_partkey\n        AND p_brand = 'Brand#23'\n        AND p_container IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK')\n        AND l_quantity >= 10\n        AND l_quantity <= 10 + 10\n        AND p_size BETWEEN 1 AND 10\n        AND l_shipmode IN ('AIR', 'AIR REG')\n        AND l_shipinstruct = 'DELIVER IN PERSON')\n    OR (p_partkey = l_partkey\n        AND p_brand = 'Brand#34'\n        AND p_container IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG')\n        AND l_quantity >= 20\n        AND l_quantity <= 20 + 10\n        AND p_size BETWEEN 1 AND 15\n        AND l_shipmode IN ('AIR', 'AIR REG')\n        AND l_shipinstruct = 'DELIVER IN PERSON')",
+  "tables": [
+   "lineitem",
+   "part"
+  ],
+  "duckdb": {
+   "ms": [
+    26.529618000495248,
+    26.876877003815025,
+    30.14502499718219
+   ],
+   "device_note": "",
+   "rows": 1
+  },
+  "cpu": {
+   "ms": [
+    27.139295,
+    317.345418,
+    26.621838
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 1,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q20": {
+  "sql": "SELECT\n    s_name,\n    s_address\nFROM\n    supplier,\n    nation\nWHERE\n    s_suppkey IN (\n        SELECT\n            ps_suppkey\n        FROM\n            partsupp\n        WHERE\n            ps_partkey IN (\n                SELECT\n                    p_partkey\n                FROM\n                    part\n                WHERE\n                    p_name LIKE 'forest%')\n                AND ps_availqty > (\n                    SELECT\n                        0.5 * sum(l_quantity)\n                    FROM\n                        lineitem\n                    WHERE\n                        l_partkey = ps_partkey\n                        AND l_suppkey = ps_suppkey\n                        AND l_shipdate >= CAST('1994-01-01' AS date)\n                        AND l_shipdate < CAST('1995-01-01' AS date)))\n            AND s_nationkey = n_nationkey\n            AND n_name = 'CANADA'\n        ORDER BY\n            s_name",
+  "tables": [
+   "lineitem",
+   "nation",
+   "part",
+   "partsupp",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    16.459103004308417,
+    14.625198993599042,
+    18.364796007517725
+   ],
+   "device_note": "",
+   "rows": 186
+  },
+  "cpu": {
+   "ms": [
+    75.370888,
+    77.504371,
+    76.300595
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 186,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q21": {
+  "sql": "SELECT\n    s_name,\n    count(*) AS numwait\nFROM\n    supplier,\n    lineitem l1,\n    orders,\n    nation\nWHERE\n    s_suppkey = l1.l_suppkey\n    AND o_orderkey = l1.l_orderkey\n    AND o_orderstatus = 'F'\n    AND l1.l_receiptdate > l1.l_commitdate\n    AND EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem l2\n        WHERE\n            l2.l_orderkey = l1.l_orderkey\n            AND l2.l_suppkey <> l1.l_suppkey)\n    AND NOT EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem l3\n        WHERE\n            l3.l_orderkey = l1.l_orderkey\n            AND l3.l_suppkey <> l1.l_suppkey\n            AND l3.l_receiptdate > l3.l_commitdate)\n    AND s_nationkey = n_nationkey\n    AND n_name = 'SAUDI ARABIA'\nGROUP BY\n    s_name\nORDER BY\n    numwait DESC,\n    s_name\nLIMIT 100",
+  "tables": [
+   "lineitem",
+   "nation",
+   "orders",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    74.66348999878392,
+    60.137591004604474,
+    65.29866300115827
+   ],
+   "device_note": "",
+   "rows": 100
+  },
+  "cpu": {
+   "ms": [
+    398.872024,
+    429.155458,
+    398.168495
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 100,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q22": {
+  "sql": "SELECT\n    cntrycode,\n    count(*) AS numcust,\n    sum(c_acctbal) AS totacctbal\nFROM (\n    SELECT\n        substring(c_phone FROM 1 FOR 2) AS cntrycode,\n        c_acctbal\n    FROM\n        customer\n    WHERE\n        substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17')\n        AND c_acctbal > (\n            SELECT\n                avg(c_acctbal)\n            FROM\n                customer\n            WHERE\n                c_acctbal > 0.00\n                AND substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17'))\n            AND NOT EXISTS (\n                SELECT\n                    *\n                FROM\n                    orders\n                WHERE\n                    o_custkey = c_custkey)) AS custsale\nGROUP BY\n    cntrycode\nORDER BY\n    cntrycode",
+  "tables": [
+   "customer",
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    17.524378999951296,
+    17.628298999625258,
+    16.875601009815
+   ],
+   "device_note": "",
+   "rows": 7
+  },
+  "cpu": {
+   "ms": [
+    149.073622,
+    152.41537,
+    150.303207
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 7,
+   "verdict": "equal"
+  }
+ },
+ "SF10/Q1": {
+  "sql": "SELECT\n    l_returnflag,\n    l_linestatus,\n    sum(l_quantity) AS sum_qty,\n    sum(l_extendedprice) AS sum_base_price,\n    sum(l_extendedprice * (1 - l_discount)) AS sum_disc_price,\n    sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,\n    avg(l_quantity) AS avg_qty,\n    avg(l_extendedprice) AS avg_price,\n    avg(l_discount) AS avg_disc,\n    count(*) AS count_order\nFROM\n    lineitem\nWHERE\n    l_shipdate <= CAST('1998-09-02' AS date)\nGROUP BY\n    l_returnflag,\n    l_linestatus\nORDER BY\n    l_returnflag,\n    l_linestatus",
+  "tables": [
+   "lineitem"
+  ],
+  "duckdb": {
+   "ms": [
+    171.00160400150344,
+    154.95701000327244,
+    152.0855700073298
+   ],
+   "device_note": "",
+   "rows": 4
+  },
+  "cpu": {
+   "ms": [
+    156.467184,
+    160.40498,
+    157.854309
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 4,
+   "verdict": "equal"
+  }
+ },
+ "SF10/Q2": {
+  "sql": "SELECT\n    s_acctbal,\n    s_name,\n    n_name,\n    p_partkey,\n    p_mfgr,\n    s_address,\n    s_phone,\n    s_comment\nFROM\n    part,\n    supplier,\n    partsupp,\n    nation,\n    region\nWHERE\n    p_partkey = ps_partkey\n    AND s_suppkey = ps_suppkey\n    AND p_size = 15\n    AND p_type LIKE '%BRASS'\n    AND s_nationkey = n_nationkey\n    AND n_regionkey = r_regionkey\n    AND r_name = 'EUROPE'\n    AND ps_supplycost = (\n        SELECT\n            min(ps_supplycost)\n        FROM\n            partsupp,\n            supplier,\n            nation,\n            region\n        WHERE\n            p_partkey = ps_partkey\n            AND s_suppkey = ps_suppkey\n            AND s_nationkey = n_nationkey\n            AND n_regionkey = r_regionkey\n            AND r_name = 'EUROPE')\nORDER BY\n    s_acctbal DESC,\n    n_name,\n    s_name,\n    p_partkey\nLIMIT 100",
+  "tables": [
+   "nation",
+   "part",
+   "partsupp",
+   "region",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    29.01059901341796,
+    30.414563007070683,
+    34.89269800775219
+   ],
+   "device_note": "",
+   "rows": 100
+  },
+  "cpu": {
+   "ms": [
+    138.149867,
+    142.106053,
+    137.162411
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 100,
+   "verdict": "equal"
+  }
+ },
+ "SF10/Q3": {
+  "sql": "SELECT\n    l_orderkey,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue,\n    o_orderdate,\n    o_shippriority\nFROM\n    customer,\n    orders,\n    lineitem\nWHERE\n    c_mktsegment = 'BUILDING'\n    AND c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND o_orderdate < CAST('1995-03-15' AS date)\n    AND l_shipdate > CAST('1995-03-15' AS date)\nGROUP BY\n    l_orderkey,\n    o_orderdate,\n    o_shippriority\nORDER BY\n    revenue DESC,\n    o_orderdate\nLIMIT 10",
+  "tables": [
+   "customer",
+   "lineitem",
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    101.05665698938537,
+    95.2300280041527,
+    105.30521199689247
+   ],
+   "device_note": "",
+   "rows": 10
+  },
+  "cpu": {
+   "ms": [
+    332.207458,
+    327.152284,
+    312.821035
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 10,
+   "verdict": "equal"
+  }
+ },
+ "SF10/Q4": {
+  "sql": "SELECT\n    o_orderpriority,\n    count(*) AS order_count\nFROM\n    orders\nWHERE\n    o_orderdate >= CAST('1993-07-01' AS date)\n    AND o_orderdate < CAST('1993-10-01' AS date)\n    AND EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem\n        WHERE\n            l_orderkey = o_orderkey\n            AND l_commitdate < l_receiptdate)\nGROUP BY\n    o_orderpriority\nORDER BY\n    o_orderpriority",
+  "tables": [
+   "lineitem",
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    115.01358699752018,
+    117.28630900324788,
+    109.56893599359319
+   ],
+   "device_note": "",
+   "rows": 5
+  },
+  "cpu": {
+   "ms": [
+    490.040483,
+    483.620714,
+    494.439866
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 5,
+   "verdict": "equal"
+  }
+ },
+ "SF10/Q5": {
+  "sql": "SELECT\n    n_name,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue\nFROM\n    customer,\n    orders,\n    lineitem,\n    supplier,\n    nation,\n    region\nWHERE\n    c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND l_suppkey = s_suppkey\n    AND c_nationkey = s_nationkey\n    AND s_nationkey = n_nationkey\n    AND n_regionkey = r_regionkey\n    AND r_name = 'ASIA'\n    AND o_orderdate >= CAST('1994-01-01' AS date)\n    AND o_orderdate < CAST('1995-01-01' AS date)\nGROUP BY\n    n_name\nORDER BY\n    revenue DESC",
+  "tables": [
+   "customer",
+   "lineitem",
+   "nation",
+   "orders",
+   "region",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    77.96342599613126,
+    78.83257299545221,
+    78.98792299965862
+   ],
+   "device_note": "",
+   "rows": 5
+  },
+  "cpu": {
+   "ms": [
+    484.790349,
+    551.145735,
+    887.289214
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 5,
+   "verdict": "equal"
+  }
+ },
+ "SF10/Q6": {
+  "sql": "SELECT\n    sum(l_extendedprice * l_discount) AS revenue\nFROM\n    lineitem\nWHERE\n    l_shipdate >= CAST('1994-01-01' AS date)\n    AND l_shipdate < CAST('1995-01-01' AS date)\n    AND l_discount BETWEEN 0.05\n    AND 0.07\n    AND l_quantity < 24",
+  "tables": [
+   "lineitem"
+  ],
+  "duckdb": {
+   "ms": [
+    52.315355991595425,
+    53.346902001067065,
+    57.99688601109665
+   ],
+   "device_note": "",
+   "rows": 1
+  },
+  "cpu": {
+   "ms": [
+    116.560961,
+    134.712347,
+    122.12399
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 1,
+   "verdict": "equal"
+  }
+ },
+ "SF10/Q7": {
+  "sql": "SELECT\n    supp_nation,\n    cust_nation,\n    l_year,\n    sum(volume) AS revenue\nFROM (\n    SELECT\n        n1.n_name AS supp_nation,\n        n2.n_name AS cust_nation,\n        extract(year FROM l_shipdate) AS l_year,\n        l_extendedprice * (1 - l_discount) AS volume\n    FROM\n        supplier,\n        lineitem,\n        orders,\n        customer,\n        nation n1,\n        nation n2\n    WHERE\n        s_suppkey = l_suppkey\n        AND o_orderkey = l_orderkey\n        AND c_custkey = o_custkey\n        AND s_nationkey = n1.n_nationkey\n        AND c_nationkey = n2.n_nationkey\n        AND ((n1.n_name = 'FRANCE'\n                AND n2.n_name = 'GERMANY')\n            OR (n1.n_name = 'GERMANY'\n                AND n2.n_name = 'FRANCE'))\n        AND l_shipdate BETWEEN CAST('1995-01-01' AS date)\n        AND CAST('1996-12-31' AS date)) AS shipping\nGROUP BY\n    supp_nation,\n    cust_nation,\n    l_year\nORDER BY\n    supp_nation,\n    cust_nation,\n    l_year",
+  "tables": [
+   "customer",
+   "lineitem",
+   "nation",
+   "orders",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    110.4401409975253,
+    105.23616999853402,
+    110.64623200218193
+   ],
+   "device_note": "",
+   "rows": 4
+  },
+  "cpu": {
+   "ms": [
+    1643.513864,
+    1458.090847,
+    1699.568102
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 4,
+   "verdict": "equal"
+  }
+ },
+ "SF10/Q8": {
+  "sql": "SELECT\n    o_year,\n    sum(\n        CASE WHEN nation = 'BRAZIL' THEN\n            volume\n        ELSE\n            0\n        END) / sum(volume) AS mkt_share\nFROM (\n    SELECT\n        extract(year FROM o_orderdate) AS o_year,\n        l_extendedprice * (1 - l_discount) AS volume,\n        n2.n_name AS nation\n    FROM\n        part,\n        supplier,\n        lineitem,\n        orders,\n        customer,\n        nation n1,\n        nation n2,\n        region\n    WHERE\n        p_partkey = l_partkey\n        AND s_suppkey = l_suppkey\n        AND l_orderkey = o_orderkey\n        AND o_custkey = c_custkey\n        AND c_nationkey = n1.n_nationkey\n        AND n1.n_regionkey = r_regionkey\n        AND r_name = 'AMERICA'\n        AND s_nationkey = n2.n_nationkey\n        AND o_orderdate BETWEEN CAST('1995-01-01' AS date)\n        AND CAST('1996-12-31' AS date)\n        AND p_type = 'ECONOMY ANODIZED STEEL') AS all_nations\nGROUP BY\n    o_year\nORDER BY\n    o_year",
+  "tables": [
+   "customer",
+   "lineitem",
+   "nation",
+   "orders",
+   "part",
+   "region",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    77.46617701195646,
+    85.69707001151983,
+    92.67610400274862
+   ],
+   "device_note": "",
+   "rows": 2
+  },
+  "cpu": {
+   "ms": [
+    322.58302,
+    277.162304,
+    305.33917
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 2,
+   "verdict": "equal"
+  }
+ },
+ "SF10/Q9": {
+  "sql": "SELECT\n    nation,\n    o_year,\n    sum(amount) AS sum_profit\nFROM (\n    SELECT\n        n_name AS nation,\n        extract(year FROM o_orderdate) AS o_year,\n        l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity AS amount\n    FROM\n        part,\n        supplier,\n        lineitem,\n        partsupp,\n        orders,\n        nation\n    WHERE\n        s_suppkey = l_suppkey\n        AND ps_suppkey = l_suppkey\n        AND ps_partkey = l_partkey\n        AND p_partkey = l_partkey\n        AND o_orderkey = l_orderkey\n        AND s_nationkey = n_nationkey\n        AND p_name LIKE '%green%') AS profit\nGROUP BY\n    nation,\n    o_year\nORDER BY\n    nation,\n    o_year DESC",
+  "tables": [
+   "lineitem",
+   "nation",
+   "orders",
+   "part",
+   "partsupp",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    600.5944320058916,
+    579.3633729917929,
+    566.1933500086889
+   ],
+   "device_note": "",
+   "rows": 175
+  },
+  "cpu": {
+   "ms": [
+    906.529675,
+    834.799458,
+    774.288406
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 175,
+   "verdict": "equal"
+  }
+ },
+ "SF10/Q10": {
+  "sql": "SELECT\n    c_custkey,\n    c_name,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue,\n    c_acctbal,\n    n_name,\n    c_address,\n    c_phone,\n    c_comment\nFROM\n    customer,\n    orders,\n    lineitem,\n    nation\nWHERE\n    c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND o_orderdate >= CAST('1993-10-01' AS date)\n    AND o_orderdate < CAST('1994-01-01' AS date)\n    AND l_returnflag = 'R'\n    AND c_nationkey = n_nationkey\nGROUP BY\n    c_custkey,\n    c_name,\n    c_acctbal,\n    c_phone,\n    n_name,\n    c_address,\n    c_comment\nORDER BY\n    revenue DESC\nLIMIT 20",
+  "tables": [
+   "customer",
+   "lineitem",
+   "nation",
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    250.17224499606527,
+    283.70250201260205,
+    299.17077701247763
+   ],
+   "device_note": "",
+   "rows": 20
+  },
+  "cpu": {
+   "ms": [
+    1756.007823,
+    1860.734346,
+    1530.809539
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 20,
+   "verdict": "equal"
+  }
+ },
+ "SF10/Q11": {
+  "sql": "SELECT\n    ps_partkey,\n    sum(ps_supplycost * ps_availqty) AS value\nFROM\n    partsupp,\n    supplier,\n    nation\nWHERE\n    ps_suppkey = s_suppkey\n    AND s_nationkey = n_nationkey\n    AND n_name = 'GERMANY'\nGROUP BY\n    ps_partkey\nHAVING\n    sum(ps_supplycost * ps_availqty) > (\n        SELECT\n            sum(ps_supplycost * ps_availqty) * 0.0001000000\n        FROM\n            partsupp,\n            supplier,\n            nation\n        WHERE\n            ps_suppkey = s_suppkey\n            AND s_nationkey = n_nationkey\n            AND n_name = 'GERMANY')\nORDER BY\n    value DESC",
+  "tables": [
+   "nation",
+   "partsupp",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    20.787960005691275,
+    19.34057399921585,
+    20.389661003719084
+   ],
+   "device_note": "",
+   "rows": 0
+  },
+  "cpu": {
+   "ms": [
+    114.17903,
+    518.704613,
+    113.646769
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 0,
+   "verdict": "equal"
+  }
+ },
+ "SF10/Q12": {
+  "sql": "SELECT\n    l_shipmode,\n    sum(\n        CASE WHEN o_orderpriority = '1-URGENT'\n            OR o_orderpriority = '2-HIGH' THEN\n            1\n        ELSE\n            0\n        END) AS high_line_count,\n    sum(\n        CASE WHEN o_orderpriority <> '1-URGENT'\n            AND o_orderpriority <> '2-HIGH' THEN\n            1\n        ELSE\n            0\n        END) AS low_line_count\nFROM\n    orders,\n    lineitem\nWHERE\n    o_orderkey = l_orderkey\n    AND l_shipmode IN ('MAIL', 'SHIP')\n    AND l_commitdate < l_receiptdate\n    AND l_shipdate < l_commitdate\n    AND l_receiptdate >= CAST('1994-01-01' AS date)\n    AND l_receiptdate < CAST('1995-01-01' AS date)\nGROUP BY\n    l_shipmode\nORDER BY\n    l_shipmode",
+  "tables": [
+   "lineitem",
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    94.4118250044994,
+    100.32068801228888,
+    93.76096600317396
+   ],
+   "device_note": "",
+   "rows": 2
+  },
+  "cpu": {
+   "ms": [
+    343.352957,
+    335.838879,
+    385.753596
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 2,
+   "verdict": "equal"
+  }
+ },
+ "SF10/Q13": {
+  "sql": "SELECT\n    c_count,\n    count(*) AS custdist\nFROM (\n    SELECT\n        c_custkey,\n        count(o_orderkey)\n    FROM\n        customer\n    LEFT OUTER JOIN orders ON c_custkey = o_custkey\n    AND o_comment NOT LIKE '%special%requests%'\nGROUP BY\n    c_custkey) AS c_orders (c_custkey,\n        c_count)\nGROUP BY\n    c_count\nORDER BY\n    custdist DESC,\n    c_count DESC",
+  "tables": [
+   "customer",
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    597.8936019964749,
+    479.36584999843035,
+    456.35842000774574
+   ],
+   "device_note": "",
+   "rows": 45
+  },
+  "cpu": {
+   "ms": [
+    1038.401316,
+    1399.347134,
+    1420.517691
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 45,
+   "verdict": "equal"
+  }
+ },
+ "SF10/Q14": {
+  "sql": "SELECT\n    100.00 * sum(\n        CASE WHEN p_type LIKE 'PROMO%' THEN\n            l_extendedprice * (1 - l_discount)\n        ELSE\n            0\n        END) / sum(l_extendedprice * (1 - l_discount)) AS promo_revenue\nFROM\n    lineitem,\n    part\nWHERE\n    l_partkey = p_partkey\n    AND l_shipdate >= date '1995-09-01'\n    AND l_shipdate < CAST('1995-10-01' AS date)",
+  "tables": [
+   "lineitem",
+   "part"
+  ],
+  "duckdb": {
+   "ms": [
+    126.3057730102446,
+    171.23634400195442,
+    186.85677599569317
+   ],
+   "device_note": "",
+   "rows": 1
+  },
+  "cpu": {
+   "ms": [
+    266.553536,
+    536.167751,
+    146.467152
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 1,
+   "verdict": "equal"
+  }
+ },
+ "SF10/Q15": {
+  "sql": "WITH revenue AS (\n    SELECT\n        l_suppkey AS supplier_no,\n        sum(l_extendedprice * (1 - l_discount)) AS total_revenue\n    FROM\n        lineitem\n    WHERE\n        l_shipdate >= CAST('1996-01-01' AS date)\n      AND l_shipdate < CAST('1996-04-01' AS date)\n    GROUP BY\n        supplier_no\n)\nSELECT\n    s_suppkey,\n    s_name,\n    s_address,\n    s_phone,\n    total_revenue\nFROM\n    supplier,\n    revenue\nWHERE\n    s_suppkey = supplier_no\n    AND total_revenue = (\n        SELECT\n            max(total_revenue)\n        FROM revenue)\nORDER BY\n    s_suppkey",
+  "tables": [
+   "lineitem",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    63.10018300428055,
+    67.57701899914537,
+    66.20029199984856
+   ],
+   "device_note": "",
+   "rows": 1
+  },
+  "cpu": {
+   "ms": [
+    70.03461,
+    74.339206,
+    69.896609
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 1,
+   "verdict": "equal"
+  }
+ },
+ "SF10/Q16": {
+  "sql": "SELECT\n    p_brand,\n    p_type,\n    p_size,\n    count(DISTINCT ps_suppkey) AS supplier_cnt\nFROM\n    partsupp,\n    part\nWHERE\n    p_partkey = ps_partkey\n    AND p_brand <> 'Brand#45'\n    AND p_type NOT LIKE 'MEDIUM POLISHED%'\n    AND p_size IN (49, 14, 23, 45, 19, 3, 36, 9)\n    AND ps_suppkey NOT IN (\n        SELECT\n            s_suppkey\n        FROM\n            supplier\n        WHERE\n            s_comment LIKE '%Customer%Complaints%')\nGROUP BY\n    p_brand,\n    p_type,\n    p_size\nORDER BY\n    supplier_cnt DESC,\n    p_brand,\n    p_type,\n    p_size",
+  "tables": [
+   "part",
+   "partsupp",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    96.4889650058467,
+    94.16010200220626,
+    93.54166399862152
+   ],
+   "device_note": "",
+   "rows": 27840
+  },
+  "cpu": {
+   "ms": [
+    146.186037,
+    136.343279,
+    139.352248
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 27840,
+   "verdict": "equal"
+  }
+ },
+ "SF10/Q17": {
+  "sql": "SELECT\n    sum(l_extendedprice) / 7.0 AS avg_yearly\nFROM\n    lineitem,\n    part\nWHERE\n    p_partkey = l_partkey\n    AND p_brand = 'Brand#23'\n    AND p_container = 'MED BOX'\n    AND l_quantity < (\n        SELECT\n            0.2 * avg(l_quantity)\n        FROM\n            lineitem\n        WHERE\n            l_partkey = p_partkey)",
+  "tables": [
+   "lineitem",
+   "part"
+  ],
+  "duckdb": {
+   "ms": [
+    62.87257099756971,
+    267.3050720040919,
+    65.9182600065833
+   ],
+   "device_note": "",
+   "rows": 1
+  },
+  "cpu": {
+   "ms": [
+    608.693934,
+    515.472597,
+    562.022405
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 1,
+   "verdict": "equal"
+  }
+ },
+ "SF10/Q18": {
+  "sql": "SELECT\n    c_name,\n    c_custkey,\n    o_orderkey,\n    o_orderdate,\n    o_totalprice,\n    sum(l_quantity)\nFROM\n    customer,\n    orders,\n    lineitem\nWHERE\n    o_orderkey IN (\n        SELECT\n            l_orderkey\n        FROM\n            lineitem\n        GROUP BY\n            l_orderkey\n        HAVING\n            sum(l_quantity) > 300)\n    AND c_custkey = o_custkey\n    AND o_orderkey = l_orderkey\nGROUP BY\n    c_name,\n    c_custkey,\n    o_orderkey,\n    o_orderdate,\n    o_totalprice\nORDER BY\n    o_totalprice DESC,\n    o_orderdate\nLIMIT 100",
+  "tables": [
+   "customer",
+   "lineitem",
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    413.3209989959141,
+    385.82536700414494,
+    376.4921270048944
+   ],
+   "device_note": "",
+   "rows": 100
+  },
+  "cpu": {
+   "ms": [
+    10511.709313,
+    8749.950578,
+    7979.549141
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 100,
+   "verdict": "equal"
+  }
+ },
+ "SF10/Q19": {
+  "sql": "SELECT\n    sum(l_extendedprice * (1 - l_discount)) AS revenue\nFROM\n    lineitem,\n    part\nWHERE (p_partkey = l_partkey\n    AND p_brand = 'Brand#12'\n    AND p_container IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG')\n    AND l_quantity >= 1\n    AND l_quantity <= 1 + 10\n    AND p_size BETWEEN 1 AND 5\n    AND l_shipmode IN ('AIR', 'AIR REG')\n    AND l_shipinstruct = 'DELIVER IN PERSON')\n    OR (p_partkey = l_partkey\n        AND p_brand = 'Brand#23'\n        AND p_container IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK')\n        AND l_quantity >= 10\n        AND l_quantity <= 10 + 10\n        AND p_size BETWEEN 1 AND 10\n        AND l_shipmode IN ('AIR', 'AIR REG')\n        AND l_shipinstruct = 'DELIVER IN PERSON')\n    OR (p_partkey = l_partkey\n        AND p_brand = 'Brand#34'\n        AND p_container IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG')\n        AND l_quantity >= 20\n        AND l_quantity <= 20 + 10\n        AND p_size BETWEEN 1 AND 15\n        AND l_shipmode IN ('AIR', 'AIR REG')\n        AND l_shipinstruct = 'DELIVER IN PERSON')",
+  "tables": [
+   "lineitem",
+   "part"
+  ],
+  "duckdb": {
+   "ms": [
+    155.8964569994714,
+    157.1064620075049,
+    162.8095540072536
+   ],
+   "device_note": "",
+   "rows": 1
+  },
+  "cpu": {
+   "ms": [
+    218.455543,
+    208.778353,
+    223.008217
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 1,
+   "verdict": "equal"
+  }
+ },
+ "SF10/Q20": {
+  "sql": "SELECT\n    s_name,\n    s_address\nFROM\n    supplier,\n    nation\nWHERE\n    s_suppkey IN (\n        SELECT\n            ps_suppkey\n        FROM\n            partsupp\n        WHERE\n            ps_partkey IN (\n                SELECT\n                    p_partkey\n                FROM\n                    part\n                WHERE\n                    p_name LIKE 'forest%')\n                AND ps_availqty > (\n                    SELECT\n                        0.5 * sum(l_quantity)\n                    FROM\n                        lineitem\n                    WHERE\n                        l_partkey = ps_partkey\n                        AND l_suppkey = ps_suppkey\n                        AND l_shipdate >= CAST('1994-01-01' AS date)\n                        AND l_shipdate < CAST('1995-01-01' AS date)))\n            AND s_nationkey = n_nationkey\n            AND n_name = 'CANADA'\n        ORDER BY\n            s_name",
+  "tables": [
+   "lineitem",
+   "nation",
+   "part",
+   "partsupp",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    70.07343199802563,
+    70.0581729906844,
+    87.72701499401592
+   ],
+   "device_note": "",
+   "rows": 1804
+  },
+  "cpu": {
+   "ms": [
+    850.219808,
+    784.157279,
+    792.501059
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 1804,
+   "verdict": "equal"
+  }
+ },
+ "SF10/Q21": {
+  "sql": "SELECT\n    s_name,\n    count(*) AS numwait\nFROM\n    supplier,\n    lineitem l1,\n    orders,\n    nation\nWHERE\n    s_suppkey = l1.l_suppkey\n    AND o_orderkey = l1.l_orderkey\n    AND o_orderstatus = 'F'\n    AND l1.l_receiptdate > l1.l_commitdate\n    AND EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem l2\n        WHERE\n            l2.l_orderkey = l1.l_orderkey\n            AND l2.l_suppkey <> l1.l_suppkey)\n    AND NOT EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem l3\n        WHERE\n            l3.l_orderkey = l1.l_orderkey\n            AND l3.l_suppkey <> l1.l_suppkey\n            AND l3.l_receiptdate > l3.l_commitdate)\n    AND s_nationkey = n_nationkey\n    AND n_name = 'SAUDI ARABIA'\nGROUP BY\n    s_name\nORDER BY\n    numwait DESC,\n    s_name\nLIMIT 100",
+  "tables": [
+   "lineitem",
+   "nation",
+   "orders",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    360.88985500100534,
+    356.37029899226036,
+    345.30972500215285
+   ],
+   "device_note": "",
+   "rows": 100
+  },
+  "cpu": {
+   "ms": [
+    4490.209425,
+    4247.97501,
+    4342.630518
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 100,
+   "verdict": "equal"
+  }
+ },
+ "SF10/Q22": {
+  "sql": "SELECT\n    cntrycode,\n    count(*) AS numcust,\n    sum(c_acctbal) AS totacctbal\nFROM (\n    SELECT\n        substring(c_phone FROM 1 FOR 2) AS cntrycode,\n        c_acctbal\n    FROM\n        customer\n    WHERE\n        substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17')\n        AND c_acctbal > (\n            SELECT\n                avg(c_acctbal)\n            FROM\n                customer\n            WHERE\n                c_acctbal > 0.00\n                AND substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17'))\n            AND NOT EXISTS (\n                SELECT\n                    *\n                FROM\n                    orders\n                WHERE\n                    o_custkey = c_custkey)) AS custsale\nGROUP BY\n    cntrycode\nORDER BY\n    cntrycode",
+  "tables": [
+   "customer",
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    53.19832600071095,
+    55.406509010936134,
+    54.47504100447986
+   ],
+   "device_note": "",
+   "rows": 7
+  },
+  "cpu": {
+   "ms": [
+    1469.439145,
+    1448.625742,
+    1421.807695
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 7,
+   "verdict": "equal"
+  }
+ }
+}
