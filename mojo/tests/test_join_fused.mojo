@@ -139,9 +139,32 @@ def main() raises:
     var r8 = Query(lf).join(rf, ["k"], ["dk"]).agg(count(), sum(col("w"))).compute()
     expect(r8.counts[0] == f_count and r8.values(1)[0] == f_sum, "two Frames: " + String(r8.counts[0]) + " " + String(r8.values(1)[0]) + " wanted " + String(f_count) + " " + String(f_sum))
     expect(has_note(r8, "join path: fused"), "two Frames join fused")
+    # (6b) a formula column of a Frame is a column of the join
+    var ff = Frame(left)
+    _ = ff.formula("g10 = g * 10")
+    var g10_sum = 0
+    for i in range(n):
+        if i % 11 != 10 and (i * 7) % 50 < 40:
+            g10_sum += (i % 4) * 10
+    var r9 = Query(ff).join(right1, ["k"], ["dk"]).agg(count(), sum(col("g10"))).compute()
+    expect(r9.counts[0] == by_hand_count and r9.values(1)[0] == g10_sum, "a formula column through the join: " + String(r9.values(1)[0]) + " wanted " + String(g10_sum))
     # (7) the joined table can still be written
     var jt = Query(left).join(right1, ["k"], ["dk"]).joined_table()
     expect(jt.rows() == by_hand_count and jt.columns() == 9 + 8 and jt.name(9) == "dk" and jt.name(10) == "w" and jt.name(11) == "pad0_1", "joined_table: " + String(jt.rows()) + " " + jt.name(11))
+    # (7b) a second join on the first one's rows (the first is written, the second runs fused): w = key * 10 finds r2's row of that key, z = key
+    var r2t = Table.empty()
+    var r2k = r2t.add_column("rk", INT)
+    var r2z = r2t.add_column("z", INT)
+    for key in range(40):
+        r2t.append(r2k, Int64(key * 10))
+        r2t.append(r2z, Int64(key))
+    var chain_sum = 0
+    for i in range(n):
+        if i % 11 != 10 and (i * 7) % 50 < 40:
+            chain_sum += (i * 7) % 50
+    var rc = Query(left).join(right1, ["k"], ["dk"]).join(r2t^.share(), ["w"], ["rk"]).agg(count(), sum(col("z"))).compute()
+    expect(rc.counts[0] == by_hand_count and rc.values(1)[0] == chain_sum, "two joins in a row: " + String(rc.counts[0]) + " " + String(rc.values(1)[0]) + " wanted " + String(by_hand_count) + " " + String(chain_sum))
+    expect(has_note(rc, "join path: fused"), "the second join of a chain is fused")
     # (8) an empty side: nothing matches (inner, semi), everything is unmatched (left, anti); GPU asked for: refused by name, nothing written
     var empty = Table.empty()
     _ = empty.add_column("dk", INT)
