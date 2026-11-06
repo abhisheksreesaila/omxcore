@@ -146,6 +146,14 @@ def main() raises:
     same_as_cpu(cat, "SELECT count(*), sum(price) FROM t WHERE (qty > 2 OR price > 1000) AND NOT (qty < 0 AND price < 0)")
     same_as_cpu(cat, "SELECT sum(CASE WHEN qty > 2 OR price < 0 THEN 1 ELSE 0 END), sum(CASE WHEN qty > 2 AND price < 0 THEN 1 ELSE 0 END), "
                      "count(CASE WHEN NOT (qty > 2) THEN 1 END) FROM t")
+    # F-212: a condition over a nullable column (qty has NULLs) is integer ops only, so it runs on an Apple GPU's Int64 word too: every shape of
+    # comparison, AND, OR, NOT and IS [NOT] NULL in a WHERE, and a CASE with no ELSE (a NULL result)
+    same_as_cpu(cat, "SELECT count(*), sum(price) FROM t WHERE qty IS NULL")
+    same_as_cpu(cat, "SELECT count(*), sum(price) FROM t WHERE qty IS NOT NULL AND qty <> 2")
+    same_as_cpu(cat, "SELECT region, count(*), sum(qty) FROM t WHERE NOT (qty > 2) OR qty IS NULL GROUP BY region ORDER BY region")
+    same_as_cpu(cat, "SELECT count(*) FROM t WHERE NOT (qty > 2 AND price < 0)")
+    same_as_cpu(cat, "SELECT count(*) FROM t WHERE NOT (qty > 2 OR price < 0)")
+    same_as_cpu(cat, "SELECT count(CASE WHEN qty > 2 THEN 1 END), sum(CASE WHEN qty > 2 THEN qty END), max(CASE WHEN qty > 2 THEN price END) FROM t")
     # EXPLAIN says what would happen, truthfully: an upload when none is attached, the attached copy when there is one, the CPU for AUTO without one
     var ex_gpu = run(cat, "EXPLAIN " + q, GPU)
     has_note(ex_gpu, "device: GPU (GPU asked for, the table uploaded for this query)")
