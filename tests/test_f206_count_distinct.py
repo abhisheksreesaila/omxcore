@@ -1,0 +1,154 @@
+"""F-206: `COUNT(DISTINCT e) ... GROUP BY g` runs as DuckDB's two phases: GROUP BY (g, e) through the normal machinery (fused into a join, dense or hashed groups),
+then the number of non-NULL e groups per g (`count(DISTINCT): two phases` in the notes). Every answer equals DuckDB, through SQL over tables and SQL over edited
+Frames; shapes that keep the holistic path (two COUNT(DISTINCT) of different columns, no GROUP BY, a median or a SUM beside it) answer as before and carry no note.
+
+World: fact (150,000 rows) with a small group key g1 (NULLs), a large one g2, a float one gf (-0.0, 0.0, NaN, NULL), values of every type (NULLs in each) and a join
+key k (NULL and dangling keys); dim (45,000 rows, unique keys) with a group column and a text column.
+"""
+import pytest
+
+from conftest import oracle_connection
+from test_mojo_sql import probe, run_probe, got_rows          # noqa: F401  (the probe fixture builds mojo/tools/sql_probe.mojo)
+from test_f202_frames import make_edits
+from mx_oracle import assert_equal, duck_kind
+
+NOTE = "count(DISTINCT): two phases"
+
+
+@pytest.fixture(scope="module")
+def world(tmp_path_factory):
+    d = tmp_path_factory.mktemp("f206")
+    base = oracle_connection()
+    base.execute("""create table fact as select i as id,
+        case when i % 40 = 0 then null else i % 50 end as g1,
+        (i * 7919) % 30011 as g2,
+        case when i % 97 = 0 then null when i % 31 = 0 then -0.0 when i % 29 = 0 then 0.0 when i % 53 = 0 then 'nan'::double else (i % 7)::double end as gf,
+        case when i % 20 = 0 then null when i % 11 = 0 then 70000 + i else (i * 7) % 45000 end as k,
+        case when i % 9 = 0 then null else (i * 13) % 17 end as xi,
+        (i * 31) % 70001 as xb,
+        case when i % 8 = 0 then null else 'w' || ((i * 5) % 13) end as xt,
+        case when i % 7 = 0 then null else date '2021-01-01' + ((i * 3) % 60)::int end as xd,
+        case when i % 6 = 0 then null else ((i * 17) % 41) / 4.0 end::decimal(12, 2) as xc,
+        case when i % 12 = 0 then null when i % 10 = 0 then -0.0 when i % 14 = 0 then 0.0 when i % 61 = 0 then 'nan'::double else ((i * 11) % 9)::double end as xf,
+        case when i % 5 = 0 then null else i % 3 = 0 end as xl,
+        i % 1000 as v from range(150000) r(i)""")
+    base.execute("""create table dim as select i as dk,
+        case when i % 33 = 0 then null else i % 25 end as dg,
+        case when i % 7 = 0 then null else 'd' || (i % 11) end as dt from range(45000) r(i)""")
+    paths = {}
+    for t, rg in [("fact", 40000), ("dim", 30000)]:
+        paths[t] = d / f"{t}.parquet"
+        base.execute(f"copy {t} to '{paths[t]}' (format parquet, row_group_size {rg})")
+    out = {"paths": paths, "dir": d, "con": base}
+    # the Frame world: the columns an edit script can write (int, text, date, decimal), in file order, under the table name `fact`
+    base.execute("create table ffact as select id, g1, g2, k, xi, xb, xt, xd, xc, v from fact")
+    paths["ffact"] = d / "ffact.parquet"
+    base.execute(f"copy ffact to '{paths['ffact']}' (format parquet, row_group_size 40000)")
+    con = oracle_connection()
+    con.execute(f"create table fact as select row_number() over () - 1 as rid, * from read_parquet('{paths['ffact']}')")
+    con.execute(f"create table dim as select * from read_parquet('{paths['dim']}')")
+    cols = [("g1", "int"), ("g2", "int"), ("k", "int"), ("xi", "int"), ("xb", "int"), ("xt", "text"), ("xd", "date"), ("xc", "dec2"), ("v", "int")]
+    edits = d / "fact.edits"
+    edits.write_text(make_edits(con, "fact", "id", cols, 150000, 5, 60, 45000))
+    out["fact_frame"] = {"con": con, "edits": edits}
+    return out
+
+
+def files_of(world, tables, first=None):
+    order = ([first] if first else []) + [t for t in tables if t != first]
+    return {t: world["paths"][t] for t in order}
+
+
+def same(res, cur, sql, label):
+    want = cur.fetchall()
+    for i, desc in enumerate(cur.description):
+        dk = duck_kind(desc[1])
+        c = res["columns"][i]
+        assert c["kind"] == dk[0] and (dk[0] != "DECIMAL" or c["scale"] == dk[1]), f"column {i} of `{sql}`: got {c}, DuckDB has {dk}"
+    assert_equal(got_rows(res), want, "ORDER BY" in sql.upper(), f"{label}: {sql}")
+
+
+def two_phase(res):
+    hits = [n for n in res["notes"] if n.startswith(NOTE)]
+    return hits[0] if hits else None
+
+
+# (name, sql, tables): every one runs the two phases
+TWO_PHASE = [
+    ("small key, int value", "select g1, count(distinct xi) as n from fact group by g1 order by g1", ["fact"]),
+    ("large key, text value", "select g2, count(distinct xt) as n from fact group by g2 order by g2", ["fact"]),
+    ("large key, int value, a filter", "select g2, count(distinct xi) as n from fact where v < 300 group by g2 order by g2", ["fact"]),
+    ("big domain value", "select g1, count(distinct xb) as n from fact group by g1 order by g1", ["fact"]),
+    ("date value", "select g1, count(distinct xd) as n from fact group by g1 order by g1", ["fact"]),
+    ("decimal value", "select g1, count(distinct xc) as n from fact group by g1 order by g1", ["fact"]),
+    ("float value (-0.0, 0.0, NaN)", "select g1, count(distinct xf) as n from fact group by g1 order by g1", ["fact"]),
+    ("bool value", "select g1, count(distinct xl) as n from fact group by g1 order by g1", ["fact"]),
+    ("float key (-0.0, 0.0, NaN, NULL)", "select gf, count(distinct xi) as n, count(*) as c from fact group by gf order by gf", ["fact"]),
+    ("text key", "select xt, count(distinct g1) as n from fact group by xt order by n, xt", ["fact"]),
+    ("count(*) and count(col) beside it", "select g1, count(*) as c, count(xi) as ci, count(distinct xi) as n from fact group by g1 order by g1", ["fact"]),
+    ("HAVING on it", "select g1, count(distinct xi) as n from fact group by g1 having count(distinct xi) > 14 order by g1", ["fact"]),
+    ("HAVING on another aggregate", "select g1, count(distinct xi) as n from fact group by g1 having count(*) > 2990 order by g1", ["fact"]),
+    ("ORDER BY it, LIMIT", "select g2, count(distinct xt) as n from fact group by g2 order by n desc, g2 limit 25", ["fact"]),
+    ("expression key and value", "select g1 % 5 as b, count(distinct xi + 1) as n from fact group by g1 % 5 order by b", ["fact"]),
+    ("expression of the count in the select list", "select g1, count(distinct xi) * 2 + 1 as n2 from fact group by g1 order by g1", ["fact"]),
+    ("two keys", "select g1, v % 4 as q, count(distinct xt) as n from fact group by g1, v % 4 order by g1, q", ["fact"]),
+    ("groups whose value is all NULL count 0", "select g2, count(distinct xi) as n from fact where xi is null or v < 5 group by g2 order by g2", ["fact"]),
+    ("nothing passes: no groups", "select g1, count(distinct xi) as n from fact where v < 0 group by g1", ["fact"]),
+    ("join: group from the build side", "select dg, count(distinct xt) as n from fact join dim on k = dk group by dg order by dg", ["fact", "dim"]),
+    ("join: value from the build side", "select g1, count(distinct dt) as n from fact join dim on k = dk group by g1 order by g1", ["fact", "dim"]),
+    ("join: both from the probe side, filtered", "select g1, count(distinct xi) as n from fact join dim on k = dk where dg < 12 and v < 700 group by g1 order by g1", ["fact", "dim"]),
+    ("join: large key", "select g2, count(distinct dt) as n, count(*) as c from fact join dim on k = dk group by g2 order by g2", ["fact", "dim"]),
+    ("left join", "select dg, count(distinct xi) as n, count(*) as c from fact left join dim on k = dk group by dg order by dg", ["fact", "dim"]),
+    ("join, HAVING on it", "select dg, count(distinct xt) as n from fact join dim on k = dk group by dg having count(distinct xt) > 11 order by dg", ["fact", "dim"]),
+]
+
+# the holistic path stays: no note, same answers
+HOLISTIC = [
+    ("two COUNT(DISTINCT) of different columns", "select g1, count(distinct xi) as a, count(distinct xt) as b from fact group by g1 order by g1", ["fact"]),
+    ("no GROUP BY", "select count(distinct xi) as n, count(distinct xt) as m from fact", ["fact"]),
+    ("a median beside it", "select g1, count(distinct xi) as n, median(xb) as m from fact group by g1 order by g1", ["fact"]),
+    ("a SUM beside it", "select g1, count(distinct xi) as n, sum(xb) as s from fact group by g1 order by g1", ["fact"]),
+]
+
+
+@pytest.mark.parametrize("name,sql,tables", TWO_PHASE, ids=[c[0] for c in TWO_PHASE])
+def test_sql_over_tables(probe, world, name, sql, tables):
+    res = run_probe(probe, sql, files_of(world, tables), mode="table")
+    same(res, world["con"].execute(sql), sql, name)
+    assert two_phase(res), res["notes"]
+
+
+@pytest.mark.parametrize("name,sql,tables", HOLISTIC, ids=[c[0] for c in HOLISTIC])
+def test_the_holistic_path_answers_as_before(probe, world, name, sql, tables):
+    res = run_probe(probe, sql, files_of(world, tables), mode="table")
+    same(res, world["con"].execute(sql), sql, name)
+    assert not two_phase(res), res["notes"]
+
+
+FRAME_CASES = [c for c in TWO_PHASE if not any(w in c[1] for w in ("gf", "xf", "xl"))]       # (an edit script writes no FLOAT or BOOL cells)
+
+
+@pytest.mark.parametrize("name,sql,tables", FRAME_CASES, ids=[c[0] for c in FRAME_CASES])
+def test_sql_over_an_edited_frame(probe, world, name, sql, tables):
+    """The fact table is an edited Frame (changed cells, NULLs, appended and removed rows): the same two phases, the same answers as DuckDB over the edited rows."""
+    files = files_of(world, tables, "fact")
+    files["fact"] = world["paths"]["ffact"]
+    res = run_probe(probe, sql, files, mode="frame", edits=world["fact_frame"]["edits"])
+    same(res, world["fact_frame"]["con"].execute(sql), sql, name)
+    assert two_phase(res), res["notes"]
+
+
+def test_the_note_counts_the_groups_it_folded(probe, world):
+    sql = "select g1, count(distinct xi) as n from fact group by g1"
+    res = run_probe(probe, sql, files_of(world, ["fact"]), mode="table")
+    inner = world["con"].execute("select count(*) from (select g1, xi from fact group by g1, xi)").fetchone()[0]
+    outer = world["con"].execute("select count(distinct g1) + 1 from fact").fetchone()[0]       # (the NULL key is a group)
+    assert two_phase(res).startswith(f"{NOTE}: {inner:,} groups of (keys, value) folded into {outer:,} groups")
+
+
+def test_a_join_stays_fused(probe, world):
+    """The point of the rewrite: a holistic aggregate declined the fused join (6M rows gathered); the two phases are an ordinary aggregate over it."""
+    sql = "select dg, count(distinct xt) as n from fact join dim on k = dk group by dg"
+    res = run_probe(probe, sql, files_of(world, ["fact", "dim"]), mode="table")
+    assert any("join path: fused" in n for n in res["notes"]), res["notes"]
+    assert not any("materialized" in n and "join path" in n for n in res["notes"]), res["notes"]

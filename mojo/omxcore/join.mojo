@@ -448,6 +448,7 @@ def count_query(catalog: Catalog, q: BoundQuery, t: Int) -> BoundQuery:
     cq.rows = False
     cq.routs = List[Int]()
     cq.keys = List[KeySpec]()
+    cq.fold_keys = -1                                       # (F-206: a count query is not the first phase of a COUNT(DISTINCT))
     cq.aggs = List[AggSpec]()
     cq.aggs.append(AggSpec(F_COUNT_STAR, -1, 0.0, INT.value, 0, "count_star()", "count_star:*:0"))
     cq.pexprs = List[BExpr]()

@@ -28,7 +28,7 @@ from .holistic import (HolStates, HolSpec, HolResult, A_DISTINCT, A_PCT, A_MEDIA
                            float_key)
 from .sql import sql_error, parse_sql, SqlStatement, EXPLAIN_NONE, EXPLAIN_ANALYZE
 from .bind import (copy_query, Catalog, SqlSource, BoundQuery, SortKey, bind_sql, bind_statement, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, F_COUNT_STAR,
-                   F_COUNT, F_SUM, F_MIN, F_MAX, F_AVG, F_COUNT_DISTINCT, F_MEDIAN, F_STDDEV_SAMP, F_STDDEV_POP, F_VAR_SAMP, F_VAR_POP, F_QEDGE, B_QBIN, B_LIT, B_AGG, B_AND, B_CMP, C_EQ,
+                   F_COUNT, F_SUM, F_MIN, F_MAX, F_AVG, F_COUNT_DISTINCT, F_MEDIAN, F_STDDEV_SAMP, F_STDDEV_POP, F_VAR_SAMP, F_VAR_POP, F_QEDGE, B_QBIN, B_LIT, B_NULL, B_STR, B_AGG, B_AND, B_CMP, C_EQ,
                    BExpr, AggSpec, KeySpec, pow10_checked)
 from .plan import LogicalPlan, build_plan, executable
 from .post import run_post
@@ -613,7 +613,7 @@ def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hre
     # the groups that exist: only non-empty ones, except the one row of a query with no GROUP BY
     var t_a = perf_counter_ns()
     var gids = List[Int]()
-    var having_total = _having_groups(q, plan, sp, acc, gids)        # F-203: -1 when HAVING is not a plain comparison of aggregates with constants
+    var having_total = -1 if q.fold_keys >= 0 else _having_groups(q, plan, sp, acc, gids)        # F-203: -1 when HAVING is not a plain comparison of aggregates with constants (F-206: the groups are not the query's yet)
     if plan.group == G_NONE:
         gids.append(0)
     elif having_total >= 0:
@@ -625,7 +625,7 @@ def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hre
     else:
         for g in range(acc.groups()):
             gids.append(g)
-    if plan.group != G_NONE and q.limit >= 0 and (q.having < 0 or having_total >= 0):
+    if plan.group != G_NONE and q.limit >= 0 and (q.having < 0 or having_total >= 0) and q.fold_keys < 0:
         var before = len(gids)
         _topk_groups(q, plan, sp, acc, gids)
         if len(gids) < before:
@@ -713,11 +713,144 @@ def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hre
             vc.src = q.rexprs[sp_a.arg].src
         aggs.append(vc^)
     var t_c = perf_counter_ns()
+    if q.fold_keys >= 0:                                                   # F-206: the groups of (keys, value) become the query's groups
+        var folded = _fold_distinct(q, keys, aggs, n)
+        notes.append("count(DISTINCT): two phases: " + commas(n) + " groups of (keys, value) folded into " + commas(folded.n) + " groups in " + _ms(Float64(perf_counter_ns() - t_c) / 1e6) + " ms")
+        n = folded.n
+        swap(keys, folded.keys)
+        swap(aggs, folded.aggs)
     # HAVING, the select list, ORDER BY, OFFSET and LIMIT: a row query over the groups (post.mojo)
     var table = run_post(q, keys, aggs, dicts, opts, n, notes)
     notes.append("finish: groups " + _ms(Float64(t_b - t_a) / 1e6) + " ms, columns " + _ms(Float64(t_c - t_b) / 1e6) + " ms, then HAVING, ORDER BY and the select list over the groups " +
                  _ms(Float64(perf_counter_ns() - t_c) / 1e6) + " ms")
     return table^
+
+
+# ── F-206: COUNT(DISTINCT e) GROUP BY g as two phases ────────────────────────────────────────────────────
+
+struct _Folded(Movable):
+    var keys: List[ValCol]
+    var aggs: List[ValCol]
+    var n: Int
+
+    def __init__(out self):
+        self.keys = List[ValCol]()
+        self.aggs = List[ValCol]()
+        self.n = 0
+
+
+@always_inline
+def _fold_word(vc: ValCol, i: Int) -> Int64:
+    """A key's value as the word that decides equality: a float64's bits with -0.0 = 0.0 and every NaN one value (the groups of a FLOAT key are those of `float_key`)."""
+    return float_key(vc.v[i]) if vc.kind == FLOAT.value else vc.v[i]
+
+
+def _fold_distinct(q: BoundQuery, keys: List[ValCol], aggs: List[ValCol], n: Int) -> _Folded:
+    """Phase two: the groups of (g, e) -- g the first `q.fold_keys` keys, e the last key -- folded into the groups of g. A COUNT(DISTINCT e) is the number of
+    its g's groups whose e is not NULL (each (g, e) group is one distinct value), a COUNT(*) or COUNT(col) the sum of the groups' counts. One pass, one open-addressing
+    table of g's words; the groups of g are in the order their first (g, e) group came."""
+    var nk = q.fold_keys
+    var cap = 16
+    while cap < 2 * n:
+        cap *= 2
+    var mask = cap - 1
+    var table = List[Int32](length=cap, fill=-1)
+    var rep = List[Int]()                                               # the first (g, e) group of each group of g
+    var dist = List[Int64]()                                            # its e's that are not NULL
+    var is_dist = List[Bool](length=len(aggs), fill=False)
+    for a in q.fold_dist:
+        is_dist[a] = True
+    var sums = List[List[Int64]]()                                      # per aggregate that is not a COUNT(DISTINCT): the sum of the counts
+    for a in range(len(aggs)):
+        sums.append(List[Int64]())
+    for i in range(n):
+        var h = UInt64(0x9E3779B97F4A7C15)
+        for k in range(nk):
+            var w = UInt64(0x51ED270B) if keys[k].is_null(i) else UInt64(_fold_word(keys[k], i))
+            h = (h ^ w) * 0xD6E8FEB86659FD93
+            h = h ^ (h >> 32)
+        var slot = Int(h) & mask
+        var id = -1
+        while True:
+            var at = Int(table[slot])
+            if at < 0:
+                break
+            var j = rep[at]
+            var same = True
+            for k in range(nk):
+                var na = keys[k].is_null(i)
+                var nb = keys[k].is_null(j)
+                if na != nb or (not na and _fold_word(keys[k], i) != _fold_word(keys[k], j)):
+                    same = False
+                    break
+            if same:
+                id = at
+                break
+            slot = (slot + 1) & mask
+        if id < 0:
+            id = len(rep)
+            table[slot] = Int32(id)
+            rep.append(i)
+            dist.append(0)
+            for a in range(len(aggs)):
+                if not is_dist[a]:
+                    sums[a].append(0)
+        if not keys[nk].is_null(i):
+            dist[id] += 1
+        for a in range(len(aggs)):
+            if not is_dist[a]:
+                sums[a][id] += aggs[a].v[i]
+    var out = _Folded()
+    out.n = len(rep)
+    for k in range(nk):
+        var vc = ValCol(keys[k].kind, keys[k].scale, out.n)
+        vc.src = keys[k].src
+        for o in range(out.n):
+            if keys[k].is_null(rep[o]):
+                vc.set_null(o)
+            else:
+                vc.v[o] = keys[k].v[rep[o]]
+        out.keys.append(vc^)
+    for a in range(len(aggs)):
+        var vc = ValCol(aggs[a].kind, aggs[a].scale, out.n)
+        for o in range(out.n):
+            vc.v[o] = dist[o] if is_dist[a] else sums[a][o]
+        out.aggs.append(vc^)
+    return out^
+
+
+def _two_phase_agg(q: BoundQuery) -> Int:
+    """The COUNT(DISTINCT e) a query can run in two phases: it has GROUP BY keys, that is its only holistic aggregate, and the others are COUNT(*) or COUNT(col)
+    (their counts add up over the groups of e). -1 for any other query: it keeps the holistic path."""
+    if q.rows or q.distinct or q.fold_keys >= 0 or len(q.keys) == 0:
+        return -1
+    var d = -1
+    for a in range(len(q.aggs)):
+        var f = q.aggs[a].func
+        if f == F_COUNT_DISTINCT:
+            if d >= 0:
+                return -1
+            d = a
+        elif f != F_COUNT_STAR and f != F_COUNT:
+            return -1
+    if d < 0 or q.aggs[d].arg < 0:
+        return -1
+    var op = q.rexprs[q.aggs[d].arg].op
+    if op == B_LIT or op == B_NULL or op == B_STR:
+        return -1
+    return d
+
+
+def _two_phase_query(q: BoundQuery, d: Int) -> BoundQuery:
+    """The first phase: the same query grouped by one more key, the distinct value; the COUNT(DISTINCT) becomes a COUNT(*) that nothing reads (the groups are
+    counted by `_fold_distinct`)."""
+    var q2 = copy_query(q)
+    var sd = q.aggs[d].copy()
+    q2.fold_keys = len(q.keys)
+    q2.keys.append(KeySpec(sd.arg, sd.name, "distinct " + sd.canon))
+    q2.aggs[d] = AggSpec(F_COUNT_STAR, -1, 0.0, sd.kind, sd.scale, sd.name, sd.canon)
+    q2.fold_dist.append(d)
+    return q2^
 
 
 # ── running ──────────────────────────────────────────────────────────────────────────────────────────
@@ -847,7 +980,7 @@ def _gpu_blocker(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, sp: SqlProgr
         return "a " + ("frame" if src.kind == SRC_FRAME else "Parquet or CSV scan") + " runs on the CPU (the GPU runs a table)"
     if plan.group == G_HASHED:
         return "hashed groups run on the CPU (the GPU kernel takes no groups or dense groups)"
-    if sp.p.mat or two_pass:
+    if sp.p.mat or two_pass or q.fold_keys >= 0:
         return "count(DISTINCT), median, quantiles and min / max of TEXT run on the CPU"
     if sp.p.has_float or sp.p.repro:
         return "a FLOAT column or float arithmetic runs on the CPU (a float64 sum has one defined order there)"
@@ -2972,6 +3105,13 @@ def _run_sql_resolved[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: 
     checks; they are verified as the row groups are read (a null count that is wrong, a row outside a stated range), and when one
     is wrong the query runs again without the statistics, which the notes say."""
     opts.job.stage(STAGE_PLAN)
+    var d = _two_phase_agg(q)                                          # F-206: COUNT(DISTINCT e) GROUP BY g runs as GROUP BY (g, e), then a count per g
+    if d >= 0:
+        return _run_sql_phases(catalog, _two_phase_query(q, d), planner, opts)
+    return _run_sql_phases(catalog, q, planner, opts)
+
+
+def _run_sql_phases[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: P, opts: PlannerOptions) raises -> SqlResult:
     if q.explain == EXPLAIN_ANALYZE:
         return _explain_analyze(catalog, q, planner, opts)
     var r: SqlResult
