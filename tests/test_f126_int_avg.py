@@ -326,7 +326,7 @@ def test_the_division_is_duckdbs_long_double_not_the_correctly_rounded_quotient(
     assert set(paths) == {ARROW}, paths
 
 
-# -- no x87 long double (macOS ARM, Windows): the correctly rounded quotient --------------------------------------------------
+# -- no x87 long double (macOS ARM, Windows): DuckDB divides in doubles there (F-211, pinned against DuckDB's own bits in test_f211_avg_platform.py) ----------
 
 @pytest.fixture
 def no_x87(monkeypatch):
@@ -335,19 +335,25 @@ def no_x87(monkeypatch):
     return npa
 
 
-def test_without_an_x87_long_double_the_mean_is_the_correctly_rounded_quotient(no_x87):
+def _double_mean(total, n):
+    """double(total) / n, the total read as DuckDB's HUGEINT cast does (a negative total below 2^64 is -double(-total - 1) - 1.0)."""
+    t = -float(-total - 1) - 1.0 if -(1 << 64) <= total < 0 else float(total)
+    return t / n
+
+
+def test_without_an_x87_long_double_the_mean_is_the_total_as_a_double_over_the_count(no_x87):
     npa = no_x87
     big = (1 << 62) + 123
     for total, n in ((-3, 2), (-1 - 2, 2), (7, 3), (-7, 3), (big * 10 + 7, 10), (-(big * 10 + 7), 10), (big * 3, 7), (1 << 100, 3), (-(1 << 100) - 1, 7)):
-        assert npa._ld_div(total, n) == total / n, (total, n)
+        assert npa._ld_div(total, n) == _double_mean(total, n), (total, n)
     tot = np.array([-3, 7, -7, (1 << 53) + 1, -(1 << 53) - 3, 5 * (1 << 60) + 11, 0], dtype=np.int64)
     cnt = np.array([2, 3, 3, 7, 10, 9, 0], dtype=np.int64)
     got = npa.int_mean_of_totals(tot, cnt)
-    assert got.tolist() == [-1.5, 7 / 3, -7 / 3, ((1 << 53) + 1) / 7, (-(1 << 53) - 3) / 10, (5 * (1 << 60) + 11) / 9, 0.0]
+    assert got.tolist() == [-1.5, 7 / 3, -7 / 3, _double_mean((1 << 53) + 1, 7), _double_mean(-(1 << 53) - 3, 10), _double_mean(5 * (1 << 60) + 11, 9), 0.0]
     lo = np.array([-1, -2, (1 << 61) + 5, -(1 << 62), 9], dtype=np.int64)
     hi = np.array([0, 0, 3, -(1 << 30), (1 << 31) - 1], dtype=np.int64)
     c = np.array([2, 2, 5, 3, 7], dtype=np.int64)
-    want = [((int(h) << 32) + int(l)) / int(k) for h, l, k in zip(hi, lo, c)]
+    want = [_double_mean((int(h) << 32) + int(l), int(k)) for h, l, k in zip(hi, lo, c)]
     assert npa.int_mean_of_halves(lo, hi, c).tolist() == want
 
 
@@ -361,7 +367,7 @@ def test_the_halves_of_a_total_are_not_added_in_int64_when_a_half_is_large(monke
 
 @pytest.mark.parametrize("c", ["over", "wide", "mixed", "fits"])
 def test_without_an_x87_long_double_an_average_is_within_an_ulp_of_duckdb(no_x87, c):
-    """Not DuckDB's long-double double on every input, but never more than the one rounding away."""
+    """The x87 imitation switched off (on x86-64 DuckDB divides in a long double): never more than one rounding away."""
     got = LazyFrame(T).groupby("g").agg(col(c).mean().alias("m")).sort("g").compute(device="cpu").column("m").to_pylist()
     want = [r[1] for r in _want(f"select g, avg({c}) from t group by g order by g")]
     assert got == pytest.approx(want, rel=2e-16, abs=0)

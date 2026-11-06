@@ -3,11 +3,12 @@
 `ValCol` is a column of results: an Int64 per group (a FLOAT holds a float64's bits) and a flag per group for NULL. The
 expressions that combine the groups' values (HAVING, the select list, ORDER BY) are no longer evaluated here: since F-152 they run
 as a row query over the groups through the executor (`post.mojo`). What stays is the column type, the float helpers, and
-`ld_div`, which divides as DuckDB's AVG does.
+`avg_div`, which divides as DuckDB's AVG does on this platform.
 """
 from std.math import fma
+from std.sys import CompilationTarget
 from .table import INT, DECIMAL, TEXT, BOOL, FLOAT
-from .wide import wide_make, wide_lo, wide_hi, fits_int64
+from .wide import wide_make, wide_lo, wide_hi, fits_int64, hug
 
 
 struct ValCol(Copyable, Movable):
@@ -76,9 +77,45 @@ def float_bits(x: Float64) -> Int64:
     return Int64(x.to_bits())
 
 
-def ld_div(num: Int64, den: UInt128) -> Float64:
-    """num / den as DuckDB's AVG divides (see `ld_div_wide`)."""
-    return ld_div_wide(Int128(num), den)
+def avg_div(num: Int128, cnt: Int, scale: Int) -> Float64:
+    """AVG of a total `num` (the stored integers' sum at `scale` decimal places) over `cnt` rows, as DuckDB divides it on this platform: its
+    C++ `long double` is the x87 80-bit type on x86-64 (`avg_div_x87`) and a plain double elsewhere (`avg_div_double`). F-211."""
+    comptime if CompilationTarget.is_x86():
+        return avg_div_x87(num, cnt, scale)
+    else:
+        return avg_div_double(num, cnt, scale)
+
+
+def avg_div_x87(num: Int128, cnt: Int, scale: Int) -> Float64:
+    """x86-64: `ld_div_wide` over count * 10^scale where DuckDB's power of ten is a double (probed: scales 2 to 38; an exact 10^25 gave a different last
+    bit for 3 of 3 cases) and the product with the count is rounded to the 64-bit mantissa. The double is m * 2^e, so the product is cnt * m (below 2^117)
+    rounded to 64 bits, divided exactly and scaled back by 2^-e."""
+    var p = Int128(1)
+    for _ in range(scale):
+        p *= Int128(10)
+    var pb = UInt64(hug(p).to_bits())
+    var m = UInt128((pb & UInt64(0xFFFFFFFFFFFFF)) | (UInt64(1) << 52))
+    var e = Int((pb >> 52) & UInt64(0x7FF)) - 1075
+    var den = UInt128(cnt) * m
+    var bits = _bitlen128(den)
+    if bits > 64:
+        var sh = bits - 64
+        var low = den & ((UInt128(1) << UInt128(sh)) - UInt128(1))
+        var half = UInt128(1) << UInt128(sh - 1)
+        den >>= UInt128(sh)
+        if low > half or (low == half and (den & UInt128(1)) != UInt128(0)):
+            den += UInt128(1)
+        e += sh
+    return ld_div_wide(num, den) * Float64(from_bits=UInt64((1023 - e) << 52))
+
+
+def avg_div_double(num: Int128, cnt: Int, scale: Int) -> Float64:
+    """arm64 (probed on an Apple M4, DuckDB 1.5.6: all 2,900 differing cases, scales 0 to 38) and any platform whose `long double` is a double:
+    DuckDB's HUGEINT cast of the total (`hug`, the same on both platforms), divided by double(count) * double(10^scale)."""
+    var p = Int128(1)
+    for _ in range(scale):
+        p *= Int128(10)
+    return hug(num) / (Float64(cnt) * hug(p))
 
 
 def ld_div_wide(num: Int128, den: UInt128) -> Float64:

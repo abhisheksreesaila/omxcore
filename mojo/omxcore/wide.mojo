@@ -172,7 +172,7 @@ def parse_wide(text: String) -> WideNum:
     return out^
 
 
-def _hug(v: Int128) -> Float64:
+def hug(v: Int128) -> Float64:
     """DuckDB's HUGEINT to DOUBLE cast (probed bit for bit on 6,000 values around +-2^63, +-2^64 and up to 10^36, at scales 0 to 7): an upper word of
     -1 is `-double(UINT64_MAX - lower) - 1.0` (two roundings, each in its own place: not `-double(2^64 - lower)`), any other upper word (0 included)
     is `double(upper) * 2^64 + double(lower)`."""
@@ -199,11 +199,11 @@ def _divmod_small(m: UInt128, p: UInt64) -> Tuple[UInt128, UInt64]:
 
 
 def wide_to_float(v: Int128, scale: Int) -> Float64:
-    """The value read as a DOUBLE, as DuckDB casts a DECIMAL(38, scale) (DuckDB's HUGEINT cast `_hug` on the value at scale 0; otherwise on the whole
+    """The value read as a DOUBLE, as DuckDB casts a DECIMAL(38, scale) (DuckDB's HUGEINT cast `hug` on the value at scale 0; otherwise on the whole
     part and the fraction apart, the quotient and remainder by 10^scale truncating toward zero: whole + fraction / 10^scale). tests/test_f192_wide_sums.py
     compares it with DuckDB over totals in the bands around +-2^63 and +-2^64 at scales 0, 2 and 4, and over random 120-bit ones."""
     if scale == 0:
-        return _hug(v)
+        return hug(v)
     var neg = v < Int128(0)
     var m = _magnitude(v)
     var pu = UInt64(1)
@@ -217,4 +217,4 @@ def wide_to_float(v: Int128, scale: Int) -> Float64:
     if neg:
         q = -q
         r = -r
-    return _hug(q) + _hug(r) / pf
+    return hug(q) + hug(r) / pf

@@ -428,19 +428,30 @@ def _int_group_sum(a, valid, g, n_groups) -> np.ndarray:
     return (s2.astype(np.int64) << 42) + (s1.astype(np.int64) << 21) + s0.astype(np.int64)
 
 
-# DuckDB divides in an x87 80-bit long double. Where numpy's longdouble is only a double (macOS ARM, Windows) the
-# imitation cannot be built (upper * 2^64 + lower cancels), so the correctly rounded quotient is used: the
-# nearest thing to what DuckDB's own hardware gives. Tests flip this flag to run that path on x86-64.
+# DuckDB divides its HUGEINT total in a C++ `long double`: the x87 80-bit type on x86-64, a plain double on arm64 (Apple
+# Silicon) and Windows (F-211: probed on an Apple M4, DuckDB 1.5.6, 106 of the 108 cases where the formulas differ were
+# `double(total) / n` with the HUGEINT cast of the total, none the correctly rounded quotient). Where numpy's longdouble is only a
+# double the x87 imitation cannot be built (upper * 2^64 + lower cancels), and DuckDB itself divides in doubles there.
+# Tests flip this flag to run each path on either machine.
 _X87 = np.finfo(np.longdouble).nmant >= 63
 
 
+def _hug(total: int) -> float:
+    """DuckDB's HUGEINT to DOUBLE cast, the same on both platforms (mojo/omxcore/wide.mojo `hug`): an upper word of -1 is
+    `-double(UINT64_MAX - lower) - 1.0`, any other `double(upper) * 2^64 + double(lower)`."""
+    upper, lower = total >> 64, total & ((1 << 64) - 1)
+    if upper == -1:
+        return -float((1 << 64) - 1 - lower) - 1.0
+    return float(upper) * 2.0 ** 64 + float(lower)
+
+
 def _ld_div(total: int, n: int) -> float:
-    """DuckDB's ``avg`` of an integer: the HUGEINT total, taken as a 64-bit-mantissa ``long double`` (upper * 2^64 +
-    lower, one rounding), divided by the count in ``long double`` and rounded to a double (F-126: probed, it is not
-    the correctly rounded total / n: 19 of 19 differing cases agree with this and with no other formula). Without
-    an x87 long double: Python's exact integer division, one rounding."""
+    """DuckDB's ``avg`` of an integer, on this platform. x86-64: the HUGEINT total, taken as a 64-bit-mantissa ``long double`` (upper * 2^64 +
+    lower, one rounding), divided by the count in ``long double`` and rounded to a double (F-126: probed, it is not the correctly rounded
+    total / n: 19 of 19 differing cases agree with this and with no other formula). Without an x87 (arm64, Windows): the cast of the total
+    to a double (`_hug`) divided by the count in doubles (F-211)."""
     if not _X87:
-        return total / n
+        return _hug(total) / n
     L = np.longdouble
     return float((L(total >> 64) * L(2.0 ** 64) + L(total & ((1 << 64) - 1))) / L(n))
 
@@ -464,10 +475,8 @@ def int_mean_of_totals(tot: np.ndarray, cnt: np.ndarray) -> np.ndarray:
     with np.errstate(divide="ignore", invalid="ignore"):
         if _X87:
             res = (tot.astype(np.longdouble) / safe.astype(np.longdouble)).astype(np.float64)
-        else:                                          # a total within 2^53 is exact as a double: one rounding
-            res = tot.astype(np.float64) / safe
-            for i in np.flatnonzero((tot > (1 << 53)) | (tot < -(1 << 53))):
-                res[i] = int(tot[i]) / int(safe[i])
+        else:                                          # DuckDB's HUGEINT cast of the total (`_hug`), divided in doubles (F-211)
+            res = np.where(tot < 0, -(~tot).astype(np.float64) - 1.0, tot.astype(np.float64)) / safe
     return np.where(cnt > 0, res, 0.0)
 
 
