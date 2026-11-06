@@ -24,7 +24,7 @@ if sys.platform == 'darwin':          # no /proc/self/maps: ask dyld for the loa
     dyld._dyld_image_count.restype = ctypes.c_uint32
     dyld._dyld_get_image_name.restype = ctypes.c_char_p
     dyld._dyld_get_image_name.argtypes = [ctypes.c_uint32]
-    maps = '\n'.join(dyld._dyld_get_image_name(i).decode() for i in range(dyld._dyld_image_count()))
+    maps = '\\n'.join(dyld._dyld_get_image_name(i).decode() for i in range(dyld._dyld_image_count()))
 else:
     maps = open('/proc/self/maps').read()
 print('libmxkernels_aot.so' in maps, 'libmxpipeline_cpu.so' in maps, 'libcuda' in maps,
