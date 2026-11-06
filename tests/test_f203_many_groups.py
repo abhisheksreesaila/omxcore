@@ -161,3 +161,20 @@ def test_decimal_having_takes_the_slot_path(mx, world):
 def test_order_by_aggregate_limit_is_cut_on_the_slots(mx, world):
     res = run_mx(mx, ["sql", "--max-rows", "0", "select uid, sum(a) s from t group by uid order by s desc, uid limit 10"], world["files"])
     assert any(n.startswith("order: top 10 found on the groups' partial slots") for n in res["notes"]), res["notes"]
+
+
+FALLBACK_TOPK = [
+    # some groups have only NULL d: a NULL first-key value sends the cut back to the old path, in both NULL orders
+    "select uid, sum(d) s from t group by uid order by s desc nulls first, uid limit 10",
+    "select uid, sum(d) s from t group by uid order by s desc nulls last, uid limit 10",
+    "select uid, max(d) m from t group by uid order by m nulls first, uid limit 10",
+    # a HAVING the slots cannot decide (OR) leaves the old path too
+    "select uid, sum(a) s from t group by uid having sum(a) > 30000 or count(*) > 4 order by s desc, uid limit 10",
+]
+
+
+@pytest.mark.parametrize("sql", FALLBACK_TOPK)
+def test_a_top_k_the_slots_cannot_cut_falls_back_and_equals_duckdb(mx, world, sql):
+    check(mx, sql, world["con"], world["files"], ordered=True)
+    res = run_mx(mx, ["sql", "--max-rows", "0", sql], world["files"])
+    assert not any("found on the groups' partial slots" in n for n in res["notes"]), res["notes"]

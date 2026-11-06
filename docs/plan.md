@@ -350,7 +350,6 @@ Before/after, mx-auto end to end via the F-001 worker (fresh process, scan_parqu
 | SF10 scan 3 cols, no filter | 354 | 300 | 170 |
 SF1 is unchanged by design (6 row groups, 6M rows: the plain reader is already ~25 ms).
 
-
 ## F-018 Join engine: order, lean materialization [done]
 Needs: F-011 merged · Found by the F-001 scoreboard: SF10 Q2 15.8x, Q9 9.4x, Q20 7.3x slower than Polars — joins dominate
 - [x] join reordering by estimated size/selectivity (filtered small sides first; e.g. Q2 joins 8M partsupp rows to supplier before the tiny filtered part table)
@@ -1104,7 +1103,6 @@ Found in the F-106 review (2026-10-16)
 - Tests: `tests/test_f110_float32_arith.py` (325 cases, cpu + gpu, native on and off, WHERE / SELECT value and type / aggregates / GROUP BY / HAVING, against a native DuckDB table): 120 fail on main, all pass. `pixi run test -k tpch`: 335 passed. `native_coverage.py --sf 1`: 22/22 no Arrow row work, same declines as before; `--sql`: unchanged except Q21 raising a correlated-EXISTS NotImplementedError (not arithmetic; not checked against main). Full suite: 22984 passed, 274 skipped, 5 xfailed (/tmp/f110_full.log).
 - Not done: `count(*) FILTER (WHERE ..)` is unsupported in the SQL front end (tests use CASE); float32 `%` is not rounded.
 
-
 - Review (2026-10-17): PASS. Trade-off recorded: SQL rounds float32 arithmetic like DuckDB, the DataFrame API still computes float32 in double, so SQL and DataFrame Q1 differ by ~1e-8 and SQL is now further from the exact DECIMAL answer (Q1 1.6e-9 -> 1.2e-8, Q3 2e-8 -> 5.4e-8; still 18x under the 1e-6 tolerance; equal to DuckDB on the same float32 Parquet)
 - [ ] quiet-machine check: SQL Q1 / Q3 on cpu against main (each float32 op adds an OP_F32 pass; Q1 charge goes from 4 to ~8 ops); expected a few percent on CPU, ~free on GPU
 - [ ] follow-ups: `test_aggregate` asserts result types (MIN / MAX FLOAT, SUM / AVG DOUBLE) via `typeof`; `count(*) FILTER (WHERE ...)` unsupported in SQL; float32 `%` (probe suggests it already matches DuckDB; pin with one test)
@@ -1343,7 +1341,6 @@ Needs: F-131 · Spec §1 · `mojo/mxframe/table.mojo`, test `mojo/tests/test_tab
 Needs: F-132 · Spec §2 ("Later")
 - [ ] export a Table as an Arrow struct array (int64 columns zero-copy, validity bitmaps, TEXT as dictionary<int64, utf8>, DECIMAL as int64 with its scale in field metadata or a decimal128 copy: decide), import one back; round trip with pyarrow from a Python test through a C-ABI shared library built from the package
 
-
 ## F-140 Mojo API: a query over a Parquet file bigger than RAM (streamed row groups) [done]
 Needs: F-135, F-137 · Spec §2, §5 · `mojo/mxframe/parquet.mojo`, `query.mojo` · Owner asked 2026-10-17 ("step 1": the cheap half of a disk tier; spilling joins / big group-bys is a later ticket)
 - [x] `Query(scan_parquet(path))` runs `where` / `group_by` / `agg` one row group at a time: only the columns the plan reads are decoded, each row group becomes a Table, the CPU kernel runs on it, partials merge (sums and counts add with the int64 overflow check, min / max combine, mean = merged sum / merged count). Peak memory is one row group's columns plus the result
@@ -1388,7 +1385,6 @@ Needs: F-142 · `table.mojo`, `parquet.mojo`, `csv.mojo`, `frame.mojo` · Naming
 - [ ] a TEXT column keeps its words in one byte arena with offsets and one hash index (the `_WordIndex` shape); the String-keyed `codes` Dict goes; `text_of` / `code_of` / `add_word` / the CSV reader / Frame session words / the Parquet writer use it; codes and words unchanged everywhere (every existing oracle)
 - [ ] then: big PLAIN text pages split into value slices so the one-page tail of a row group shrinks
 - [ ] measured: the 5M-row text read (F-142 bench) and the CSV 1M-row read, before / after
-
 
 ## F-145 Mojo API: every core busy inside a row group (parallel dictionary pages, big pages split by row range) [done]
 Needs: F-143 · `mojo/mxframe/parquet.mojo` · F-143 review: decode is the critical path and ~3-4 ms per group does not parallelise: a 1M-row single-page dictionary-index column decodes on one worker, ~1 MB dictionary pages decode serially inside the header walk, snappy is ~12 of 18 single-thread ms. Bar: within 1.5x of DuckDB on the streamed numeric query (0.149-0.164 s vs 0.072-0.086 s at 20M rows)
@@ -1706,7 +1702,6 @@ Needs: F-155 · Size: L · engine-first; F-058's losses are joins
 - Not built, in order of expected value: (1) a runtime key filter for a leaf that is read filtered after earlier steps (Q10: customer + orders leave 57,069 order keys, lineitem's filtered copy holds 1,478,870 rows, about 56,000 of them join: add `l_orderkey IN (the 57,069 keys)`, the kernel's IN set, to the leaf's row query when the keys are INT / DATE, at most about 1M, and a small share of the leaf); (2) the radix-partitioned probe (table over L3 / 2, probe at least 4x the build); (3) a bitmap of a probe side's surviving keys trimming the build side; (4) the cost model knowing fused stars and group-by-first (F-155 review notes).
 - Tests: `tests/test_f161_join_speed.py` (100: expansion for aggregates, LEFT, streamed, many groups under dense / hashed / staged morsels, a hot key past the limit, probe filter first, the sparse-array join filter, TPC-H Q12 / Q14 at SF 1, 24 random worlds x 14 queries; a one-off sweep of 400 random worlds x 14 queries equal DuckDB), the old join tests updated where they asserted `materialized` for aggregates. Run on this branch: the join files, f158, TPC-H gate 22 of 22, random gate, rows / holistic / sql / hashjoin_lib / kernel hashes: 1,401 passed, 9 skipped (as on main); the Mojo suite except test_gpu_*: all ok (test_views segfaulted in 3 of 150 runs on main too, in String._add inside a job thread: not from this ticket).
 
-
 - Review: PASS (round expansion counts each partner once, LEFT unmatched once, NULL keys, morsel bound, no weakened tests, kernel hashes match). Minor, open: the outer-join / join tests pick the expected path by SQL text (`"count(" in sql`); give the parametrization an explicit path field.
 
 ## F-199 `mojo/tests/test_views.mojo` segfaults about 3 runs in 150 (String._add in a job thread) [done 2026-11-05] (found 2026-11-05 by the F-161 developer, on main after F-160)
@@ -1730,7 +1725,6 @@ TPC-H Q18's inner step `SELECT l_orderkey FROM lineitem GROUP BY l_orderkey HAVI
 
 - Merged 2026-11-05 (HAVING on slots, parallel copy). Review: PASS; should-fix: a test that Q18's DECIMAL HAVING takes the slot path (note assertion). Left: the kernel's per-row flush for near-unique keys (adaptive raw partitioning), 12 of 24 threads, ORDER BY aggregate LIMIT building every group, the 70 ms HAVING loop.
 - Part 2 (2026-11-05, branch f-203b-groups-threads): ORDER BY an aggregate LIMIT (m = LIMIT + OFFSET <= 4096) keeps a heap of the m best first-key values on the slots and only the groups tied or better get columns (top-n at SF10 789 ms -> 553 ms, DuckDB 299, ratio 2.6 -> 1.85; the slot passes use raw slot addresses: the first version with nested List indexing took 444 ms and was slower than before). Threads: `core_count()` is the 12 physical cores of this 24-thread Ryzen, a design choice, not a cap; `--threads 24` on Q18's inner step and on Q1 changed nothing beyond noise (Q1 ~5% at best), so left. Adaptive raw partitioning (a worker whose table sees 3 of 4 rows as new keys stops probing and writes records straight): built and A/B-ed over 5 alternating runs, no measurable change (528-768 ms both ways, load 4), so reverted; a larger first partition buffer likewise. The workers' ~250 ms is the record writes and their page faults, not the probe.
-
 
 ## F-162 M8 gate: TPC-H 22 and the random suite through `mx sql` equal DuckDB [todo]
 - Harness built 2026-10-28 (review PASS): `tests/test_mx_tpch_gate.py` (22 queries through `mx sql`, a gap xfails only with its exact engine error), `tests/test_mx_random_gate.py` (80 seeds), `scripts/gate_scoreboard.py` (quiet-night timing, `--stream never`, median of 3 fresh processes, failures count as losses), `docs/bench/f162-coverage.md`. On main: 8/22 equal DuckDB, 80/80 random; the 14 gaps are F-159 shapes, Q16 / Q21 (subquery beside a join, two subqueries), Q14 (F-190). `mx sql --device gpu|auto` runs the CPU (F-191).
