@@ -1925,3 +1925,12 @@ Where the time goes (F-202): Q13 writes a 14.8M-row filtered copy of orders (99%
 - Left, by design: a multi-way query's intermediate steps and star dimensions still read their (reduced) filtered leaves as copies (`_read_filtered`, `_read_filtered_reduced`: small by construction, none of Q3 / Q7 / Q8 has a big high-pass leaf); the flags are not made for a scan (Parquet row groups) or a Frame with changed rows.
 
 - Merged aa65288. Review: PASS; should-fixes (LEFT preserved-side filter, flag note on Frames, multi-way claim corrected, appends-only Frame) done. Main after merge: pytest 29,514 passed, mojo 45 ok.
+## F-207 Random-suite losses: join aggregates, multi-key TEXT group-by top-k, ORDER BY LIMIT scans [todo] (owner 2026-11-06 night run; evidence docs/bench/2026-11-06-night-partial.md)
+Needs: F-201..F-205 · Size: L · general cost / shape rules only, never seed- or TPC-H-specific.
+Evidence (random suite, omxcore ms / DuckDB ms under load; SQL from `scripts/gate_common.py random_sql(seed, random_stats(sf))`): SF10 r1 576/193 and r51 626/391 (lineitem JOIN orders [JOIN supplier], selective filters on both sides, a few groups); SF1 r14 82/10 (GROUP BY o_custkey + two TEXT keys, ORDER BY sum LIMIT 10); SF10 r24 98/44 (ORDER BY ... LIMIT 10 over a filtered lineitem scan).
+- [ ] cost found first per query with EXPLAIN ANALYZE step timings, written here
+- [ ] join aggregate (r1, r51): fact filter first, dimension filter as a presence bitmap, one fused probe pass; faster than before, equal DuckDB
+- [ ] multi-key group-by with TEXT parts plus ORDER BY aggregate LIMIT (r14): top-k on hashed composite groups, and keys fixed by a WHERE equality folded to constants; faster than before, equal DuckDB
+- [ ] ORDER BY ... LIMIT over a filtered scan (r24): per-thread heaps with late column fetch, no full materialization or sort; faster than before, equal DuckDB
+- [ ] each fast path holds on every entry point (SQL over Tables, SQL over edited Frames, the builder API): tests assert DuckDB equality and the path note on each, over random worlds with NULLs and ties at the LIMIT boundary
+- [ ] `pixi run test -n 4` and `pixi run mojo-test` pass (exit codes checked); no scoreboard runs, single-query checks with DuckDB in the same minute and the load noted
