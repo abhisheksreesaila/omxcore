@@ -2519,7 +2519,7 @@ def lower_sql(q: BoundQuery, plan: PhysicalPlan, var nullable: List[Bool], var p
             var v = e.value(lay.expr)
             if lay.nullable and v.nul < 0:                           # the planner says the key may be NULL (it is cautious about expressions): this one never is
                 v = V(v.reg, e.const_f(0.0), v.unk, v.fl)
-            if lay.kind == TEXT.value or lay.kind == BOOL.value:
+            if (lay.kind == TEXT.value or lay.kind == BOOL.value) and not lay.fixed:     # (a key the WHERE pins is offset by its value like a number: its slot is 0)
                 if lay.nullable:
                     var one = e.const_i(1)
                     e.ins(OP_IADD, v.reg, v.reg, one)

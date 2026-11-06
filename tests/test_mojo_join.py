@@ -188,6 +188,9 @@ def test_empty_sides(mx, data):
 def test_a_hot_key(mx, data):
     # the hot key is on the probe side: the build side (dims) has unique keys, so the join is fused
     res = q(mx, data, "SELECT count(*), sum(h.v) FROM hot h JOIN dims d ON h.k = d.k", ["hot", "dims"])
+    # (no column of dims is read after the join: its unique keys are a presence bitmap, F-207; reading one keeps the direct array)
+    assert re.match(r"join build side: d \(2,000 rows, the smaller side\): presence bitmap:", note(res, "join build side")), res["notes"]
+    res = q(mx, data, "SELECT count(*), sum(h.v), max(d.k) FROM hot h JOIN dims d ON h.k = d.k", ["hot", "dims"])
     assert re.match(r"join build side: d \(2,000 rows, the smaller side\): direct array, unique keys", note(res, "join build side")), res["notes"]
     assert note(res, "join path").startswith("join path: fused:"), res["notes"]
     # the hot key on both sides: repeated build keys, materialized pairs

@@ -13,7 +13,7 @@ from .frame import NULL_EDIT, text_ranks, _radix_order
 from .query import Program, _ScanMask, _group_mask
 from .kernels._fpenv import core_count, par_n
 from .kernels.pipeline_cpu import IP, LP, FP, BP
-from .bind import Catalog, SqlSource, BoundQuery, SortKey, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, B_CAST, B_DATEPART, B_DATETRUNC, B_ADDMONTHS, B_DATEDIFF, B_NEG, B_ADD, B_SUB
+from .bind import Catalog, SqlSource, BoundQuery, SortKey, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, B_LIT, B_STR, B_AND, B_CMP, C_EQ, B_CAST, B_DATEPART, B_DATETRUNC, B_ADDMONTHS, B_DATEDIFF, B_NEG, B_ADD, B_SUB
 from .planner import Stats, ColStat
 from .sqlprog import DictAccess, collect_columns
 from .sqleval import ValCol
@@ -199,6 +199,44 @@ def _delta_nulls(src: SqlSource, c: Int) -> Bool:
     return False
 
 
+def _pin_columns(q: BoundQuery, dicts: DictAccess, mut st: Stats, e: Int) raises:
+    """F-207: a column the WHERE pins with `col = literal` (a conjunct of its top-level ANDs) holds that one value in every row that passes (never NULL), so a
+    GROUP BY on it needs one slot: `ColStat.fixed` / `fixed_val` (the stored value, or a TEXT word's code; a word no row holds pins nothing)."""
+    ref x = q.rexprs[e]
+    if x.op == B_AND:
+        _pin_columns(q, dicts, st, x.a)
+        _pin_columns(q, dicts, st, x.b)
+        return
+    if x.op != B_CMP or Int(x.value) != C_EQ:
+        return
+    var a = x.a
+    var b = x.b
+    if q.rexprs[a].op != B_COL:
+        a = x.b
+        b = x.a
+    if q.rexprs[a].op != B_COL:
+        return
+    ref col = q.rexprs[a]
+    ref lit = q.rexprs[b]
+    var c = Int(col.value)
+    if c < 0 or c >= len(st.cols) or st.cols[c].fixed:                  # (two different literals on one column: the first stays, the answer is empty either way)
+        return
+    if col.kind == TEXT.value:
+        if lit.op != B_STR:
+            return
+        var code = dicts.code_of(col.src if col.src >= 0 else c, lit.text)
+        if code < 0:
+            return
+        st.cols[c].fixed_val = Int64(code)
+    elif col.kind == INT.value or col.kind == DATE.value or col.kind == DECIMAL.value or col.kind == BOOL.value:
+        if lit.op != B_LIT or lit.kind != col.kind or lit.scale != col.scale:
+            return
+        st.cols[c].fixed_val = lit.value
+    else:
+        return
+    st.cols[c].fixed = True
+
+
 def make_stats(src: SqlSource, q: BoundQuery, dicts: DictAccess, trust: Bool = True) raises -> Stats:
     """`trust` False: a file's footer statistics are not used (every column may hold NULLs, no range is known)."""
     var st = Stats(src.name, src.kind, src.rows() + (len(src.overlay.delta) if src.kind != SRC_SCAN else 0))
@@ -224,6 +262,8 @@ def make_stats(src: SqlSource, q: BoundQuery, dicts: DictAccess, trust: Bool = T
                 cs.lo = src.range_lo[i]
                 cs.hi = src.range_hi[i]
         st.cols.append(cs^)
+    if q.where >= 0 and not q.joined and not q.rows:
+        _pin_columns(q, dicts, st, q.where)
     return st^
 
 

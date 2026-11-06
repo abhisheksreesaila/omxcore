@@ -34,6 +34,7 @@ The serial build (no Mojo async runtime, the Apple link) runs every task in a lo
 from std.memory.alloc import unsafe_alloc
 from std.memory import Pointer, unsafe_memset_zero
 from std.ffi import external_call
+from std.bit import pop_count
 from std.sys import prefetch, PrefetchOptions, CompilationTarget
 from _fpenv import par_n, core_count, start_pool
 
@@ -45,6 +46,7 @@ comptime BP = Pointer[UInt8, MutUntrackedOrigin]
 comptime MODE_EMPTY = 0
 comptime MODE_DIRECT = 1
 comptime MODE_HASH = 2
+comptime MODE_BITS = 3                  # F-207: presence only, unique keys: one bit per key of lo .. hi (`hj_build(bits=True)`), no row numbers
 
 comptime DIRECT_MAX = 1 << 28           # the most key values a direct array covers
 comptime DIRECT_MIN_RANGE = 1 << 20     # a range this small is always direct (the array is small whatever the row count)
@@ -93,6 +95,14 @@ def _free(a: Int):
 @always_inline
 def _prefetch(addr: Int):
     prefetch[PrefetchOptions().for_read().high_locality().to_data_cache()](LP(unsafe_from_address=addr))
+
+
+@always_inline
+def _fetch_or_u64(ptr: UP, val: UInt64):
+    """Atomic OR (monotonic) via llvm.atomicrmw (bin_op 5 = or): the same pattern as joinsemi_cpu.mojo."""
+    var p = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.`!llvm.ptr`](ptr._mlir_value)
+    var v = __mlir_op.`builtin.unrealized_conversion_cast`[_type = __mlir_type.i64](val)
+    _ = __mlir_op.`llvm.atomicrmw`[bin_op = __mlir_attr.`5 : i64`, ordering = __mlir_attr.`2 : i64`, _type = __mlir_type.i64](p, v)
 
 
 def _bits(n: Int) -> Int:
@@ -151,6 +161,8 @@ struct JoinMap(Movable):
     def kind(self) -> String:
         if self.mode == MODE_EMPTY:
             return "empty"
+        if self.mode == MODE_BITS:
+            return "presence bitmap: " + String(self.nvalid) + " keys in " + String(self.span) + " values, one bit each (no hash table)"
         if self.presence:
             return "direct array, presence marks only"
         var base = "direct array" if self.mode == MODE_DIRECT else "hash table (" + String(1 << self.pbits) + " partitions)"
@@ -233,10 +245,14 @@ def _part_of(k: Int64, direct: Bool, base: Int64, pshift: Int, pbits: Int) -> In
 
 # ── build ────────────────────────────────────────────────────────────────────────────────────────────
 
-def hj_build(keys_a: Int, ok_a: Int, n: Int, threads: Int, presence: Bool = False) -> JoinMap:
+def hj_build(keys_a: Int, ok_a: Int, n: Int, threads: Int, presence: Bool = False, bits: Bool = False) -> JoinMap:
     """The map of the build side's keys. See the module doc for the layout it chooses. `presence`: the caller only asks whether a key is present (semi and
     anti joins: `hj_probe_select`, `hj_filter_block`): keys that fit a direct array are then marked in one pass (any row of the key will do, no repeated-key
-    rows are kept), which is cheaper than the CSR build; the map answers presence lookups only (`hj_probe_unique` / `hj_probe_pairs` would see an arbitrary row)."""
+    rows are kept), which is cheaper than the CSR build; the map answers presence lookups only (`hj_probe_unique` / `hj_probe_pairs` would see an arbitrary row).
+    `bits` (F-207): the caller needs an inner join's partner only to know it exists (no build-side column is read), so a build side whose keys are unique
+    and span fewer than BITMAP_MAX_RANGE values is one bit per key (MODE_BITS: a probe is one load from the cache-resident bitmap, `u` and the hash
+    table are never built); repeated keys (fewer bits than usable rows) or a wider span build the map as usual. `presence` alone (semi and anti joins) takes
+    the same bitmap whenever the span is under BITMAP_MAX_RANGE, repeats or not: 8 MB of bits instead of an Int32 mark per key."""
     var m = JoinMap()
     m.n = n
     if n <= 0:
@@ -278,6 +294,31 @@ def hj_build(keys_a: Int, ok_a: Int, n: Int, threads: Int, presence: Bool = Fals
     m.lo = lo
     m.hi = hi
     var span_u = UInt64(hi) - UInt64(lo)
+    if (bits or presence) and span_u < UInt64(BITMAP_MAX_RANGE):
+        var nwords = (Int(span_u) + 1 + 63) // 64
+        var bmw = UP(unsafe_from_address=_alloc(8 * nwords))
+        unsafe_memset_zero(BP(unsafe_from_address=Int(bmw)), 8 * nwords)
+
+        def setbits(t: Int) {imm}:
+            for i in range(_slice(n, t, T), _slice(n, t + 1, T)):
+                if has_ok and oks[i] == 0:
+                    continue
+                var d = Int(keys[i] - lo)
+                _fetch_or_u64(bmw + (d >> 6), UInt64(1) << UInt64(d & 63))
+
+        par_n(setbits, T, T)
+        var distinct = 0
+        for w in range(nwords):
+            distinct += Int(pop_count(bmw[w]))
+        if presence or distinct == nvalid:                       # (a presence-only caller does not care that a key repeats: one bit says it is there)
+            m.mode = MODE_BITS
+            m.span = Int(span_u) + 1
+            m.unique = True
+            m.presence = True
+            m.bitmap = Int(bmw)
+            m.bytes = 8 * nwords
+            return m^
+        _free(Int(bmw))
     var direct = span_u < UInt64(DIRECT_MAX) and Int(span_u) + 1 <= max(DIRECT_FACTOR * nvalid, DIRECT_MIN_RANGE)
     var span = Int(span_u) + 1 if direct else 0
     if presence and direct:
@@ -614,6 +655,8 @@ def _prefetch_key(m_mode: Int, lo: Int64, hi: Int64, span: Int, unique: Bool, u:
         return
     if bitmap != 0 and not _has_bit(BP(unsafe_from_address=bitmap), Int(k - lo)):
         return                                                    # (a miss never touches the table: F-161's key bitmap on a direct array, the hash's own presence bits)
+    if m_mode == MODE_BITS:
+        return                                                    # (the bit was the whole lookup)
     if m_mode == MODE_DIRECT:
         _prefetch((u if unique else s) + 4 * Int(k - lo))
         return
@@ -662,6 +705,8 @@ def hj_probe_unique(m: JoinMap, keys_a: Int, ok_a: Int, n: Int, out_a: Int, thre
                     if k >= lo and k <= hi:
                         if bitmap != 0 and not _has_bit(BP(unsafe_from_address=bitmap), Int(k - lo)):
                             pass
+                        elif mode == MODE_BITS:
+                            r = 0                                 # (a presence-only map: the key is there, there is no row to name)
                         elif mode == MODE_DIRECT:
                             r = IP(unsafe_from_address=u)[Int(k - lo)]
                         else:
@@ -683,6 +728,9 @@ def _match(mode: Int, unique: Bool, lo: Int64, hi: Int64, u: Int, s: Int, ent: I
     if k < lo or k > hi:
         return
     if bitmap != 0 and not _has_bit(BP(unsafe_from_address=bitmap), Int(k - lo)):
+        return
+    if mode == MODE_BITS:
+        count = 1
         return
     if mode == MODE_DIRECT:
         var d = Int(k - lo)
@@ -958,6 +1006,8 @@ def hj_probe_block(v: MapView, keys: LP, ok: BP, has_ok: Bool, i0: Int, sel: IP,
             var b = Int32(-1)
             if bitmap != 0 and not _has_bit(BP(unsafe_from_address=bitmap), Int(k - lo)):
                 pass
+            elif mode == MODE_BITS:
+                b = 0                                             # (presence only: no build-side column is read through this row)
             elif mode == MODE_DIRECT:
                 b = IP(unsafe_from_address=u)[Int(k - lo)]
             else:
@@ -1032,6 +1082,8 @@ def hj_probe_left_block(v: MapView, keys: LP, ok: BP, has_ok: Bool, i0: Int, sel
                 if k >= v.lo and k <= v.hi:
                     if v.bitmap != 0 and not _has_bit(BP(unsafe_from_address=v.bitmap), Int(k - v.lo)):
                         pass
+                    elif mode == MODE_BITS:
+                        b = 0
                     elif mode == MODE_DIRECT:
                         b = IP(unsafe_from_address=v.u)[Int(k - v.lo)]
                     else:

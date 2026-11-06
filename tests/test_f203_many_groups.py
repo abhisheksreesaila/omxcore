@@ -163,11 +163,23 @@ def test_order_by_aggregate_limit_is_cut_on_the_slots(mx, world):
     assert any(n.startswith("order: top 10 found on the groups' partial slots") for n in res["notes"]), res["notes"]
 
 
-FALLBACK_TOPK = [
-    # some groups have only NULL d: a NULL first-key value sends the cut back to the old path, in both NULL orders
+NULL_TOPK = [
+    # some groups have only NULL d: a NULL first-key value counts as the best or the worst by NULLS FIRST / LAST (F-207; it used to send the cut back to the old path)
     "select uid, sum(d) s from t group by uid order by s desc nulls first, uid limit 10",
     "select uid, sum(d) s from t group by uid order by s desc nulls last, uid limit 10",
     "select uid, max(d) m from t group by uid order by m nulls first, uid limit 10",
+    "select uid, max(d) m from t group by uid order by m nulls last, uid limit 10",
+]
+
+
+@pytest.mark.parametrize("sql", NULL_TOPK)
+def test_a_null_aggregate_is_cut_on_the_slots_and_equals_duckdb(mx, world, sql):
+    check(mx, sql, world["con"], world["files"], ordered=True)
+    res = run_mx(mx, ["sql", "--max-rows", "0", sql], world["files"])
+    assert any("found on the groups' partial slots" in n for n in res["notes"]), res["notes"]
+
+
+FALLBACK_TOPK = [
     # a HAVING the slots cannot decide (OR) leaves the old path too
     "select uid, sum(a) s from t group by uid having sum(a) > 30000 or count(*) > 4 order by s desc, uid limit 10",
 ]

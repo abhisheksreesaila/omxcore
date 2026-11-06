@@ -32,10 +32,10 @@ from .bind import (copy_query, Catalog, SqlSource, BoundQuery, SortKey, bind_sql
                    BExpr, AggSpec, KeySpec, pow10_checked)
 from .plan import LogicalPlan, build_plan, executable
 from .post import run_post
-from .join import (needed_columns, side_query, joined_query, virtual_schema, all_needed, needed_after, table_of_column, filter_query, final_query, count_query,
+from .join import (needed_columns, live_columns, side_query, joined_query, virtual_schema, all_needed, needed_after, table_of_column, filter_query, final_query, count_query,
                    with_probe_filter, final_needed, virtual_schema_multi, star_query)
 from .joincore import JoinKeys, JoinSide, KeyPlan, make_key_plan, column_ndv, normalize_keys, unmatchable_not_null, join_pairs, select_rows, gather_join, JoinPairs, JOIN_BUDGET_BYTES, build_budget_error, count_flags, apply_build_keep, compact_side
-from .kernels.hashjoin_cpu import hj_build, JoinMap, PM_SEMI, PM_ANTI, PM_ANTI_NA, PM_NONE
+from .kernels.hashjoin_cpu import hj_build, JoinMap, MODE_BITS, PM_SEMI, PM_ANTI, PM_ANTI_NA, PM_NONE
 from .kargs import KernelRun
 from .winsql import plan_windows, finish_windows, point_wide_columns, fix_wide_columns, WIN_TABLE
 from .jfront import EXPAND_MAX_REP, pred_reads_probe_only, FusedJoin, StageData, StreamStage, ProbeStream, chunk_join, stream_template, front_spec, jf_front
@@ -575,8 +575,8 @@ comptime TOPK_MAX = 4096                     # F-203: the most rows (LIMIT + OFF
 
 def _topk_groups(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, mut gids: List[Int]):
     """F-203: ORDER BY an aggregate with LIMIT: keeps the groups whose first sort value is as good as the LIMIT + OFFSET'th best (ties included), so the
-    finish builds columns for those alone and the stage after aggregation sorts them by every key and cuts as before. A NULL aggregate (its place
-    depends on NULLS FIRST / LAST) or an unreadable first key leaves `gids` untouched."""
+    finish builds columns for those alone and the stage after aggregation sorts them by every key and cuts as before. A NULL aggregate (a SUM / MIN / MAX
+    of no value) counts as the best or the worst value by NULLS FIRST / LAST (F-207: a sentinel past every Int128 sum); an unreadable first key leaves `gids` untouched."""
     var m = q.limit + q.offset
     if q.limit < 0 or len(q.order) == 0 or m <= 0 or m > TOPK_MAX or len(gids) <= 4 * m or len(gids) < TOPK_MIN_GROUPS:
         return
@@ -588,6 +588,7 @@ def _topk_groups(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial
         return
     _arm(acc, cond)
     var desc = o.desc
+    var null_v = (Int128.MAX if desc else Int128.MIN) if o.nulls_first else (Int128.MIN if desc else Int128.MAX)       # a NULL: better than every value, or worse
     # a heap of the m best values so far; its root is the worst of them
     var hv = List[Int128]()
     hv.reserve(m)
@@ -595,7 +596,7 @@ def _topk_groups(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial
         var is_null = False
         var v = _cond_value(cond, gids[i], is_null)
         if is_null:
-            return
+            v = null_v
         if len(hv) < m:
             hv.append(v)
             var c = len(hv) - 1
@@ -630,6 +631,8 @@ def _topk_groups(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial
     for i in range(len(gids)):
         var is_null = False
         var v = _cond_value(cond, gids[i], is_null)
+        if is_null:
+            v = null_v
         if (v >= thr) if desc else (v <= thr):
             keep.append(gids[i])
     gids = keep^
@@ -674,7 +677,7 @@ def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hre
                         vc.set_null(i)
                         continue
                     part -= 1
-                vc.v[i] = Int64(part) + (0 if (lay.kind == TEXT.value or lay.kind == BOOL.value) else lay.lo)
+                vc.v[i] = Int64(part) + (0 if ((lay.kind == TEXT.value or lay.kind == BOOL.value) and not lay.fixed) else lay.lo)
             else:
                 if lay.nullable and acc.kw[kwat + 1][gids[i]] != 0:
                     vc.set_null(i)
@@ -2149,7 +2152,8 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
                     fmode = PM_ANTI_NA
                     na_note = " (a NULL key is dropped)"
         t_build = perf_counter_ns()
-        m = hj_build(keys.bk_addr, keys.bo_addr, nb0, opts.threads, semi_anti)
+        var bits = kind == 0 and len(live_columns(qe, 0 if left_builds else 1)) == 0          # F-207: no build-side column is read: unique keys are one bit each
+        m = hj_build(keys.bk_addr, keys.bo_addr, nb0, opts.threads, semi_anti, bits)
         if fmode == PM_ANTI_NA and not streaming:
             unmatchable_not_null(keys, m.lo, m.hi, left.table, left.key_cols[0], left.table.rows())
         t_probe = perf_counter_ns()
@@ -2157,6 +2161,8 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
         fusable = opts.fuse and not keys.verify and not any_holistic and (m.unique or semi_anti or expands)
         if streaming and (kplan.hashed or fmode == PM_ANTI_NA):
             fusable = False                                          # (hashed tuples are verified per pair; NOT IN's unmatchable words are settled over the whole probe side)
+        if m.mode == MODE_BITS and not fusable:                      # a bitmap names no build row: the pairs of an unfused join need the usual map
+            m = hj_build(keys.bk_addr, keys.bo_addr, nb0, opts.threads, semi_anti)
         if defer_probe >= 0 and not fusable and pass_no == 1:
             # the join cannot be fused after all (repeated build keys, hashed keys): read the probe side filtered, as before
             if defer_probe == 0:
@@ -2592,7 +2598,12 @@ def _run_star[P: Planner](mut catalog: Catalog, q: BoundQuery, mut leaves: List[
             kplan = make_key_plan(stage_leaf.table, psrc.table, rkey, lkey, pw, pal, keys)
         else:
             normalize_keys(stage_leaf.table, probe, rkey, lkey, keys, threads)
-        var m = hj_build(keys.bk_addr, keys.bo_addr, stage_leaf.table.rows(), threads)
+        var no_cols = True                                          # F-207: no column of this dimension is read (a filter-only or key-only dimension): its keys are one bit each
+        for c in range(stage_leaf.table.columns()):
+            var g = stage_leaf.gtable[c]
+            if g >= 0 and need[g]:
+                no_cols = False
+        var m = hj_build(keys.bk_addr, keys.bo_addr, stage_leaf.table.rows(), threads, False, no_cols)
         if keys.verify or kplan.hashed or not m.unique:
             res.notes.append("star: " + label + " has " + ("hashed keys" if (keys.verify or kplan.hashed) else "repeated keys") + ": the joins run one by one")
             return False

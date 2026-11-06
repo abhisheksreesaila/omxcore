@@ -238,7 +238,9 @@ def test_a_sparse_direct_array_has_a_runtime_join_filter(mx, data, sql, path):
     res = q(mx, data, sql, ["probes", "sparse", "sparse_rep"], extra=BUILD_RIGHT)
     assert note(res, "join path").startswith(path), res["notes"]
     if "IN (SELECT" not in sql:                                     # (a semi join builds presence marks only: no filter bitmap)
-        assert FILTER in note(res, "join build side"), res["notes"]
+        reads_build = "s." in sql.split("FROM")[0] or "r." in sql.split("FROM")[0] or "name" in sql.split("FROM")[0]
+        # no column of the build side read after the join (F-207): its unique keys are the bitmap itself; else the direct array keeps a bitmap in front of it
+        assert (FILTER if reads_build else "presence bitmap") in note(res, "join build side"), res["notes"]
 
 
 @pytest.mark.parametrize("threads", ["1", "3"])
