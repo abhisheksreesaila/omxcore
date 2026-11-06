@@ -162,7 +162,11 @@ def compute_joined(q: Query, device: Int, job: JobCtl) raises -> QueryResult:
         else:
             normalize_keys(jn.right, jn.left, jn.rkeys, jn.lkeys, keys, q._threads)
         var nb = jn.left.rows() if left_builds else jn.right.rows()
-        m = hj_build(keys.bk_addr, keys.bo_addr, nb, q._threads, semi_anti)
+        var bits = kind == 0                                         # F-207: no build-side column is read: unique keys are one bit each
+        for v in range(0 if left_builds else jn.left.columns(), jn.left.columns() if left_builds else len(used)):
+            if used[v]:
+                bits = False
+        m = hj_build(keys.bk_addr, keys.bo_addr, nb, q._threads, semi_anti, bits)
         expands = kind <= 1 and not m.unique and m.maxrep <= EXPAND_MAX_REP
         if keys.verify:
             why = " (the keys are hashed tuples, verified per pair)"
