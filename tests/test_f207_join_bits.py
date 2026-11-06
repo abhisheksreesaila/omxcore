@@ -24,6 +24,12 @@ TWO = [
     ("a holistic aggregate (the join is not fused)", "SELECT f.a % 5 AS g, count(DISTINCT f.x) FROM f JOIN da ON f.a = da.id WHERE da.seg = 2 GROUP BY f.a % 5 ORDER BY g",
      ["f", "da"], False),
     ("a row query", "SELECT f.id, f.x FROM f JOIN da ON f.a = da.id WHERE da.seg = 3 AND f.x > 40 ORDER BY f.x DESC, f.id LIMIT 12", ["f", "da"], True),
+    # semi and anti joins only ask whether a key is there: a bitmap too, repeated keys included (db.bk repeats)
+    ("a semi join (IN)", "SELECT f.a % 5 AS g, count(*), sum(f.x) FROM f WHERE f.a IN (SELECT id FROM da WHERE seg = 2) GROUP BY f.a % 5 ORDER BY g", ["f", "da"], True),
+    ("a semi join over repeated keys", "SELECT f.a % 5 AS g, count(*) FROM f WHERE f.a IN (SELECT bk FROM db) GROUP BY f.a % 5 ORDER BY g", ["f", "db"], True),
+    ("an anti join (NOT EXISTS)", "SELECT f.a % 5 AS g, count(*), sum(f.x) FROM f WHERE NOT EXISTS (SELECT 1 FROM da WHERE da.id = f.a AND da.seg = 2) GROUP BY f.a % 5 ORDER BY g", ["f", "da"], True),
+    ("NOT IN over a list without NULL", "SELECT f.a % 5 AS g, count(*) FROM f WHERE f.a NOT IN (SELECT id FROM da WHERE seg < 3) GROUP BY f.a % 5 ORDER BY g", ["f", "da"], True),
+    ("NOT IN over a list with a NULL", "SELECT count(*) FROM f WHERE f.a NOT IN (SELECT ak FROM da)", ["f", "da"], None),
 ]
 
 
@@ -38,7 +44,8 @@ def test_two_tables(probe, world, name, sql, tables, bits):
     assert_equal(got_rows(res), want, "ORDER BY" in sql, f"table: {sql}")
     line = [n for n in res["notes"] if n.startswith("join build side:")]
     assert line, res["notes"]
-    assert (BITS in line[0]) == bits, line[0]
+    if bits is not None:
+        assert (BITS in line[0]) == bits, line[0]
 
 
 @pytest.mark.parametrize("frame_table", ["f", "da"])

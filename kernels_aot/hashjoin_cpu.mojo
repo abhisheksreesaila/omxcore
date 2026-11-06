@@ -162,7 +162,7 @@ struct JoinMap(Movable):
         if self.mode == MODE_EMPTY:
             return "empty"
         if self.mode == MODE_BITS:
-            return "presence bitmap, unique keys: " + String(self.nvalid) + " keys in " + String(self.span) + " values, one bit each (no hash table)"
+            return "presence bitmap: " + String(self.nvalid) + " keys in " + String(self.span) + " values, one bit each (no hash table)"
         if self.presence:
             return "direct array, presence marks only"
         var base = "direct array" if self.mode == MODE_DIRECT else "hash table (" + String(1 << self.pbits) + " partitions)"
@@ -251,7 +251,8 @@ def hj_build(keys_a: Int, ok_a: Int, n: Int, threads: Int, presence: Bool = Fals
     rows are kept), which is cheaper than the CSR build; the map answers presence lookups only (`hj_probe_unique` / `hj_probe_pairs` would see an arbitrary row).
     `bits` (F-207): the caller needs an inner join's partner only to know it exists (no build-side column is read), so a build side whose keys are unique
     and span fewer than BITMAP_MAX_RANGE values is one bit per key (MODE_BITS: a probe is one load from the cache-resident bitmap, `u` and the hash
-    table are never built); repeated keys (fewer bits than usable rows) or a wider span build the map as usual."""
+    table are never built); repeated keys (fewer bits than usable rows) or a wider span build the map as usual. `presence` alone (semi and anti joins) takes
+    the same bitmap whenever the span is under BITMAP_MAX_RANGE, repeats or not: 8 MB of bits instead of an Int32 mark per key."""
     var m = JoinMap()
     m.n = n
     if n <= 0:
@@ -293,7 +294,7 @@ def hj_build(keys_a: Int, ok_a: Int, n: Int, threads: Int, presence: Bool = Fals
     m.lo = lo
     m.hi = hi
     var span_u = UInt64(hi) - UInt64(lo)
-    if bits and span_u < UInt64(BITMAP_MAX_RANGE):
+    if (bits or presence) and span_u < UInt64(BITMAP_MAX_RANGE):
         var nwords = (Int(span_u) + 1 + 63) // 64
         var bmw = UP(unsafe_from_address=_alloc(8 * nwords))
         unsafe_memset_zero(BP(unsafe_from_address=Int(bmw)), 8 * nwords)
@@ -309,7 +310,7 @@ def hj_build(keys_a: Int, ok_a: Int, n: Int, threads: Int, presence: Bool = Fals
         var distinct = 0
         for w in range(nwords):
             distinct += Int(pop_count(bmw[w]))
-        if distinct == nvalid:                                   # no key repeats
+        if presence or distinct == nvalid:                       # (a presence-only caller does not care that a key repeats: one bit says it is there)
             m.mode = MODE_BITS
             m.span = Int(span_u) + 1
             m.unique = True
