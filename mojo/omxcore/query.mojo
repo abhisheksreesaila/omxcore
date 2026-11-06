@@ -564,7 +564,8 @@ struct Query(Movable, ViewSource):
 
     def table(self) raises -> SharedTable:
         """The rows this query reads, as a table: the table it was built over, a Frame's edited rows, a joined query's joined rows. A method since F-204: the field
-        holding the input is `base`, which for a joined query is only the joined schema with no rows, so a reader must ask (`q.table()`) and never meets it empty."""
+        holding the input is `base`, which for a joined query is only the joined schema with no rows, so a reader must ask (`q.table()`) and never meets it empty.
+        A joined query or an edited Frame writes its rows on every call: keep the result rather than calling it again."""
         return self.joined_table()
 
     def joined_table(self) raises -> SharedTable:
