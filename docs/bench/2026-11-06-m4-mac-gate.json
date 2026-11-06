@@ -1,0 +1,3327 @@
+{
+ "SF1/Q1": {
+  "sql": "SELECT\n    l_returnflag,\n    l_linestatus,\n    sum(l_quantity) AS sum_qty,\n    sum(l_extendedprice) AS sum_base_price,\n    sum(l_extendedprice * (1 - l_discount)) AS sum_disc_price,\n    sum(l_extendedprice * (1 - l_discount) * (1 + l_tax)) AS sum_charge,\n    avg(l_quantity) AS avg_qty,\n    avg(l_extendedprice) AS avg_price,\n    avg(l_discount) AS avg_disc,\n    count(*) AS count_order\nFROM\n    lineitem\nWHERE\n    l_shipdate <= CAST('1998-09-02' AS date)\nGROUP BY\n    l_returnflag,\n    l_linestatus\nORDER BY\n    l_returnflag,\n    l_linestatus",
+  "tables": [
+   "lineitem"
+  ],
+  "duckdb": {
+   "ms": [
+    22.33408301253803,
+    22.193290991708636,
+    22.194709003088064
+   ],
+   "device_note": "",
+   "rows": 4
+  },
+  "cpu": {
+   "ms": [
+    80.799,
+    79.76,
+    83.495
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 4,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    319.149,
+    317.032,
+    318.458
+   ],
+   "device_note": "device: GPU (GPU asked for, the table uploaded for this query)",
+   "rows": 4,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    81.189,
+    81.019,
+    80.062
+   ],
+   "device_note": "device: CPU (AUTO: no table resident on the GPU (attach a DeviceTable, or --device gpu uploads it for the query))",
+   "rows": 4,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q2": {
+  "sql": "SELECT\n    s_acctbal,\n    s_name,\n    n_name,\n    p_partkey,\n    p_mfgr,\n    s_address,\n    s_phone,\n    s_comment\nFROM\n    part,\n    supplier,\n    partsupp,\n    nation,\n    region\nWHERE\n    p_partkey = ps_partkey\n    AND s_suppkey = ps_suppkey\n    AND p_size = 15\n    AND p_type LIKE '%BRASS'\n    AND s_nationkey = n_nationkey\n    AND n_regionkey = r_regionkey\n    AND r_name = 'EUROPE'\n    AND ps_supplycost = (\n        SELECT\n            min(ps_supplycost)\n        FROM\n            partsupp,\n            supplier,\n            nation,\n            region\n        WHERE\n            p_partkey = ps_partkey\n            AND s_suppkey = ps_suppkey\n            AND s_nationkey = n_nationkey\n            AND n_regionkey = r_regionkey\n            AND r_name = 'EUROPE')\nORDER BY\n    s_acctbal DESC,\n    n_name,\n    s_name,\n    p_partkey\nLIMIT 100",
+  "tables": [
+   "nation",
+   "part",
+   "partsupp",
+   "region",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    4.762500000651926,
+    4.7740409936523065,
+    4.8433750052936375
+   ],
+   "device_note": "",
+   "rows": 100
+  },
+  "cpu": {
+   "ms": [
+    16.125,
+    16.445,
+    16.196
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 100,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    16.155,
+    16.063,
+    16.124
+   ],
+   "device_note": "device: CPU (GPU asked for; a query without aggregates runs on the CPU)",
+   "rows": 100,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    16.908,
+    16.045,
+    16.204
+   ],
+   "device_note": "device: CPU (AUTO: the table has 642 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 100,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q3": {
+  "sql": "SELECT\n    l_orderkey,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue,\n    o_orderdate,\n    o_shippriority\nFROM\n    customer,\n    orders,\n    lineitem\nWHERE\n    c_mktsegment = 'BUILDING'\n    AND c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND o_orderdate < CAST('1995-03-15' AS date)\n    AND l_shipdate > CAST('1995-03-15' AS date)\nGROUP BY\n    l_orderkey,\n    o_orderdate,\n    o_shippriority\nORDER BY\n    revenue DESC,\n    o_orderdate\nLIMIT 10",
+  "tables": [
+   "customer",
+   "lineitem",
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    10.207708008238114,
+    8.744000006117858,
+    8.657916012452915
+   ],
+   "device_note": "",
+   "rows": 10
+  },
+  "cpu": {
+   "ms": [
+    53.243,
+    53.862,
+    55.788
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 10,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    121.47,
+    118.861,
+    119.734
+   ],
+   "device_note": "device: CPU (GPU asked for; a join runs on the CPU)",
+   "rows": 10,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    53.912,
+    53.936,
+    52.735
+   ],
+   "device_note": "device: CPU (AUTO: a join runs on the CPU)",
+   "rows": 10,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q4": {
+  "sql": "SELECT\n    o_orderpriority,\n    count(*) AS order_count\nFROM\n    orders\nWHERE\n    o_orderdate >= CAST('1993-07-01' AS date)\n    AND o_orderdate < CAST('1993-10-01' AS date)\n    AND EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem\n        WHERE\n            l_orderkey = o_orderkey\n            AND l_commitdate < l_receiptdate)\nGROUP BY\n    o_orderpriority\nORDER BY\n    o_orderpriority",
+  "tables": [
+   "lineitem",
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    9.470999997574836,
+    9.573041999829002,
+    9.466208997764625
+   ],
+   "device_note": "",
+   "rows": 5
+  },
+  "cpu": {
+   "ms": [
+    38.631,
+    38.606,
+    39.005
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 5,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    79.538,
+    80.131,
+    79.536
+   ],
+   "device_note": "device: CPU (GPU asked for; a join runs on the CPU)",
+   "rows": 5,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    38.398,
+    38.055,
+    37.962
+   ],
+   "device_note": "device: CPU (AUTO: the table has 57218 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 5,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q5": {
+  "sql": "SELECT\n    n_name,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue\nFROM\n    customer,\n    orders,\n    lineitem,\n    supplier,\n    nation,\n    region\nWHERE\n    c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND l_suppkey = s_suppkey\n    AND c_nationkey = s_nationkey\n    AND s_nationkey = n_nationkey\n    AND n_regionkey = r_regionkey\n    AND r_name = 'ASIA'\n    AND o_orderdate >= CAST('1994-01-01' AS date)\n    AND o_orderdate < CAST('1995-01-01' AS date)\nGROUP BY\n    n_name\nORDER BY\n    revenue DESC",
+  "tables": [
+   "customer",
+   "lineitem",
+   "nation",
+   "orders",
+   "region",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    8.301249996293336,
+    8.247584002674557,
+    8.16800000029616
+   ],
+   "device_note": "",
+   "rows": 5
+  },
+  "cpu": {
+   "ms": [
+    58.225,
+    57.679,
+    57.259
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 5,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    92.162,
+    92.382,
+    92.2
+   ],
+   "device_note": "device: CPU (GPU asked for; a join runs on the CPU)",
+   "rows": 5,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    57.792,
+    58.401,
+    58.443
+   ],
+   "device_note": "device: CPU (AUTO: a join runs on the CPU)",
+   "rows": 5,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q6": {
+  "sql": "SELECT\n    sum(l_extendedprice * l_discount) AS revenue\nFROM\n    lineitem\nWHERE\n    l_shipdate >= CAST('1994-01-01' AS date)\n    AND l_shipdate < CAST('1995-01-01' AS date)\n    AND l_discount BETWEEN 0.05\n    AND 0.07\n    AND l_quantity < 24",
+  "tables": [
+   "lineitem"
+  ],
+  "duckdb": {
+   "ms": [
+    3.3899580012075603,
+    3.3481249993201345,
+    3.5237090050941333
+   ],
+   "device_note": "",
+   "rows": 1
+  },
+  "cpu": {
+   "ms": [
+    50.996,
+    55.58,
+    53.242
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 1,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    149.327,
+    148.0,
+    149.343
+   ],
+   "device_note": "device: CPU (GPU asked for; the Apple GPU kernel runs integer programs only (this one has an instruction its Int64 word does not run))",
+   "rows": 1,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    50.751,
+    51.512,
+    50.971
+   ],
+   "device_note": "device: CPU (AUTO: no table resident on the GPU (attach a DeviceTable, or --device gpu uploads it for the query))",
+   "rows": 1,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q7": {
+  "sql": "SELECT\n    supp_nation,\n    cust_nation,\n    l_year,\n    sum(volume) AS revenue\nFROM (\n    SELECT\n        n1.n_name AS supp_nation,\n        n2.n_name AS cust_nation,\n        extract(year FROM l_shipdate) AS l_year,\n        l_extendedprice * (1 - l_discount) AS volume\n    FROM\n        supplier,\n        lineitem,\n        orders,\n        customer,\n        nation n1,\n        nation n2\n    WHERE\n        s_suppkey = l_suppkey\n        AND o_orderkey = l_orderkey\n        AND c_custkey = o_custkey\n        AND s_nationkey = n1.n_nationkey\n        AND c_nationkey = n2.n_nationkey\n        AND ((n1.n_name = 'FRANCE'\n                AND n2.n_name = 'GERMANY')\n            OR (n1.n_name = 'GERMANY'\n                AND n2.n_name = 'FRANCE'))\n        AND l_shipdate BETWEEN CAST('1995-01-01' AS date)\n        AND CAST('1996-12-31' AS date)) AS shipping\nGROUP BY\n    supp_nation,\n    cust_nation,\n    l_year\nORDER BY\n    supp_nation,\n    cust_nation,\n    l_year",
+  "tables": [
+   "customer",
+   "lineitem",
+   "nation",
+   "orders",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    9.256250006728806,
+    9.394874999998137,
+    9.237666992703453
+   ],
+   "device_note": "",
+   "rows": 4
+  },
+  "cpu": {
+   "ms": [
+    71.499,
+    69.755,
+    72.641
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 4,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    101.541,
+    100.817,
+    99.539
+   ],
+   "device_note": "device: GPU (GPU asked for, the table uploaded for this query)",
+   "rows": 4,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    72.37,
+    71.893,
+    73.679
+   ],
+   "device_note": "device: CPU (AUTO: the table has 5924 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 4,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q8": {
+  "sql": "SELECT\n    o_year,\n    sum(\n        CASE WHEN nation = 'BRAZIL' THEN\n            volume\n        ELSE\n            0\n        END) / sum(volume) AS mkt_share\nFROM (\n    SELECT\n        extract(year FROM o_orderdate) AS o_year,\n        l_extendedprice * (1 - l_discount) AS volume,\n        n2.n_name AS nation\n    FROM\n        part,\n        supplier,\n        lineitem,\n        orders,\n        customer,\n        nation n1,\n        nation n2,\n        region\n    WHERE\n        p_partkey = l_partkey\n        AND s_suppkey = l_suppkey\n        AND l_orderkey = o_orderkey\n        AND o_custkey = c_custkey\n        AND c_nationkey = n1.n_nationkey\n        AND n1.n_regionkey = r_regionkey\n        AND r_name = 'AMERICA'\n        AND s_nationkey = n2.n_nationkey\n        AND o_orderdate BETWEEN CAST('1995-01-01' AS date)\n        AND CAST('1996-12-31' AS date)\n        AND p_type = 'ECONOMY ANODIZED STEEL') AS all_nations\nGROUP BY\n    o_year\nORDER BY\n    o_year",
+  "tables": [
+   "customer",
+   "lineitem",
+   "nation",
+   "orders",
+   "part",
+   "region",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    7.748625008389354,
+    7.763125002384186,
+    7.7046249934937805
+   ],
+   "device_note": "",
+   "rows": 2
+  },
+  "cpu": {
+   "ms": [
+    55.898,
+    56.022,
+    56.63
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 2,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    110.307,
+    111.163,
+    104.823
+   ],
+   "device_note": "device: GPU (GPU asked for, the table uploaded for this query)",
+   "rows": 2,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    57.026,
+    57.483,
+    56.268
+   ],
+   "device_note": "device: CPU (AUTO: the table has 2603 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 2,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q9": {
+  "sql": "SELECT\n    nation,\n    o_year,\n    sum(amount) AS sum_profit\nFROM (\n    SELECT\n        n_name AS nation,\n        extract(year FROM o_orderdate) AS o_year,\n        l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity AS amount\n    FROM\n        part,\n        supplier,\n        lineitem,\n        partsupp,\n        orders,\n        nation\n    WHERE\n        s_suppkey = l_suppkey\n        AND ps_suppkey = l_suppkey\n        AND ps_partkey = l_partkey\n        AND p_partkey = l_partkey\n        AND o_orderkey = l_orderkey\n        AND s_nationkey = n_nationkey\n        AND p_name LIKE '%green%') AS profit\nGROUP BY\n    nation,\n    o_year\nORDER BY\n    nation,\n    o_year DESC",
+  "tables": [
+   "lineitem",
+   "nation",
+   "orders",
+   "part",
+   "partsupp",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    33.95533400180284,
+    30.11541698651854,
+    29.778583004372194
+   ],
+   "device_note": "",
+   "rows": 175
+  },
+  "cpu": {
+   "ms": [
+    102.867,
+    104.387,
+    103.902
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 175,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    136.823,
+    137.208,
+    139.326
+   ],
+   "device_note": "device: GPU (GPU asked for, the table uploaded for this query)",
+   "rows": 175,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    103.82,
+    105.29,
+    106.123
+   ],
+   "device_note": "device: CPU (AUTO: the table has 319404 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 175,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q10": {
+  "sql": "SELECT\n    c_custkey,\n    c_name,\n    sum(l_extendedprice * (1 - l_discount)) AS revenue,\n    c_acctbal,\n    n_name,\n    c_address,\n    c_phone,\n    c_comment\nFROM\n    customer,\n    orders,\n    lineitem,\n    nation\nWHERE\n    c_custkey = o_custkey\n    AND l_orderkey = o_orderkey\n    AND o_orderdate >= CAST('1993-10-01' AS date)\n    AND o_orderdate < CAST('1994-01-01' AS date)\n    AND l_returnflag = 'R'\n    AND c_nationkey = n_nationkey\nGROUP BY\n    c_custkey,\n    c_name,\n    c_acctbal,\n    c_phone,\n    n_name,\n    c_address,\n    c_comment\nORDER BY\n    revenue DESC\nLIMIT 20",
+  "tables": [
+   "customer",
+   "lineitem",
+   "nation",
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    17.45120900159236,
+    17.46445799653884,
+    17.389207991072908
+   ],
+   "device_note": "",
+   "rows": 20
+  },
+  "cpu": {
+   "ms": [
+    46.02,
+    45.95,
+    45.632
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 20,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    93.548,
+    94.545,
+    86.818
+   ],
+   "device_note": "device: CPU (GPU asked for; a join runs on the CPU)",
+   "rows": 20,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    45.837,
+    45.781,
+    46.221
+   ],
+   "device_note": "device: CPU (AUTO: a join runs on the CPU)",
+   "rows": 20,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q11": {
+  "sql": "SELECT\n    ps_partkey,\n    sum(ps_supplycost * ps_availqty) AS value\nFROM\n    partsupp,\n    supplier,\n    nation\nWHERE\n    ps_suppkey = s_suppkey\n    AND s_nationkey = n_nationkey\n    AND n_name = 'GERMANY'\nGROUP BY\n    ps_partkey\nHAVING\n    sum(ps_supplycost * ps_availqty) > (\n        SELECT\n            sum(ps_supplycost * ps_availqty) * 0.0001000000\n        FROM\n            partsupp,\n            supplier,\n            nation\n        WHERE\n            ps_suppkey = s_suppkey\n            AND s_nationkey = n_nationkey\n            AND n_name = 'GERMANY')\nORDER BY\n    value DESC",
+  "tables": [
+   "nation",
+   "partsupp",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    2.9766660009045154,
+    3.0629999964730814,
+    2.955667005153373
+   ],
+   "device_note": "",
+   "rows": 1048
+  },
+  "cpu": {
+   "ms": [
+    12.689,
+    11.966,
+    11.799
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 1048,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    11.957,
+    11.842,
+    11.846
+   ],
+   "device_note": "device: CPU (GPU asked for; a join runs on the CPU)",
+   "rows": 1048,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    11.803,
+    11.778,
+    11.988
+   ],
+   "device_note": "device: CPU (AUTO: the table has 800000 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 1048,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q12": {
+  "sql": "SELECT\n    l_shipmode,\n    sum(\n        CASE WHEN o_orderpriority = '1-URGENT'\n            OR o_orderpriority = '2-HIGH' THEN\n            1\n        ELSE\n            0\n        END) AS high_line_count,\n    sum(\n        CASE WHEN o_orderpriority <> '1-URGENT'\n            AND o_orderpriority <> '2-HIGH' THEN\n            1\n        ELSE\n            0\n        END) AS low_line_count\nFROM\n    orders,\n    lineitem\nWHERE\n    o_orderkey = l_orderkey\n    AND l_shipmode IN ('MAIL', 'SHIP')\n    AND l_commitdate < l_receiptdate\n    AND l_shipdate < l_commitdate\n    AND l_receiptdate >= CAST('1994-01-01' AS date)\n    AND l_receiptdate < CAST('1995-01-01' AS date)\nGROUP BY\n    l_shipmode\nORDER BY\n    l_shipmode",
+  "tables": [
+   "lineitem",
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    13.09933299489785,
+    13.039750003372319,
+    13.506957999197766
+   ],
+   "device_note": "",
+   "rows": 2
+  },
+  "cpu": {
+   "ms": [
+    120.147,
+    119.971,
+    121.331
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 2,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    120.183,
+    123.824,
+    119.909
+   ],
+   "device_note": "device: CPU (GPU asked for; a join runs on the CPU)",
+   "rows": 2,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    120.417,
+    121.095,
+    121.198
+   ],
+   "device_note": "device: CPU (AUTO: a join runs on the CPU)",
+   "rows": 2,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q13": {
+  "sql": "SELECT\n    c_count,\n    count(*) AS custdist\nFROM (\n    SELECT\n        c_custkey,\n        count(o_orderkey)\n    FROM\n        customer\n    LEFT OUTER JOIN orders ON c_custkey = o_custkey\n    AND o_comment NOT LIKE '%special%requests%'\nGROUP BY\n    c_custkey) AS c_orders (c_custkey,\n        c_count)\nGROUP BY\n    c_count\nORDER BY\n    custdist DESC,\n    c_count DESC",
+  "tables": [
+   "customer",
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    34.407208004267886,
+    33.58733300410677,
+    32.08375000394881
+   ],
+   "device_note": "",
+   "rows": 42
+  },
+  "cpu": {
+   "ms": [
+    101.822,
+    101.206,
+    101.047
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 42,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    130.492,
+    130.042,
+    129.395
+   ],
+   "device_note": "device: GPU (GPU asked for, the table uploaded for this query)",
+   "rows": 42,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    101.384,
+    101.306,
+    101.329
+   ],
+   "device_note": "device: CPU (AUTO: the table has 150000 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 42,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q14": {
+  "sql": "SELECT\n    100.00 * sum(\n        CASE WHEN p_type LIKE 'PROMO%' THEN\n            l_extendedprice * (1 - l_discount)\n        ELSE\n            0\n        END) / sum(l_extendedprice * (1 - l_discount)) AS promo_revenue\nFROM\n    lineitem,\n    part\nWHERE\n    l_partkey = p_partkey\n    AND l_shipdate >= date '1995-09-01'\n    AND l_shipdate < CAST('1995-10-01' AS date)",
+  "tables": [
+   "lineitem",
+   "part"
+  ],
+  "duckdb": {
+   "ms": [
+    7.386458004475571,
+    7.337375005590729,
+    7.339250005315989
+   ],
+   "device_note": "",
+   "rows": 1
+  },
+  "cpu": {
+   "ms": [
+    32.756,
+    32.254,
+    36.418
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 1,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    54.891,
+    55.022,
+    54.506
+   ],
+   "device_note": "device: CPU (GPU asked for; a join runs on the CPU)",
+   "rows": 1,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    31.811,
+    32.578,
+    32.553
+   ],
+   "device_note": "device: CPU (AUTO: the table has 200000 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 1,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q15": {
+  "sql": "WITH revenue AS (\n    SELECT\n        l_suppkey AS supplier_no,\n        sum(l_extendedprice * (1 - l_discount)) AS total_revenue\n    FROM\n        lineitem\n    WHERE\n        l_shipdate >= CAST('1996-01-01' AS date)\n      AND l_shipdate < CAST('1996-04-01' AS date)\n    GROUP BY\n        supplier_no\n)\nSELECT\n    s_suppkey,\n    s_name,\n    s_address,\n    s_phone,\n    total_revenue\nFROM\n    supplier,\n    revenue\nWHERE\n    s_suppkey = supplier_no\n    AND total_revenue = (\n        SELECT\n            max(total_revenue)\n        FROM revenue)\nORDER BY\n    s_suppkey",
+  "tables": [
+   "lineitem",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    4.996415998903103,
+    4.949750000378117,
+    4.702334001194686
+   ],
+   "device_note": "",
+   "rows": 1
+  },
+  "cpu": {
+   "ms": [
+    28.977,
+    29.093,
+    29.309
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 1,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    134.629,
+    137.688,
+    134.485
+   ],
+   "device_note": "device: CPU (GPU asked for; a query without aggregates runs on the CPU)",
+   "rows": 1,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    29.35,
+    29.375,
+    29.282
+   ],
+   "device_note": "device: CPU (AUTO: the table has 10000 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 1,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q16": {
+  "sql": "SELECT\n    p_brand,\n    p_type,\n    p_size,\n    count(DISTINCT ps_suppkey) AS supplier_cnt\nFROM\n    partsupp,\n    part\nWHERE\n    p_partkey = ps_partkey\n    AND p_brand <> 'Brand#45'\n    AND p_type NOT LIKE 'MEDIUM POLISHED%'\n    AND p_size IN (49, 14, 23, 45, 19, 3, 36, 9)\n    AND ps_suppkey NOT IN (\n        SELECT\n            s_suppkey\n        FROM\n            supplier\n        WHERE\n            s_comment LIKE '%Customer%Complaints%')\nGROUP BY\n    p_brand,\n    p_type,\n    p_size\nORDER BY\n    supplier_cnt DESC,\n    p_brand,\n    p_type,\n    p_size",
+  "tables": [
+   "part",
+   "partsupp",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    10.958375001791865,
+    11.390250001568347,
+    11.092083004768938
+   ],
+   "device_note": "",
+   "rows": 18314
+  },
+  "cpu": {
+   "ms": [
+    26.492,
+    26.646,
+    26.828
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 18314,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    26.56,
+    26.874,
+    26.682
+   ],
+   "device_note": "device: CPU (GPU asked for; count(DISTINCT), median, quantiles and min / max of TEXT run on the CPU)",
+   "rows": 18314,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    26.849,
+    26.723,
+    27.43
+   ],
+   "device_note": "device: CPU (AUTO: the table has 118274 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 18314,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q17": {
+  "sql": "SELECT\n    sum(l_extendedprice) / 7.0 AS avg_yearly\nFROM\n    lineitem,\n    part\nWHERE\n    p_partkey = l_partkey\n    AND p_brand = 'Brand#23'\n    AND p_container = 'MED BOX'\n    AND l_quantity < (\n        SELECT\n            0.2 * avg(l_quantity)\n        FROM\n            lineitem\n        WHERE\n            l_partkey = p_partkey)",
+  "tables": [
+   "lineitem",
+   "part"
+  ],
+  "duckdb": {
+   "ms": [
+    7.0391670014942065,
+    6.804374992498197,
+    6.610874988837168
+   ],
+   "device_note": "",
+   "rows": 1
+  },
+  "cpu": {
+   "ms": [
+    49.862,
+    48.622,
+    49.171
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 1,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    73.665,
+    72.051,
+    73.381
+   ],
+   "device_note": "device: CPU (GPU asked for; a join runs on the CPU)",
+   "rows": 1,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    49.536,
+    48.659,
+    48.921
+   ],
+   "device_note": "device: CPU (AUTO: the table has 6088 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 1,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q18": {
+  "sql": "SELECT\n    c_name,\n    c_custkey,\n    o_orderkey,\n    o_orderdate,\n    o_totalprice,\n    sum(l_quantity)\nFROM\n    customer,\n    orders,\n    lineitem\nWHERE\n    o_orderkey IN (\n        SELECT\n            l_orderkey\n        FROM\n            lineitem\n        GROUP BY\n            l_orderkey\n        HAVING\n            sum(l_quantity) > 300)\n    AND c_custkey = o_custkey\n    AND o_orderkey = l_orderkey\nGROUP BY\n    c_name,\n    c_custkey,\n    o_orderkey,\n    o_orderdate,\n    o_totalprice\nORDER BY\n    o_totalprice DESC,\n    o_orderdate\nLIMIT 100",
+  "tables": [
+   "customer",
+   "lineitem",
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    25.655666991951875,
+    21.727375002228655,
+    21.30375000706408
+   ],
+   "device_note": "",
+   "rows": 57
+  },
+  "cpu": {
+   "ms": [
+    113.755,
+    113.039,
+    114.313
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 57,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    115.144,
+    113.65,
+    115.245
+   ],
+   "device_note": "device: CPU (GPU asked for; a join runs on the CPU)",
+   "rows": 57,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    112.854,
+    113.504,
+    113.468
+   ],
+   "device_note": "device: CPU (AUTO: a join runs on the CPU)",
+   "rows": 57,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q19": {
+  "sql": "SELECT\n    sum(l_extendedprice * (1 - l_discount)) AS revenue\nFROM\n    lineitem,\n    part\nWHERE (p_partkey = l_partkey\n    AND p_brand = 'Brand#12'\n    AND p_container IN ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG')\n    AND l_quantity >= 1\n    AND l_quantity <= 1 + 10\n    AND p_size BETWEEN 1 AND 5\n    AND l_shipmode IN ('AIR', 'AIR REG')\n    AND l_shipinstruct = 'DELIVER IN PERSON')\n    OR (p_partkey = l_partkey\n        AND p_brand = 'Brand#23'\n        AND p_container IN ('MED BAG', 'MED BOX', 'MED PKG', 'MED PACK')\n        AND l_quantity >= 10\n        AND l_quantity <= 10 + 10\n        AND p_size BETWEEN 1 AND 10\n        AND l_shipmode IN ('AIR', 'AIR REG')\n        AND l_shipinstruct = 'DELIVER IN PERSON')\n    OR (p_partkey = l_partkey\n        AND p_brand = 'Brand#34'\n        AND p_container IN ('LG CASE', 'LG BOX', 'LG PACK', 'LG PKG')\n        AND l_quantity >= 20\n        AND l_quantity <= 20 + 10\n        AND p_size BETWEEN 1 AND 15\n        AND l_shipmode IN ('AIR', 'AIR REG')\n        AND l_shipinstruct = 'DELIVER IN PERSON')",
+  "tables": [
+   "lineitem",
+   "part"
+  ],
+  "duckdb": {
+   "ms": [
+    23.764874989865348,
+    23.687084001721814,
+    24.455749997287057
+   ],
+   "device_note": "",
+   "rows": 1
+  },
+  "cpu": {
+   "ms": [
+    39.083,
+    39.253,
+    39.359
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 1,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    39.411,
+    39.441,
+    40.863
+   ],
+   "device_note": "device: CPU (GPU asked for; a join runs on the CPU)",
+   "rows": 1,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    38.916,
+    39.147,
+    39.166
+   ],
+   "device_note": "device: CPU (AUTO: the table has 214377 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 1,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q20": {
+  "sql": "SELECT\n    s_name,\n    s_address\nFROM\n    supplier,\n    nation\nWHERE\n    s_suppkey IN (\n        SELECT\n            ps_suppkey\n        FROM\n            partsupp\n        WHERE\n            ps_partkey IN (\n                SELECT\n                    p_partkey\n                FROM\n                    part\n                WHERE\n                    p_name LIKE 'forest%')\n                AND ps_availqty > (\n                    SELECT\n                        0.5 * sum(l_quantity)\n                    FROM\n                        lineitem\n                    WHERE\n                        l_partkey = ps_partkey\n                        AND l_suppkey = ps_suppkey\n                        AND l_shipdate >= CAST('1994-01-01' AS date)\n                        AND l_shipdate < CAST('1995-01-01' AS date)))\n            AND s_nationkey = n_nationkey\n            AND n_name = 'CANADA'\n        ORDER BY\n            s_name",
+  "tables": [
+   "lineitem",
+   "nation",
+   "part",
+   "partsupp",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    7.327165993046947,
+    7.314375005080365,
+    7.48220800596755
+   ],
+   "device_note": "",
+   "rows": 186
+  },
+  "cpu": {
+   "ms": [
+    37.671,
+    38.192,
+    37.853
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 186,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    61.744,
+    60.343,
+    61.568
+   ],
+   "device_note": "device: CPU (GPU asked for; a query without aggregates runs on the CPU)",
+   "rows": 186,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    38.924,
+    38.122,
+    37.459
+   ],
+   "device_note": "device: CPU (AUTO: the table has 412 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 186,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q21": {
+  "sql": "SELECT\n    s_name,\n    count(*) AS numwait\nFROM\n    supplier,\n    lineitem l1,\n    orders,\n    nation\nWHERE\n    s_suppkey = l1.l_suppkey\n    AND o_orderkey = l1.l_orderkey\n    AND o_orderstatus = 'F'\n    AND l1.l_receiptdate > l1.l_commitdate\n    AND EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem l2\n        WHERE\n            l2.l_orderkey = l1.l_orderkey\n            AND l2.l_suppkey <> l1.l_suppkey)\n    AND NOT EXISTS (\n        SELECT\n            *\n        FROM\n            lineitem l3\n        WHERE\n            l3.l_orderkey = l1.l_orderkey\n            AND l3.l_suppkey <> l1.l_suppkey\n            AND l3.l_receiptdate > l3.l_commitdate)\n    AND s_nationkey = n_nationkey\n    AND n_name = 'SAUDI ARABIA'\nGROUP BY\n    s_name\nORDER BY\n    numwait DESC,\n    s_name\nLIMIT 100",
+  "tables": [
+   "lineitem",
+   "nation",
+   "orders",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    25.987833010731265,
+    26.247165995300747,
+    26.042041994514875
+   ],
+   "device_note": "",
+   "rows": 100
+  },
+  "cpu": {
+   "ms": [
+    131.549,
+    131.818,
+    130.551
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 100,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    192.006,
+    188.511,
+    188.677
+   ],
+   "device_note": "device: CPU (GPU asked for; a join runs on the CPU)",
+   "rows": 100,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    131.881,
+    131.476,
+    134.412
+   ],
+   "device_note": "device: CPU (AUTO: the table has 73089 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 100,
+   "verdict": "equal"
+  }
+ },
+ "SF1/Q22": {
+  "sql": "SELECT\n    cntrycode,\n    count(*) AS numcust,\n    sum(c_acctbal) AS totacctbal\nFROM (\n    SELECT\n        substring(c_phone FROM 1 FOR 2) AS cntrycode,\n        c_acctbal\n    FROM\n        customer\n    WHERE\n        substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17')\n        AND c_acctbal > (\n            SELECT\n                avg(c_acctbal)\n            FROM\n                customer\n            WHERE\n                c_acctbal > 0.00\n                AND substring(c_phone FROM 1 FOR 2) IN ('13', '31', '23', '29', '30', '18', '17'))\n            AND NOT EXISTS (\n                SELECT\n                    *\n                FROM\n                    orders\n                WHERE\n                    o_custkey = c_custkey)) AS custsale\nGROUP BY\n    cntrycode\nORDER BY\n    cntrycode",
+  "tables": [
+   "customer",
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    7.50466700992547,
+    7.53062499279622,
+    7.6872500067111105
+   ],
+   "device_note": "",
+   "rows": 7
+  },
+  "cpu": {
+   "ms": [
+    13.989,
+    13.956,
+    14.137
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 7,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    36.205,
+    36.133,
+    35.597
+   ],
+   "device_note": "device: GPU (GPU asked for, the table uploaded for this query)",
+   "rows": 7,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    14.038,
+    13.994,
+    14.019
+   ],
+   "device_note": "device: CPU (AUTO: the table has 6384 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 7,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r0": {
+  "sql": "SELECT c_custkey, c_acctbal FROM customer WHERE (c_mktsegment IN ('BUILDING', 'FURNITURE', 'MACHINERY')) AND (c_acctbal < 3166.7) ORDER BY c_acctbal ASC, c_custkey ASC LIMIT 200",
+  "tables": [
+   "customer"
+  ],
+  "duckdb": {
+   "ms": [
+    2.2484170040115714,
+    2.2282499994616956,
+    2.3052090109558776
+   ],
+   "device_note": "",
+   "rows": 200
+  },
+  "cpu": {
+   "ms": [
+    0.515,
+    0.486,
+    0.475
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 200,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    0.487,
+    0.478,
+    0.498
+   ],
+   "device_note": "device: CPU (GPU asked for; a query without aggregates runs on the CPU)",
+   "rows": 200,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    0.48,
+    0.488,
+    0.475
+   ],
+   "device_note": "device: CPU (AUTO: the table has 150000 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 200,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r1": {
+  "sql": "SELECT l_linestatus, SUM(l_extendedprice * (1 - l_discount)) AS a0, AVG(l_quantity) AS a1, MAX(l_extendedprice * (1 - l_discount)) AS a2 FROM lineitem JOIN orders ON l_orderkey = o_orderkey JOIN supplier ON l_suppkey = s_suppkey WHERE (l_extendedprice < 10826.64) AND (o_orderpriority IN ('4-NOT SPECIFIED', '5-LOW')) AND (l_shipinstruct = 'TAKE BACK RETURN') GROUP BY l_linestatus ORDER BY a0 DESC, l_linestatus ASC",
+  "tables": [
+   "lineitem",
+   "orders",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    22.688625002047047,
+    22.12754100037273,
+    21.9081250106683
+   ],
+   "device_note": "",
+   "rows": 2
+  },
+  "cpu": {
+   "ms": [
+    59.824,
+    64.877,
+    61.556
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 2,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    81.468,
+    81.992,
+    86.685
+   ],
+   "device_note": "device: CPU (GPU asked for; a join runs on the CPU)",
+   "rows": 2,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    60.334,
+    58.893,
+    61.754
+   ],
+   "device_note": "device: CPU (AUTO: a join runs on the CPU)",
+   "rows": 2,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r2": {
+  "sql": "SELECT l_linestatus, l_shipmode, AVG(l_extendedprice) AS a0, AVG(l_extendedprice) AS a1, COUNT(l_tax) AS a2 FROM lineitem WHERE TRUE GROUP BY l_linestatus, l_shipmode",
+  "tables": [
+   "lineitem"
+  ],
+  "duckdb": {
+   "ms": [
+    15.830750009627081,
+    15.79304201004561,
+    15.85437500034459
+   ],
+   "device_note": "",
+   "rows": 14
+  },
+  "cpu": {
+   "ms": [
+    26.311,
+    26.941,
+    26.158
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 14,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    189.744,
+    189.289,
+    190.71
+   ],
+   "device_note": "device: GPU (GPU asked for, the table uploaded for this query)",
+   "rows": 14,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    26.415,
+    26.434,
+    27.265
+   ],
+   "device_note": "device: CPU (AUTO: no table resident on the GPU (attach a DeviceTable, or --device gpu uploads it for the query))",
+   "rows": 14,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r3": {
+  "sql": "SELECT s_nationkey, p_size, SUM(p_size) AS a0, AVG(l_tax) AS a1 FROM lineitem JOIN supplier ON l_suppkey = s_suppkey JOIN part ON l_partkey = p_partkey WHERE TRUE GROUP BY s_nationkey, p_size",
+  "tables": [
+   "lineitem",
+   "part",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    8.198333001928404,
+    8.14245900255628,
+    7.998000000952743
+   ],
+   "device_note": "",
+   "rows": 1250
+  },
+  "cpu": {
+   "ms": [
+    77.13,
+    77.57,
+    76.46
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 1250,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    77.18,
+    77.728,
+    78.901
+   ],
+   "device_note": "device: CPU (GPU asked for; a join runs on the CPU)",
+   "rows": 1250,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    75.928,
+    82.57,
+    78.589
+   ],
+   "device_note": "device: CPU (AUTO: a join runs on the CPU)",
+   "rows": 1250,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r4": {
+  "sql": "SELECT o_orderpriority, o_orderstatus, SUM(o_totalprice) AS a0, COUNT(c_acctbal) AS a1, MIN(o_totalprice) AS a2 FROM orders JOIN customer ON o_custkey = c_custkey WHERE (o_totalprice < 144409.04) AND (o_orderdate >= DATE '1994-07-06' AND o_orderdate <= DATE '1995-04-20') AND (c_acctbal < 6265.79) GROUP BY o_orderpriority, o_orderstatus HAVING COUNT(c_acctbal) > 10",
+  "tables": [
+   "customer",
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    5.587749998085201,
+    5.478874998516403,
+    5.434874998172745
+   ],
+   "device_note": "",
+   "rows": 15
+  },
+  "cpu": {
+   "ms": [
+    20.431,
+    20.499,
+    20.503
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 15,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    59.734,
+    58.505,
+    58.852
+   ],
+   "device_note": "device: CPU (GPU asked for; a join runs on the CPU)",
+   "rows": 15,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    20.557,
+    20.658,
+    20.152
+   ],
+   "device_note": "device: CPU (AUTO: the table has 150000 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 15,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r5": {
+  "sql": "SELECT p_container, SUM(s_acctbal) AS a0, AVG(ps_availqty) AS a1, AVG(ps_supplycost) AS a2, SUM(ps_supplycost) AS a3 FROM partsupp JOIN part ON ps_partkey = p_partkey JOIN supplier ON ps_suppkey = s_suppkey JOIN nation ON s_nationkey = n_nationkey WHERE TRUE GROUP BY p_container ORDER BY a0 DESC, p_container ASC LIMIT 10",
+  "tables": [
+   "nation",
+   "part",
+   "partsupp",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    7.917041992186569,
+    7.8078329970594496,
+    7.9772089957259595
+   ],
+   "device_note": "",
+   "rows": 10
+  },
+  "cpu": {
+   "ms": [
+    10.89,
+    10.49,
+    10.551
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 10,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    10.367,
+    10.604,
+    10.588
+   ],
+   "device_note": "device: CPU (GPU asked for; a join runs on the CPU)",
+   "rows": 10,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    10.643,
+    10.783,
+    10.665
+   ],
+   "device_note": "device: CPU (AUTO: the table has 800000 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 10,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r6": {
+  "sql": "SELECT p_mfgr, p_size, SUM(p_size) AS a0 FROM part WHERE (p_size < 43) AND (p_mfgr IN ('Manufacturer#1', 'Manufacturer#2', 'Manufacturer#3', 'Manufacturer#5')) GROUP BY p_mfgr, p_size",
+  "tables": [
+   "part"
+  ],
+  "duckdb": {
+   "ms": [
+    4.860375003772788,
+    4.740125004900619,
+    4.795500004547648
+   ],
+   "device_note": "",
+   "rows": 168
+  },
+  "cpu": {
+   "ms": [
+    1.388,
+    1.391,
+    1.401
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 168,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    1.403,
+    1.398,
+    1.396
+   ],
+   "device_note": "device: CPU (GPU asked for; the program uses an instruction the GPU kernel does not run (opcode 19: text, dates, IN lists, casts or float arithmetic))",
+   "rows": 168,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    1.393,
+    1.398,
+    1.399
+   ],
+   "device_note": "device: CPU (AUTO: the table has 200000 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 168,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r7": {
+  "sql": "SELECT MAX(l_extendedprice * (1 - l_discount)) AS a0 FROM lineitem WHERE (l_quantity < 24.0) AND (l_extendedprice >= 5087.01 AND l_extendedprice <= 19458.72) AND (l_returnflag <> 'A')",
+  "tables": [
+   "lineitem"
+  ],
+  "duckdb": {
+   "ms": [
+    5.187582995858975,
+    5.258291988866404,
+    5.784291002782993
+   ],
+   "device_note": "",
+   "rows": 1
+  },
+  "cpu": {
+   "ms": [
+    44.568,
+    45.172,
+    44.956
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 1,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    143.378,
+    144.277,
+    147.481
+   ],
+   "device_note": "device: CPU (GPU asked for; the Apple GPU kernel runs integer programs only (this one has an instruction its Int64 word does not run))",
+   "rows": 1,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    45.22,
+    45.122,
+    45.996
+   ],
+   "device_note": "device: CPU (AUTO: no table resident on the GPU (attach a DeviceTable, or --device gpu uploads it for the query))",
+   "rows": 1,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r8": {
+  "sql": "SELECT p_type, MAX(ps_availqty) AS a0, MAX(s_acctbal) AS a1 FROM partsupp JOIN part ON ps_partkey = p_partkey JOIN supplier ON ps_suppkey = s_suppkey WHERE TRUE GROUP BY p_type ORDER BY a0 DESC, p_type ASC",
+  "tables": [
+   "part",
+   "partsupp",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    8.104666994768195,
+    7.987625009263866,
+    8.135958996717818
+   ],
+   "device_note": "",
+   "rows": 150
+  },
+  "cpu": {
+   "ms": [
+    9.291,
+    9.21,
+    9.608
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 150,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    9.88,
+    9.569,
+    9.479
+   ],
+   "device_note": "device: CPU (GPU asked for; a join runs on the CPU)",
+   "rows": 150,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    9.579,
+    9.562,
+    9.168
+   ],
+   "device_note": "device: CPU (AUTO: the table has 800000 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 150,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r9": {
+  "sql": "SELECT ps_partkey, COUNT(DISTINCT p_container) AS n FROM partsupp JOIN part ON ps_partkey = p_partkey WHERE (p_mfgr = 'Manufacturer#3') GROUP BY ps_partkey ORDER BY n DESC, ps_partkey ASC",
+  "tables": [
+   "part",
+   "partsupp"
+  ],
+  "duckdb": {
+   "ms": [
+    6.774708002922125,
+    6.644333989243023,
+    7.17641701339744
+   ],
+   "device_note": "",
+   "rows": 40304
+  },
+  "cpu": {
+   "ms": [
+    10.763,
+    10.823,
+    10.856
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 40304,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    34.419,
+    35.53,
+    34.985
+   ],
+   "device_note": "device: CPU (GPU asked for; a join runs on the CPU)",
+   "rows": 40304,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    10.835,
+    10.815,
+    10.654
+   ],
+   "device_note": "device: CPU (AUTO: the table has 800000 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 40304,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r10": {
+  "sql": "SELECT c_mktsegment, c_nationkey, SUM(c_acctbal) AS a0, SUM(c_acctbal) AS a1, MAX(c_acctbal) AS a2 FROM customer WHERE (c_acctbal >= 5817.34) AND (c_mktsegment IN ('AUTOMOBILE', 'BUILDING', 'FURNITURE', 'MACHINERY')) GROUP BY c_mktsegment, c_nationkey ORDER BY a0 DESC, c_mktsegment ASC, c_nationkey ASC LIMIT 10",
+  "tables": [
+   "customer"
+  ],
+  "duckdb": {
+   "ms": [
+    3.210708004189655,
+    3.108999997493811,
+    3.2735830027377233
+   ],
+   "device_note": "",
+   "rows": 10
+  },
+  "cpu": {
+   "ms": [
+    1.105,
+    1.101,
+    1.118
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 10,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    1.109,
+    1.1,
+    1.105
+   ],
+   "device_note": "device: CPU (GPU asked for; the program uses an instruction the GPU kernel does not run (opcode 19: text, dates, IN lists, casts or float arithmetic))",
+   "rows": 10,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    1.117,
+    1.117,
+    1.106
+   ],
+   "device_note": "device: CPU (AUTO: the table has 150000 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 10,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r11": {
+  "sql": "SELECT p_partkey, COUNT(DISTINCT p_size) AS n FROM part WHERE (p_mfgr IN ('Manufacturer#1', 'Manufacturer#2', 'Manufacturer#4', 'Manufacturer#5')) AND (p_brand IN ('Brand#13', 'Brand#43')) AND (p_size >= 3 AND p_size <= 13) GROUP BY p_partkey ORDER BY n DESC, p_partkey ASC LIMIT 100",
+  "tables": [
+   "part"
+  ],
+  "duckdb": {
+   "ms": [
+    2.4624999932711944,
+    2.6733749982668087,
+    2.294541001901962
+   ],
+   "device_note": "",
+   "rows": 100
+  },
+  "cpu": {
+   "ms": [
+    2.115,
+    2.089,
+    2.084
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 100,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    2.082,
+    2.102,
+    2.1
+   ],
+   "device_note": "device: CPU (GPU asked for; hashed groups run on the CPU (the GPU kernel takes no groups or dense groups))",
+   "rows": 100,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    2.106,
+    2.09,
+    2.093
+   ],
+   "device_note": "device: CPU (AUTO: the table has 200000 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 100,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r12": {
+  "sql": "SELECT c_nationkey, COUNT(DISTINCT o_orderpriority) AS n FROM orders JOIN customer ON o_custkey = c_custkey WHERE (o_orderdate >= DATE '1997-05-27') AND (o_orderpriority IN ('1-URGENT', '2-HIGH', '3-MEDIUM', '5-LOW')) AND (o_orderstatus <> 'O') GROUP BY c_nationkey HAVING COUNT(DISTINCT o_orderpriority) > 1 ORDER BY n DESC, c_nationkey ASC",
+  "tables": [
+   "customer",
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    1.7475839995313436,
+    1.6431249969173223,
+    1.7338330071652308
+   ],
+   "device_note": "",
+   "rows": 0
+  },
+  "cpu": {
+   "ms": [
+    9.585,
+    9.39,
+    9.504
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 0,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    9.328,
+    9.516,
+    9.469
+   ],
+   "device_note": "device: CPU (GPU asked for; a join runs on the CPU)",
+   "rows": 0,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    9.533,
+    10.134,
+    9.667
+   ],
+   "device_note": "device: CPU (AUTO: the table has 150000 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 0,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r13": {
+  "sql": "SELECT o_orderstatus, COUNT(c_acctbal) AS a0, SUM(c_acctbal) AS a1 FROM orders JOIN customer ON o_custkey = c_custkey JOIN nation ON c_nationkey = n_nationkey WHERE (n_name <> 'RUSSIA') GROUP BY o_orderstatus HAVING COUNT(c_acctbal) > 20",
+  "tables": [
+   "customer",
+   "nation",
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    5.051625004853122,
+    5.007291998481378,
+    4.960791004123166
+   ],
+   "device_note": "",
+   "rows": 3
+  },
+  "cpu": {
+   "ms": [
+    11.38,
+    11.401,
+    11.477
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 3,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    11.37,
+    11.451,
+    11.182
+   ],
+   "device_note": "device: CPU (GPU asked for; a join runs on the CPU)",
+   "rows": 3,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    11.242,
+    11.318,
+    11.277
+   ],
+   "device_note": "device: CPU (AUTO: a join runs on the CPU)",
+   "rows": 3,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r14": {
+  "sql": "SELECT o_custkey, o_orderpriority, o_orderstatus, SUM(o_totalprice) AS a0, MIN(o_totalprice) AS a1, MIN(o_totalprice) AS a2 FROM orders WHERE (o_orderpriority = '4-NOT SPECIFIED') AND (o_totalprice >= 166120.85) GROUP BY o_custkey, o_orderpriority, o_orderstatus ORDER BY a0 DESC, o_custkey ASC, o_orderpriority ASC, o_orderstatus ASC LIMIT 10",
+  "tables": [
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    5.3383330086944625,
+    5.3012499993201345,
+    5.364208001992665
+   ],
+   "device_note": "",
+   "rows": 10
+  },
+  "cpu": {
+   "ms": [
+    17.605,
+    17.754,
+    17.777
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 10,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    48.375,
+    49.418,
+    47.763
+   ],
+   "device_note": "device: CPU (GPU asked for; the Apple GPU kernel runs integer programs only (this one has an instruction its Int64 word does not run))",
+   "rows": 10,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    17.772,
+    17.754,
+    17.732
+   ],
+   "device_note": "device: CPU (AUTO: no table resident on the GPU (attach a DeviceTable, or --device gpu uploads it for the query))",
+   "rows": 10,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r15": {
+  "sql": "SELECT o_orderstatus, l_shipinstruct, l_linestatus, MAX(o_totalprice) AS a0, MAX(l_discount) AS a1, SUM(p_size) AS a2 FROM lineitem JOIN supplier ON l_suppkey = s_suppkey JOIN orders ON l_orderkey = o_orderkey JOIN part ON l_partkey = p_partkey WHERE (l_quantity < 43.0) GROUP BY o_orderstatus, l_shipinstruct, l_linestatus ORDER BY a0 DESC, o_orderstatus ASC, l_shipinstruct ASC, l_linestatus ASC LIMIT 100",
+  "tables": [
+   "lineitem",
+   "orders",
+   "part",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    48.18091599736363,
+    48.412042000563815,
+    48.45612499048002
+   ],
+   "device_note": "",
+   "rows": 16
+  },
+  "cpu": {
+   "ms": [
+    113.16,
+    112.615,
+    113.024
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 16,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    139.688,
+    144.197,
+    138.566
+   ],
+   "device_note": "device: CPU (GPU asked for; a join runs on the CPU)",
+   "rows": 16,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    112.323,
+    112.826,
+    116.461
+   ],
+   "device_note": "device: CPU (AUTO: a join runs on the CPU)",
+   "rows": 16,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r16": {
+  "sql": "SELECT MIN(p_size) AS a0, COUNT(p_size) AS a1, SUM(p_size) AS a2 FROM part WHERE (p_container IN ('MED BAG', 'SM CAN')) AND (p_type <> 'MEDIUM BRUSHED COPPER') AND (p_size < 19)",
+  "tables": [
+   "part"
+  ],
+  "duckdb": {
+   "ms": [
+    2.002415989409201,
+    1.9635839998954907,
+    1.97387499792967
+   ],
+   "device_note": "",
+   "rows": 1
+  },
+  "cpu": {
+   "ms": [
+    1.111,
+    1.105,
+    1.103
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 1,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    1.11,
+    1.186,
+    1.107
+   ],
+   "device_note": "device: CPU (GPU asked for; the program uses an instruction the GPU kernel does not run (opcode 19: text, dates, IN lists, casts or float arithmetic))",
+   "rows": 1,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    1.111,
+    1.1,
+    1.106
+   ],
+   "device_note": "device: CPU (AUTO: the table has 200000 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 1,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r17": {
+  "sql": "SELECT DISTINCT n_name, c_mktsegment FROM customer JOIN nation ON c_nationkey = n_nationkey WHERE (c_acctbal < -784.52) AND (c_mktsegment <> 'HOUSEHOLD')",
+  "tables": [
+   "customer",
+   "nation"
+  ],
+  "duckdb": {
+   "ms": [
+    1.6723330045351759,
+    1.744749999488704,
+    1.6645409923512489
+   ],
+   "device_note": "",
+   "rows": 100
+  },
+  "cpu": {
+   "ms": [
+    1.26,
+    1.259,
+    1.264
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 100,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    22.364,
+    21.895,
+    22.153
+   ],
+   "device_note": "device: CPU (GPU asked for; a join runs on the CPU)",
+   "rows": 100,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    1.259,
+    1.254,
+    1.255
+   ],
+   "device_note": "device: CPU (AUTO: the table has 150000 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 100,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r18": {
+  "sql": "SELECT p_brand, l_shipinstruct, COUNT(l_quantity) AS a0, MIN(p_size) AS a1, SUM(o_totalprice) AS a2 FROM lineitem JOIN part ON l_partkey = p_partkey JOIN supplier ON l_suppkey = s_suppkey JOIN orders ON l_orderkey = o_orderkey WHERE (o_totalprice >= 177206.8 AND o_totalprice <= 212358.47) GROUP BY p_brand, l_shipinstruct ORDER BY a0 DESC, p_brand ASC, l_shipinstruct ASC LIMIT 10",
+  "tables": [
+   "lineitem",
+   "orders",
+   "part",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    20.495749995461665,
+    20.922208001138642,
+    20.698624997748993
+   ],
+   "device_note": "",
+   "rows": 10
+  },
+  "cpu": {
+   "ms": [
+    65.639,
+    65.326,
+    66.216
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 10,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    98.896,
+    97.528,
+    97.794
+   ],
+   "device_note": "device: CPU (GPU asked for; a join runs on the CPU)",
+   "rows": 10,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    65.026,
+    65.82,
+    65.222
+   ],
+   "device_note": "device: CPU (AUTO: a join runs on the CPU)",
+   "rows": 10,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r19": {
+  "sql": "SELECT l_shipmode, MIN(l_discount) AS a0, MIN(l_extendedprice * (1 - l_discount)) AS a1, AVG(l_extendedprice) AS a2, SUM(l_quantity) AS a3 FROM lineitem WHERE (l_shipinstruct IN ('COLLECT COD', 'DELIVER IN PERSON', 'NONE', 'TAKE BACK RETURN')) GROUP BY l_shipmode ORDER BY a0 ASC, l_shipmode ASC",
+  "tables": [
+   "lineitem"
+  ],
+  "duckdb": {
+   "ms": [
+    36.9827500107931,
+    36.94387500581797,
+    36.99662500002887
+   ],
+   "device_note": "",
+   "rows": 7
+  },
+  "cpu": {
+   "ms": [
+    54.478,
+    53.789,
+    54.956
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 7,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    54.46,
+    54.882,
+    54.093
+   ],
+   "device_note": "device: CPU (GPU asked for; the program uses an instruction the GPU kernel does not run (opcode 19: text, dates, IN lists, casts or float arithmetic))",
+   "rows": 7,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    54.395,
+    54.513,
+    53.777
+   ],
+   "device_note": "device: CPU (AUTO: the program uses an instruction the GPU kernel does not run (opcode 19: text, dates, IN lists, casts or float arithmetic))",
+   "rows": 7,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r20": {
+  "sql": "SELECT o_orderpriority, MAX(c_acctbal) AS a0, MAX(o_totalprice) AS a1, SUM(c_acctbal) AS a2 FROM orders JOIN customer ON o_custkey = c_custkey JOIN nation ON c_nationkey = n_nationkey WHERE (o_orderdate >= DATE '1995-07-25') GROUP BY o_orderpriority",
+  "tables": [
+   "customer",
+   "nation",
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    6.842500006314367,
+    6.829417005064897,
+    6.909165997058153
+   ],
+   "device_note": "",
+   "rows": 5
+  },
+  "cpu": {
+   "ms": [
+    16.5,
+    16.761,
+    16.648
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 5,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    66.467,
+    68.464,
+    64.892
+   ],
+   "device_note": "device: CPU (GPU asked for; a join runs on the CPU)",
+   "rows": 5,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    16.751,
+    16.516,
+    16.896
+   ],
+   "device_note": "device: CPU (AUTO: a join runs on the CPU)",
+   "rows": 5,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r21": {
+  "sql": "SELECT c_mktsegment, COUNT(c_acctbal) AS a0, MAX(c_acctbal) AS a1 FROM customer JOIN nation ON c_nationkey = n_nationkey WHERE (c_mktsegment IN ('AUTOMOBILE', 'BUILDING', 'FURNITURE', 'MACHINERY')) AND (c_acctbal >= 7136.99) GROUP BY c_mktsegment ORDER BY a0 DESC, c_mktsegment ASC LIMIT 10",
+  "tables": [
+   "customer",
+   "nation"
+  ],
+  "duckdb": {
+   "ms": [
+    2.6255420089000836,
+    2.645958011271432,
+    2.602249995106831
+   ],
+   "device_note": "",
+   "rows": 4
+  },
+  "cpu": {
+   "ms": [
+    1.485,
+    1.492,
+    1.496
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 4,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    1.502,
+    1.49,
+    1.566
+   ],
+   "device_note": "device: CPU (GPU asked for; a join runs on the CPU)",
+   "rows": 4,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    1.477,
+    1.497,
+    1.49
+   ],
+   "device_note": "device: CPU (AUTO: the table has 150000 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 4,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r22": {
+  "sql": "SELECT o_orderpriority, SUM(c_acctbal) AS a0, AVG(o_totalprice) AS a1, AVG(c_acctbal) AS a2 FROM orders JOIN customer ON o_custkey = c_custkey WHERE (c_mktsegment = 'FURNITURE') GROUP BY o_orderpriority",
+  "tables": [
+   "customer",
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    5.423499998869374,
+    5.372540996177122,
+    5.7066660083364695
+   ],
+   "device_note": "",
+   "rows": 5
+  },
+  "cpu": {
+   "ms": [
+    9.72,
+    9.636,
+    9.701
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 5,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    34.866,
+    35.053,
+    34.093
+   ],
+   "device_note": "device: CPU (GPU asked for; a join runs on the CPU)",
+   "rows": 5,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    9.529,
+    9.527,
+    9.763
+   ],
+   "device_note": "device: CPU (AUTO: a join runs on the CPU)",
+   "rows": 5,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r23": {
+  "sql": "SELECT l_returnflag, s_nationkey, COUNT(l_tax) AS a0 FROM lineitem JOIN supplier ON l_suppkey = s_suppkey WHERE (l_shipinstruct IN ('DELIVER IN PERSON', 'TAKE BACK RETURN')) AND (s_acctbal >= -787.58) GROUP BY l_returnflag, s_nationkey",
+  "tables": [
+   "lineitem",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    20.077000008313917,
+    20.04658299847506,
+    20.125667011598125
+   ],
+   "device_note": "",
+   "rows": 75
+  },
+  "cpu": {
+   "ms": [
+    45.071,
+    44.213,
+    45.709
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 75,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    44.816,
+    43.366,
+    43.444
+   ],
+   "device_note": "device: CPU (GPU asked for; a join runs on the CPU)",
+   "rows": 75,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    44.054,
+    44.423,
+    44.506
+   ],
+   "device_note": "device: CPU (AUTO: a join runs on the CPU)",
+   "rows": 75,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r24": {
+  "sql": "SELECT l_orderkey, l_linenumber, l_quantity, l_discount FROM lineitem WHERE (l_receiptdate < DATE '1997-11-15') ORDER BY l_quantity ASC, l_orderkey ASC, l_linenumber ASC LIMIT 10",
+  "tables": [
+   "lineitem"
+  ],
+  "duckdb": {
+   "ms": [
+    5.505292007001117,
+    5.518124991795048,
+    5.431124998722225
+   ],
+   "device_note": "",
+   "rows": 10
+  },
+  "cpu": {
+   "ms": [
+    9.933,
+    10.09,
+    10.26
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 10,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    10.445,
+    10.013,
+    10.405
+   ],
+   "device_note": "device: CPU (GPU asked for; a query without aggregates runs on the CPU)",
+   "rows": 10,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    9.965,
+    10.216,
+    10.227
+   ],
+   "device_note": "device: CPU (AUTO: a query without aggregates runs on the CPU)",
+   "rows": 10,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r25": {
+  "sql": "SELECT l_orderkey, l_linenumber, l_tax, l_quantity FROM lineitem WHERE (l_extendedprice >= 5087.01) AND (l_quantity >= 37.0) ORDER BY l_tax DESC, l_orderkey ASC, l_linenumber ASC LIMIT 10",
+  "tables": [
+   "lineitem"
+  ],
+  "duckdb": {
+   "ms": [
+    5.953333995421417,
+    5.755749996751547,
+    5.927542006247677
+   ],
+   "device_note": "",
+   "rows": 10
+  },
+  "cpu": {
+   "ms": [
+    16.919,
+    16.624,
+    17.499
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 10,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    18.632,
+    16.999,
+    16.958
+   ],
+   "device_note": "device: CPU (GPU asked for; a query without aggregates runs on the CPU)",
+   "rows": 10,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    16.999,
+    16.649,
+    16.479
+   ],
+   "device_note": "device: CPU (AUTO: a query without aggregates runs on the CPU)",
+   "rows": 10,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r26": {
+  "sql": "SELECT o_orderpriority, SUM(c_acctbal) AS a0, MAX(c_acctbal) AS a1 FROM orders JOIN customer ON o_custkey = c_custkey JOIN nation ON c_nationkey = n_nationkey WHERE (o_orderdate >= DATE '1993-06-16' AND o_orderdate <= DATE '1994-10-10') AND (c_mktsegment IN ('BUILDING', 'HOUSEHOLD')) AND (c_acctbal >= -784.52 AND c_acctbal <= 1429.5) GROUP BY o_orderpriority ORDER BY a0 DESC, o_orderpriority ASC",
+  "tables": [
+   "customer",
+   "nation",
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    4.863583002588712,
+    4.887749993940815,
+    4.910040996037424
+   ],
+   "device_note": "",
+   "rows": 5
+  },
+  "cpu": {
+   "ms": [
+    18.697,
+    18.956,
+    18.712
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 5,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    63.189,
+    63.922,
+    64.551
+   ],
+   "device_note": "device: CPU (GPU asked for; a join runs on the CPU)",
+   "rows": 5,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    19.226,
+    19.125,
+    19.945
+   ],
+   "device_note": "device: CPU (AUTO: a join runs on the CPU)",
+   "rows": 5,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r27": {
+  "sql": "SELECT o_shippriority, COUNT(DISTINCT c_mktsegment) AS n FROM orders JOIN customer ON o_custkey = c_custkey WHERE TRUE GROUP BY o_shippriority ORDER BY n DESC, o_shippriority ASC LIMIT 20",
+  "tables": [
+   "customer",
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    6.58425000438001,
+    6.64179099840112,
+    6.540832997416146
+   ],
+   "device_note": "",
+   "rows": 1
+  },
+  "cpu": {
+   "ms": [
+    13.211,
+    13.126,
+    13.194
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 1,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    13.393,
+    13.287,
+    13.158
+   ],
+   "device_note": "device: CPU (GPU asked for; a join runs on the CPU)",
+   "rows": 1,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    13.276,
+    13.136,
+    13.124
+   ],
+   "device_note": "device: CPU (AUTO: a join runs on the CPU)",
+   "rows": 1,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r28": {
+  "sql": "SELECT l_shipinstruct, l_linestatus, SUM(l_extendedprice * (1 - l_discount)) AS a0, SUM(l_extendedprice * (1 - l_discount)) AS a1 FROM lineitem WHERE (l_receiptdate < DATE '1997-08-11') GROUP BY l_shipinstruct, l_linestatus ORDER BY a0 DESC, l_shipinstruct ASC, l_linestatus ASC LIMIT 10",
+  "tables": [
+   "lineitem"
+  ],
+  "duckdb": {
+   "ms": [
+    23.698915989371017,
+    23.962667008163407,
+    24.037707989919
+   ],
+   "device_note": "",
+   "rows": 8
+  },
+  "cpu": {
+   "ms": [
+    34.933,
+    33.744,
+    33.577
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 8,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    131.643,
+    128.619,
+    130.74
+   ],
+   "device_note": "device: GPU (GPU asked for, the table uploaded for this query)",
+   "rows": 8,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    34.866,
+    33.769,
+    33.898
+   ],
+   "device_note": "device: CPU (AUTO: no table resident on the GPU (attach a DeviceTable, or --device gpu uploads it for the query))",
+   "rows": 8,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r29": {
+  "sql": "SELECT DISTINCT l_shipinstruct FROM lineitem JOIN supplier ON l_suppkey = s_suppkey WHERE (l_discount >= 0.05) AND (l_shipmode = 'AIR')",
+  "tables": [
+   "lineitem",
+   "supplier"
+  ],
+  "duckdb": {
+   "ms": [
+    14.597750006942078,
+    14.628667006036267,
+    14.544999998179264
+   ],
+   "device_note": "",
+   "rows": 4
+  },
+  "cpu": {
+   "ms": [
+    28.854,
+    28.538,
+    28.104
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 4,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    51.354,
+    51.863,
+    52.799
+   ],
+   "device_note": "device: CPU (GPU asked for; a join runs on the CPU)",
+   "rows": 4,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    28.375,
+    28.616,
+    28.786
+   ],
+   "device_note": "device: CPU (AUTO: a join runs on the CPU)",
+   "rows": 4,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r30": {
+  "sql": "SELECT DISTINCT o_orderpriority, o_orderstatus FROM orders WHERE (o_orderpriority = '4-NOT SPECIFIED')",
+  "tables": [
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    3.8636250101262704,
+    3.854291993775405,
+    3.9639169990550727
+   ],
+   "device_note": "",
+   "rows": 3
+  },
+  "cpu": {
+   "ms": [
+    4.449,
+    4.537,
+    4.382
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 3,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    45.302,
+    43.585,
+    44.829
+   ],
+   "device_note": "device: GPU (GPU asked for, the table uploaded for this query)",
+   "rows": 3,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    4.405,
+    4.471,
+    4.377
+   ],
+   "device_note": "device: CPU (AUTO: no table resident on the GPU (attach a DeviceTable, or --device gpu uploads it for the query))",
+   "rows": 3,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r31": {
+  "sql": "SELECT p_mfgr, p_brand, SUM(p_size) AS a0, COUNT(p_size) AS a1 FROM part WHERE TRUE GROUP BY p_mfgr, p_brand HAVING COUNT(p_size) > 2",
+  "tables": [
+   "part"
+  ],
+  "duckdb": {
+   "ms": [
+    2.967499996884726,
+    2.9572500061476603,
+    2.935333992354572
+   ],
+   "device_note": "",
+   "rows": 25
+  },
+  "cpu": {
+   "ms": [
+    0.947,
+    0.945,
+    0.944
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 25,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    30.376,
+    30.357,
+    30.796
+   ],
+   "device_note": "device: GPU (GPU asked for, the table uploaded for this query)",
+   "rows": 25,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    0.956,
+    0.95,
+    0.948
+   ],
+   "device_note": "device: CPU (AUTO: the table has 200000 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 25,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r32": {
+  "sql": "SELECT o_orderstatus, MIN(o_totalprice) AS a0 FROM orders WHERE (o_orderpriority <> '4-NOT SPECIFIED') GROUP BY o_orderstatus",
+  "tables": [
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    3.642708994448185,
+    3.9847919979365543,
+    3.8408340042224154
+   ],
+   "device_note": "",
+   "rows": 3
+  },
+  "cpu": {
+   "ms": [
+    6.086,
+    5.631,
+    6.558
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 3,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    41.509,
+    40.763,
+    41.172
+   ],
+   "device_note": "device: GPU (GPU asked for, the table uploaded for this query)",
+   "rows": 3,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    5.696,
+    5.635,
+    5.659
+   ],
+   "device_note": "device: CPU (AUTO: no table resident on the GPU (attach a DeviceTable, or --device gpu uploads it for the query))",
+   "rows": 3,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r33": {
+  "sql": "SELECT n_name, MIN(c_acctbal) AS a0, AVG(o_totalprice) AS a1, SUM(o_totalprice) AS a2, MIN(c_acctbal) AS a3 FROM orders JOIN customer ON o_custkey = c_custkey JOIN nation ON c_nationkey = n_nationkey WHERE (c_mktsegment IN ('AUTOMOBILE', 'BUILDING', 'FURNITURE')) AND (c_acctbal >= 3166.7) GROUP BY n_name",
+  "tables": [
+   "customer",
+   "nation",
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    7.157208994613029,
+    7.265499996719882,
+    7.387958001345396
+   ],
+   "device_note": "",
+   "rows": 25
+  },
+  "cpu": {
+   "ms": [
+    13.983,
+    13.923,
+    14.014
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 25,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    13.957,
+    14.177,
+    14.228
+   ],
+   "device_note": "device: CPU (GPU asked for; a join runs on the CPU)",
+   "rows": 25,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    14.073,
+    14.281,
+    14.225
+   ],
+   "device_note": "device: CPU (AUTO: a join runs on the CPU)",
+   "rows": 25,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r34": {
+  "sql": "SELECT DISTINCT ps_suppkey FROM partsupp WHERE (ps_availqty >= 4605)",
+  "tables": [
+   "partsupp"
+  ],
+  "duckdb": {
+   "ms": [
+    1.9535409956006333,
+    1.9245000003138557,
+    1.9454170105746016
+   ],
+   "device_note": "",
+   "rows": 10000
+  },
+  "cpu": {
+   "ms": [
+    3.348,
+    3.291,
+    3.234
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 10000,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    41.25,
+    41.686,
+    40.516
+   ],
+   "device_note": "device: GPU (GPU asked for, the table uploaded for this query)",
+   "rows": 10000,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    3.17,
+    3.228,
+    3.235
+   ],
+   "device_note": "device: CPU (AUTO: the table has 800000 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 10000,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r35": {
+  "sql": "SELECT DISTINCT ps_suppkey FROM partsupp WHERE (ps_availqty >= 3409) AND (ps_supplycost >= 61.36 AND ps_supplycost <= 260.84)",
+  "tables": [
+   "partsupp"
+  ],
+  "duckdb": {
+   "ms": [
+    1.874082998256199,
+    1.7785839881980792,
+    1.7990000051213428
+   ],
+   "device_note": "",
+   "rows": 10000
+  },
+  "cpu": {
+   "ms": [
+    5.212,
+    5.272,
+    5.218
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 10000,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    28.966,
+    28.392,
+    27.799
+   ],
+   "device_note": "device: CPU (GPU asked for; the Apple GPU kernel runs integer programs only (this one has an instruction its Int64 word does not run))",
+   "rows": 10000,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    5.359,
+    5.479,
+    5.344
+   ],
+   "device_note": "device: CPU (AUTO: the table has 800000 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 10000,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r36": {
+  "sql": "SELECT SUM(l_quantity) AS a0, SUM(l_extendedprice) AS a1, COUNT(l_tax) AS a2 FROM lineitem WHERE TRUE",
+  "tables": [
+   "lineitem"
+  ],
+  "duckdb": {
+   "ms": [
+    2.1163750061532483,
+    2.0472089963732287,
+    2.077500001178123
+   ],
+   "device_note": "",
+   "rows": 1
+  },
+  "cpu": {
+   "ms": [
+    14.591,
+    14.837,
+    14.97
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 1,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    133.667,
+    127.768,
+    118.633
+   ],
+   "device_note": "device: GPU (GPU asked for, the table uploaded for this query)",
+   "rows": 1,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    14.583,
+    14.725,
+    14.826
+   ],
+   "device_note": "device: CPU (AUTO: no table resident on the GPU (attach a DeviceTable, or --device gpu uploads it for the query))",
+   "rows": 1,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r37": {
+  "sql": "SELECT l_linestatus, l_returnflag, MAX(l_quantity) AS a0 FROM lineitem WHERE (l_extendedprice < 65867.5) AND (l_returnflag IN ('A', 'N', 'R')) GROUP BY l_linestatus, l_returnflag",
+  "tables": [
+   "lineitem"
+  ],
+  "duckdb": {
+   "ms": [
+    19.591042000683956,
+    19.68745799968019,
+    19.879082989064045
+   ],
+   "device_note": "",
+   "rows": 4
+  },
+  "cpu": {
+   "ms": [
+    40.401,
+    39.656,
+    39.577
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 4,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    39.692,
+    39.699,
+    39.498
+   ],
+   "device_note": "device: CPU (GPU asked for; the program uses an instruction the GPU kernel does not run (opcode 19: text, dates, IN lists, casts or float arithmetic))",
+   "rows": 4,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    39.848,
+    40.511,
+    39.789
+   ],
+   "device_note": "device: CPU (AUTO: the program uses an instruction the GPU kernel does not run (opcode 19: text, dates, IN lists, casts or float arithmetic))",
+   "rows": 4,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r38": {
+  "sql": "SELECT c_custkey, c_acctbal FROM customer WHERE TRUE ORDER BY c_acctbal ASC, c_custkey ASC LIMIT 50",
+  "tables": [
+   "customer"
+  ],
+  "duckdb": {
+   "ms": [
+    0.8569999918108806,
+    0.8496660011587664,
+    0.9287080029025674
+   ],
+   "device_note": "",
+   "rows": 50
+  },
+  "cpu": {
+   "ms": [
+    0.338,
+    0.347,
+    0.346
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 50,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    0.338,
+    0.33,
+    0.325
+   ],
+   "device_note": "device: CPU (GPU asked for; a query without aggregates runs on the CPU)",
+   "rows": 50,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    0.338,
+    0.341,
+    0.357
+   ],
+   "device_note": "device: CPU (AUTO: the table has 150000 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 50,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r39": {
+  "sql": "SELECT o_shippriority, o_orderpriority, o_orderstatus, COUNT(o_totalprice) AS a0, MIN(o_totalprice) AS a1, SUM(c_acctbal) AS a2 FROM orders JOIN customer ON o_custkey = c_custkey JOIN nation ON c_nationkey = n_nationkey WHERE (o_orderstatus = 'P') GROUP BY o_shippriority, o_orderpriority, o_orderstatus",
+  "tables": [
+   "customer",
+   "nation",
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    6.326707996777259,
+    6.293999991612509,
+    6.224958007805981
+   ],
+   "device_note": "",
+   "rows": 5
+  },
+  "cpu": {
+   "ms": [
+    14.987,
+    15.052,
+    14.857
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 5,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    49.666,
+    52.37,
+    49.846
+   ],
+   "device_note": "device: CPU (GPU asked for; a join runs on the CPU)",
+   "rows": 5,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    15.581,
+    15.175,
+    15.477
+   ],
+   "device_note": "device: CPU (AUTO: a join runs on the CPU)",
+   "rows": 5,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r40": {
+  "sql": "SELECT l_suppkey, COUNT(DISTINCT l_returnflag) AS n FROM lineitem WHERE (l_receiptdate >= DATE '1994-06-16') AND (l_discount >= 0.06 AND l_discount <= 0.07) GROUP BY l_suppkey ORDER BY n DESC, l_suppkey ASC LIMIT 100",
+  "tables": [
+   "lineitem"
+  ],
+  "duckdb": {
+   "ms": [
+    7.9348750005010515,
+    7.644792000064626,
+    8.322167006554082
+   ],
+   "device_note": "",
+   "rows": 100
+  },
+  "cpu": {
+   "ms": [
+    44.465,
+    44.221,
+    44.717
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 100,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    44.436,
+    43.901,
+    44.466
+   ],
+   "device_note": "device: CPU (GPU asked for; count(DISTINCT), median, quantiles and min / max of TEXT run on the CPU)",
+   "rows": 100,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    46.765,
+    45.274,
+    44.364
+   ],
+   "device_note": "device: CPU (AUTO: count(DISTINCT), median, quantiles and min / max of TEXT run on the CPU)",
+   "rows": 100,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r41": {
+  "sql": "SELECT ps_partkey, ps_suppkey, ps_supplycost, ps_availqty FROM partsupp WHERE (ps_supplycost >= 380.85 AND ps_supplycost <= 580.1) ORDER BY ps_supplycost ASC, ps_partkey ASC, ps_suppkey ASC LIMIT 200",
+  "tables": [
+   "partsupp"
+  ],
+  "duckdb": {
+   "ms": [
+    1.746416004607454,
+    1.6972500015981495,
+    1.7142089927801862
+   ],
+   "device_note": "",
+   "rows": 200
+  },
+  "cpu": {
+   "ms": [
+    2.164,
+    2.189,
+    2.166
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 200,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    2.123,
+    2.14,
+    2.339
+   ],
+   "device_note": "device: CPU (GPU asked for; a query without aggregates runs on the CPU)",
+   "rows": 200,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    2.184,
+    2.129,
+    2.156
+   ],
+   "device_note": "device: CPU (AUTO: the table has 800000 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 200,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r42": {
+  "sql": "SELECT l_suppkey, l_returnflag, l_shipmode, SUM(l_extendedprice * (1 - l_discount)) AS a0, SUM(l_quantity) AS a1, COUNT(l_tax) AS a2, SUM(l_tax) AS a3 FROM lineitem WHERE (l_receiptdate < DATE '1998-05-27') AND (l_discount < 0.09) GROUP BY l_suppkey, l_returnflag, l_shipmode ORDER BY a0 ASC, l_suppkey ASC, l_returnflag ASC, l_shipmode ASC LIMIT 100",
+  "tables": [
+   "lineitem"
+  ],
+  "duckdb": {
+   "ms": [
+    67.00450000062119,
+    66.3974579947535,
+    68.3177920000162
+   ],
+   "device_note": "",
+   "rows": 100
+  },
+  "cpu": {
+   "ms": [
+    82.469,
+    85.235,
+    83.458
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 100,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    181.496,
+    180.839,
+    181.465
+   ],
+   "device_note": "device: CPU (GPU asked for; the Apple GPU kernel runs integer programs only (this one has an instruction its Int64 word does not run))",
+   "rows": 100,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    82.42,
+    82.649,
+    88.077
+   ],
+   "device_note": "device: CPU (AUTO: no table resident on the GPU (attach a DeviceTable, or --device gpu uploads it for the query))",
+   "rows": 100,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r43": {
+  "sql": "SELECT o_custkey, o_shippriority, o_orderstatus, AVG(o_totalprice) AS a0, AVG(o_totalprice) AS a1, MAX(o_totalprice) AS a2, SUM(o_totalprice) AS a3 FROM orders WHERE (o_orderstatus IN ('F', 'O', 'P')) GROUP BY o_custkey, o_shippriority, o_orderstatus",
+  "tables": [
+   "orders"
+  ],
+  "duckdb": {
+   "ms": [
+    22.249582994845696,
+    25.10674999211915,
+    23.983166000107303
+   ],
+   "device_note": "",
+   "rows": 230540
+  },
+  "cpu": {
+   "ms": [
+    33.172,
+    31.334,
+    31.688
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 230540,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    32.014,
+    31.777,
+    32.127
+   ],
+   "device_note": "device: CPU (GPU asked for; the program uses an instruction the GPU kernel does not run (opcode 19: text, dates, IN lists, casts or float arithmetic))",
+   "rows": 230540,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    31.783,
+    31.943,
+    32.387
+   ],
+   "device_note": "device: CPU (AUTO: the program uses an instruction the GPU kernel does not run (opcode 19: text, dates, IN lists, casts or float arithmetic))",
+   "rows": 230540,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r44": {
+  "sql": "SELECT l_orderkey, l_linenumber, l_discount, l_tax FROM lineitem WHERE (l_receiptdate < DATE '1993-02-19') AND (l_shipdate >= DATE '1992-04-18' AND l_shipdate <= DATE '1993-02-03') AND (l_quantity < 49.0) ORDER BY l_discount ASC, l_orderkey ASC, l_linenumber ASC LIMIT 200",
+  "tables": [
+   "lineitem"
+  ],
+  "duckdb": {
+   "ms": [
+    5.500624989508651,
+    5.657625006278977,
+    5.589624997810461
+   ],
+   "device_note": "",
+   "rows": 200
+  },
+  "cpu": {
+   "ms": [
+    22.742,
+    22.301,
+    21.909
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 200,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    21.6,
+    21.683,
+    22.231
+   ],
+   "device_note": "device: CPU (GPU asked for; a query without aggregates runs on the CPU)",
+   "rows": 200,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    22.186,
+    24.165,
+    22.202
+   ],
+   "device_note": "device: CPU (AUTO: a query without aggregates runs on the CPU)",
+   "rows": 200,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r45": {
+  "sql": "SELECT c_mktsegment, SUM(c_acctbal) AS a0, MIN(c_acctbal) AS a1, MIN(c_acctbal) AS a2, AVG(c_acctbal) AS a3 FROM customer JOIN nation ON c_nationkey = n_nationkey WHERE TRUE GROUP BY c_mktsegment ORDER BY a0 ASC, c_mktsegment ASC LIMIT 100",
+  "tables": [
+   "customer",
+   "nation"
+  ],
+  "duckdb": {
+   "ms": [
+    2.900499996030703,
+    2.8839160077041015,
+    2.8605840052478015
+   ],
+   "device_note": "",
+   "rows": 5
+  },
+  "cpu": {
+   "ms": [
+    1.267,
+    1.215,
+    1.177
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 5,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    1.198,
+    1.206,
+    1.211
+   ],
+   "device_note": "device: CPU (GPU asked for; a join runs on the CPU)",
+   "rows": 5,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    1.214,
+    1.206,
+    1.214
+   ],
+   "device_note": "device: CPU (AUTO: the table has 150000 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 5,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r46": {
+  "sql": "SELECT c_mktsegment, c_nationkey, SUM(c_acctbal) AS a0 FROM customer WHERE TRUE GROUP BY c_mktsegment, c_nationkey",
+  "tables": [
+   "customer"
+  ],
+  "duckdb": {
+   "ms": [
+    2.8004170017084107,
+    2.80695800029207,
+    2.808874996844679
+   ],
+   "device_note": "",
+   "rows": 125
+  },
+  "cpu": {
+   "ms": [
+    0.914,
+    0.96,
+    0.967
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 125,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    28.314,
+    28.728,
+    28.504
+   ],
+   "device_note": "device: GPU (GPU asked for, the table uploaded for this query)",
+   "rows": 125,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    0.967,
+    0.942,
+    0.964
+   ],
+   "device_note": "device: CPU (AUTO: the table has 150000 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 125,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r47": {
+  "sql": "SELECT MIN(l_tax) AS a0 FROM lineitem WHERE (l_extendedprice >= 48251.5) AND (l_returnflag IN ('A', 'N', 'R')) AND (l_shipdate >= DATE '1992-04-18' AND l_shipdate <= DATE '1993-02-03')",
+  "tables": [
+   "lineitem"
+  ],
+  "duckdb": {
+   "ms": [
+    5.216082994593307,
+    5.4943330032983795,
+    5.1004999986616895
+   ],
+   "device_note": "",
+   "rows": 1
+  },
+  "cpu": {
+   "ms": [
+    44.941,
+    46.896,
+    45.092
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 1,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    45.885,
+    45.193,
+    45.264
+   ],
+   "device_note": "device: CPU (GPU asked for; the program uses an instruction the GPU kernel does not run (opcode 19: text, dates, IN lists, casts or float arithmetic))",
+   "rows": 1,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    45.069,
+    45.572,
+    44.898
+   ],
+   "device_note": "device: CPU (AUTO: the program uses an instruction the GPU kernel does not run (opcode 19: text, dates, IN lists, casts or float arithmetic))",
+   "rows": 1,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r48": {
+  "sql": "SELECT DISTINCT ps_suppkey FROM partsupp WHERE (ps_availqty < 1802) AND (ps_supplycost >= 141.43 AND ps_supplycost <= 300.97) ORDER BY ps_suppkey ASC",
+  "tables": [
+   "partsupp"
+  ],
+  "duckdb": {
+   "ms": [
+    1.9501250062603503,
+    1.8524580082157627,
+    1.8957919965032488
+   ],
+   "device_note": "",
+   "rows": 9021
+  },
+  "cpu": {
+   "ms": [
+    5.013,
+    5.177,
+    5.055
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 9021,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    28.651,
+    27.912,
+    27.404
+   ],
+   "device_note": "device: CPU (GPU asked for; the Apple GPU kernel runs integer programs only (this one has an instruction its Int64 word does not run))",
+   "rows": 9021,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    5.087,
+    5.182,
+    5.158
+   ],
+   "device_note": "device: CPU (AUTO: the table has 800000 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 9021,
+   "verdict": "equal"
+  }
+ },
+ "SF1/r49": {
+  "sql": "SELECT ps_suppkey, COUNT(ps_availqty) AS a0, COUNT(ps_availqty) AS a1, AVG(ps_supplycost) AS a2, AVG(ps_supplycost) AS a3 FROM partsupp WHERE (ps_availqty >= 6603 AND ps_availqty <= 7798) AND (ps_supplycost >= 61.36 AND ps_supplycost <= 260.84) GROUP BY ps_suppkey ORDER BY a0 DESC, ps_suppkey ASC LIMIT 10",
+  "tables": [
+   "partsupp"
+  ],
+  "duckdb": {
+   "ms": [
+    1.9904999935533851,
+    1.9565410038921982,
+    1.9980000070063397
+   ],
+   "device_note": "",
+   "rows": 10
+  },
+  "cpu": {
+   "ms": [
+    6.286,
+    6.403,
+    6.318
+   ],
+   "device_note": "device: CPU (device CPU was asked for)",
+   "rows": 10,
+   "verdict": "equal"
+  },
+  "gpu": {
+   "ms": [
+    29.385,
+    29.147,
+    28.92
+   ],
+   "device_note": "device: CPU (GPU asked for; the Apple GPU kernel runs integer programs only (this one has an instruction its Int64 word does not run))",
+   "rows": 10,
+   "verdict": "equal"
+  },
+  "auto": {
+   "ms": [
+    6.363,
+    6.28,
+    6.494
+   ],
+   "device_note": "device: CPU (AUTO: the table has 800000 rows, under the 1000000 AUTO runs on the GPU)",
+   "rows": 10,
+   "verdict": "equal"
+  }
+ }
+}
