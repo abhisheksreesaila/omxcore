@@ -1,6 +1,6 @@
 # F-150: runs one SQL string over Parquet files and prints the result as typed JSON (tests/test_mojo_sql.py compares it with DuckDB).
 #
-#   sql_probe [--mode table|scan|frame|framescan] [--edits FILE] [--group auto|dense|hashed] [--dense-limit N]
+#   sql_probe [--mode table|scan|frame|framescan] [--edits FILE] [--redits FILE] [--group auto|dense|hashed] [--dense-limit N]
 #             [--threads N] [--repeat N] [--group-rows N] [--block-bytes N] [--infer-rows N]
 #             "<SQL>" name=path.parquet|path.csv [name=path ...]
 # A path ending in .csv or .tsv is read with read_csv (table, frame) or streamed with scan_csv (scan, framescan; F-178: --group-rows,
@@ -8,6 +8,7 @@
 #
 # --mode  table: read the file whole; scan: stream it a row group at a time; frame: read it whole, then apply the edit script
 #         to a Frame over it; framescan: the same over a streamed file. The edits go to the first file.
+# --redits (frame mode) the second file is a Frame as well, edited by this script.
 # --edits a tab-separated script: `set COL ROW TEXT`, `append V1 V2 ...` (one per column, empty = NULL), `remove ROW`, `formula name = expr`,
 #         `merge COL INTO W1,W2,...` (words folded into INTO).
 # Output, one JSON object: {"columns":[{"name","kind","scale"}], "rows":[[...]], "notes":[...], "explain":"...", "ms":x, "times":[...]}
@@ -191,6 +192,7 @@ def main() raises:
     var args = argv()
     var mode = String("table")
     var edits = String()
+    var redits = String()
     var opts = PlannerOptions()
     var repeat = 1
     var csv = CsvOptions()
@@ -203,6 +205,9 @@ def main() raises:
             i += 2
         elif a == "--edits":
             edits = String(args[i + 1])
+            i += 2
+        elif a == "--redits":                                    # F-204: the second file is a Frame too, with this edit script (frame mode)
+            redits = String(args[i + 1])
             i += 2
         elif a == "--group":
             var g = String(args[i + 1])
@@ -235,7 +240,11 @@ def main() raises:
         var kv = split(positional[k], "=")
         var name = kv[0]
         var path = kv[1]
-        if mode == "table" or (mode == "frame" and k > 1):
+        if mode == "frame" and k == 2 and redits.byte_length() > 0:
+            var f2 = Frame(read_whole(path, csv))
+            apply_edits(f2, redits)
+            cat.add_frame(name, f2)
+        elif mode == "table" or (mode == "frame" and k > 1):
             cat.add_table(name, read_whole(path, csv))
         elif mode == "scan" or (mode == "framescan" and k > 1):
             cat.add_scan(name, open_scan(path, csv))

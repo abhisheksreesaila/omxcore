@@ -80,7 +80,7 @@ trait ViewSource:
     def view_sql(self, source: String) raises -> String:
         ...
 
-    def view_source(self, name: String) -> SqlSource:
+    def view_source(self, name: String) raises -> SqlSource:
         ...
 
 

@@ -193,7 +193,7 @@ f.remove_formula(m)                            # the columns after it move up by
 var q = Query(f).where(col("region") == code)             # filters: ranges and equality on any column, ANDed
               .group_by(col("carrier"), groups=n)            # a key expression with a known dense group count
               .agg(sum(col("revenue")), count())
-var r = q.compute(device=AUTO)    # r.sums: List[Int] (index = key), r.counts, r.milliseconds
+var r = q.compute(device=AUTO)    # r.sums: List[Int] (index = key), r.counts, r.milliseconds, r.notes (how a joined query ran, F-204)
 ```
 
 What omxplorer runs today, all through one call, `group_sum(frame, gf, key, value, ranges, groups)`:
@@ -871,8 +871,14 @@ not change (`mojo/tests/test_multiway.mojo`).
 and estimated rows. `EXPLAIN ANALYZE` (also `mx explain --analyze`) runs the query and adds an `Actual` section: the rows and milliseconds of each scan, each join (actual rows next to the estimate), each
 filter across tables, the star, and the result.
 
-**Builder**: `Query(left).join(right: SharedTable, left_on, right_on, how)` (`how` = "inner", "left", "semi" or "anti") returns a query over the joined rows (this table's columns, then the other's; a repeated name gets a
-suffix `_1`). It must come first and works over plain tables; the rest of the builder's rules apply after it.
+**Builder** (F-204: the same join machinery as SQL): `Query(left).join(right: SharedTable | Frame, left_on, right_on, how)` (`how` = "inner", "left", "semi" or "anti"; `left` is a table or a Frame, a Frame side
+is joined as its edits leave it: set cells, appended and removed rows, merges, formula columns) returns a query over the joined rows (this table's columns, then the other's; a repeated name gets a
+suffix `_1`). It must come first; the rest of the builder's rules (`where`, dense `group_by`, `agg`) apply after it. A Frame over a Parquet scan is not joined here (SQL streams it: `Catalog.add_frame`).
+No joined row is written when the query computes: it runs fused, as SQL's join does (`jfront.mojo`: the same keys, the same hash table, the same front stage that looks each block of probe rows up and gathers
+only the build-side columns the plan reads) when the build side's keys are unique, repeat up to 64 times, or the join is semi / anti; `QueryResult.notes` says so (`join build side:`, `join path: fused ...`,
+`join path: materialized ...: (why)`). Otherwise (a holistic aggregate, hashed multi-column keys, a key with more than 64 rows, `compute(GPU)`) the rows are written first, only the columns the plan reads
+(`join path: materialized`). **Breaking (F-204):** the field that held a Query's input is now `Query.base` and `table` is a method, `q.table()`, that returns the rows the query reads (a joined query's joined rows, written when asked; its `base` is only the joined schema, no rows, so `q.table.rows()` no longer compiles and nothing can read an empty table by mistake). `q.joined_table()` is the same call
+(`Query.on_device`, `view_sql` / `view_source` refuse a joined query, `window` writes the rows first). Builder queries that do not start with a join have no notes.
 
 **Keys (exactness)**: a NULL key never matches. TEXT keys match by bytes across dictionaries (a once-per-dictionary translation of codes), so `West` is not `west`
 (only ordering ignores case). INT is a DECIMAL of scale 0 and scales are aligned (a value that overflows when aligned cannot equal anything). FLOAT keys follow
