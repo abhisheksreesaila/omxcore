@@ -2,6 +2,8 @@
 # call gives; progress only grows and ends at the total; a cancel (at any point) returns no partial result, frees everything and
 # leaves a saved file as it was; several jobs run at once; a job over an edited Frame runs while the caller reads cells.
 from std.ffi import external_call, c_int
+from std.sys import CompilationTarget
+from std.memory.alloc import unsafe_alloc
 from std.os import makedirs
 from omxcore import (Table, SharedTable, Frame, Query, QueryResult, col, lit, sum, count, mean, min_of, max_of, count_distinct, median,
                      percentile, top_k, INT, DECIMAL, TEXT, FLOAT, write_parquet, read_parquet, scan_parquet, ParquetResult, ZSTD,
@@ -41,11 +43,25 @@ def pause(us: Int):
 
 
 def rss_kb() raises -> Int:
-    var f = open("/proc/self/statm", "r")
-    var text = f.read()
-    f.close()
-    var parts = text.split(" ")
-    return Int(String(parts[1])) * 4
+    """Resident memory in KB: /proc/self/statm on Linux, Mach task_info on macOS."""
+    comptime if CompilationTarget.is_linux():
+        var f = open("/proc/self/statm", "r")
+        var text = f.read()
+        f.close()
+        var parts = text.split(" ")
+        return Int(String(parts[1])) * 4
+    else:                                          # macOS: task_info(MACH_TASK_BASIC_INFO).resident_size
+        var info = unsafe_alloc[Int64](8)
+        for i in range(8):
+            info[i] = 0
+        var count = unsafe_alloc[Int32](1)
+        count[0] = 12
+        var task = external_call["mach_task_self", Int32]()
+        _ = external_call["task_info", Int32](task, Int32(20), info, count)
+        var kb = Int(info[1]) // 1024
+        info.free()
+        count.free()
+        return kb
 
 
 # ── comparing results ────────────────────────────────────────────────────────────────────────────

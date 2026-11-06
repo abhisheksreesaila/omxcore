@@ -2,6 +2,7 @@
 # dropped handles, many jobs at once, and no memory left behind. The real work (queries, reads, saves) is test_jobs.mojo.
 from std.atomic import Atomic
 from std.ffi import external_call, c_int
+from std.sys import CompilationTarget
 from std.memory.alloc import unsafe_alloc
 from omxcore import (Job, JobCtl, JobBody, JobDone, start_job, start_job_then, JOB_RUNNING, JOB_DONE, JOB_FAILED, JOB_CANCELLED, STAGE_AGGREGATE)
 from omxcore.kernels._fpenv import SERIAL
@@ -17,12 +18,25 @@ def pause(us: Int):
 
 
 def rss_kb() raises -> Int:
-    """Resident memory of this process, from /proc/self/statm (pages * 4)."""
-    var f = open("/proc/self/statm", "r")
-    var text = f.read()
-    f.close()
-    var parts = text.split(" ")
-    return Int(String(parts[1])) * 4
+    """Resident memory of this process, in KB: /proc/self/statm on Linux, Mach task_info on macOS (F-210: jobs run on threads there too, so the test reaches it)."""
+    comptime if CompilationTarget.is_linux():
+        var f = open("/proc/self/statm", "r")
+        var text = f.read()
+        f.close()
+        var parts = text.split(" ")
+        return Int(String(parts[1])) * 4
+    else:                                          # macOS: task_info(MACH_TASK_BASIC_INFO).resident_size
+        var info = unsafe_alloc[Int64](8)
+        for i in range(8):
+            info[i] = 0
+        var count = unsafe_alloc[Int32](1)
+        count[0] = 12
+        var task = external_call["mach_task_self", Int32]()
+        _ = external_call["task_info", Int32](task, Int32(20), info, count)
+        var kb = Int(info[1]) // 1024
+        info.free()
+        count.free()
+        return kb
 
 
 struct Counter(Movable):
