@@ -152,7 +152,7 @@ def m6():
     ref = run(["pixi", "run", "python", "ci/mac/orders.py", str(work / "orders.csv"), "200000"])
     lib = ROOT / ".pixi/envs/default/lib"
     b = run(["pixi", "run", "mojo", "build", "--disable-warnings", *APPLE_SHAPE.split(), "-I", "build", "ci/mac/engine_check.mojo",
-             "-Xlinker", f"-L{lib}", "-Xlinker", "-lzstd", "-Xlinker", "-lsnappy", "-Xlinker", f"-rpath={lib}",
+             "-Xlinker", f"-L{lib}", "-Xlinker", "-lzstd", "-Xlinker", "-lsnappy", "-Xlinker", "-rpath", "-Xlinker", str(lib),
              "-o", str(work / "engine_check")])
     if b.returncode != 0:
         return False, "engine check build failed: " + (b.stdout + b.stderr)[-300:]

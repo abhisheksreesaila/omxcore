@@ -3,6 +3,7 @@ installed in, never from the machine that built them."""
 import shutil
 import struct
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,9 @@ KERNELS = Path(__file__).resolve().parent.parent / "kernels_aot"
 LIBS = sorted(KERNELS.glob("*.so"))
 RUNTIME = ("libKGENCompilerRTShared.so", "libAsyncRTMojoBindings.so",
            "libMSupportGlobals.so", "libAsyncRTRuntimeGlobals.so")
+
+
+linux_only = pytest.mark.skipif(sys.platform != "linux", reason="the shipped libraries' ELF RUNPATH: macOS dylibs are out of scope (scripts/set_runpath.sh)")
 
 
 def runpath(path: Path) -> list:
@@ -40,6 +44,7 @@ def test_every_registered_library_is_there():
     assert [p.name for p in LIBS] == sorted(rbh.LIBRARIES)
 
 
+@linux_only
 @pytest.mark.parametrize("lib", LIBS, ids=lambda p: p.name)
 def test_runpath_is_relative_to_the_library(lib):
     assert runpath(lib) == ["$ORIGIN/../.pixi/envs/default/lib", "$ORIGIN/../../modular/lib",
@@ -51,6 +56,7 @@ def _env_lib() -> Path:
     return Path(sys.prefix) / "lib"
 
 
+@linux_only
 @pytest.mark.parametrize("layout", ["venv", "pip_modular"])
 def test_a_library_loads_in_a_foreign_interpreter_from_an_installed_layout(tmp_path, layout):
     """Copy a library and the Mojo runtime into the layout pip or conda would make, then dlopen
@@ -72,6 +78,7 @@ def test_a_library_loads_in_a_foreign_interpreter_from_an_installed_layout(tmp_p
     assert (r.stdout.strip(), r.returncode) == ("loaded", 0), r.stderr
 
 
+@linux_only
 def test_the_same_copy_fails_without_the_runtime_so_the_check_means_something(tmp_path):
     system_python = shutil.which("python3", path="/usr/bin")
     if system_python is None:
@@ -84,6 +91,7 @@ def test_the_same_copy_fails_without_the_runtime_so_the_check_means_something(tm
     assert r.returncode != 0 and "libKGENCompilerRTShared.so" in r.stderr
 
 
+@linux_only
 def test_a_checkout_prefers_its_own_pixi_env_over_a_runtime_planted_next_to_it(tmp_path):
     """A checkout at /tmp/mxframe must not load /tmp/modular/lib (writable by anyone) when its
     own pixi env has the runtime."""

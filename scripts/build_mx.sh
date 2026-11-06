@@ -10,9 +10,11 @@ bash "$root/scripts/build_mojo_pkg.sh" > "$root/build/pkg-build.log" 2>&1 \
   || { grep -E "error:" -A4 "$root/build/pkg-build.log" | head -40; echo "FAIL (package build)"; exit 1; }
 lib="$root/.pixi/envs/default/lib"
 mojo build --disable-warnings "$root/mojo/cli/mx.mojo" -I "$root/build" -Xlinker -L"$lib" -Xlinker -lzstd -Xlinker -lsnappy \
-  -Xlinker -rpath="$lib" -o "$out"
+  -Xlinker -rpath -Xlinker "$lib" -o "$out"
 # The same guard as scripts/mojo_test.sh: no libpython, no Mojo Python interop symbols.
-if ldd "$out" | grep -i python > /dev/null \
+# ldd is GNU only; macOS lists a binary's libraries with otool -L.
+libs_of() { if command -v ldd > /dev/null; then ldd "$1"; else otool -L "$1"; fi; }
+if libs_of "$out" | grep -i python > /dev/null \
    || nm -D "$out" 2>/dev/null | grep KGEN_CompilerRT_Python > /dev/null \
    || strings "$out" | grep -E "^Py_Initialize" > /dev/null; then
   echo "FAIL: mx uses Python (libpython linked or Mojo Python interop)"; rm -f "$out"; exit 1

@@ -23,7 +23,7 @@ from .table import SharedTable, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOA
 from .frame import Frame, _text_less
 from .kernels._fpenv import core_count, par_n
 from .kernels.pipeline_cpu import LP, BP
-from .sqleval import ld_div
+from .sqleval import avg_div
 
 comptime MORSEL = 16384            # positions per morsel: the unit of work, and the unit of the (reproducible) float sum
 comptime NP = Pointer[Int, MutUntrackedOrigin]
@@ -644,7 +644,7 @@ def _fold(p: _Prep, recs: List[Int64], nm: Int, rows: Int, names: List[String]) 
                 raise Error("the sum of column `" + names[k] + "` passed the int64 range (about 9.2e18)")
             agg.has_sum = True
             agg.sum = (h << 32) + (lo_t & 0xFFFFFFFF)
-            agg.mean = ld_div(agg.sum, UInt128(cnt) * UInt128(Int(_p10(agg.scale))))
+            agg.mean = avg_div(Int128(agg.sum), Int(cnt), agg.scale)
             agg.min = mn
             agg.max = mx
         elif cnt > 0 and kind != TEXT.value:

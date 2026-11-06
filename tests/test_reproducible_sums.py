@@ -165,6 +165,10 @@ def test_the_per_morsel_table_path_and_the_staged_path_give_the_defined_order(ca
 def test_reproducible_false_overrides_the_environment_variable(calls, monkeypatch):
     """With MXFRAME_REPRODUCIBLE=1, `reproducible=False` runs the default mode again: above 8,192 groups that
     is the faster path whose sums differ between runs (200k groups over 6M rows: many groups differ)."""
+    from conftest import cpu_kernels_threaded
+    if not cpu_kernels_threaded():
+        pytest.skip("the default mode differs between runs only through thread order, and the CPU kernels of this build run "
+                    "on one thread (kernels_aot/_fpenv.mojo SERIAL), so its sums repeat bit for bit")
     monkeypatch.setenv("MXFRAME_REPRODUCIBLE", "1")
     t = _fact(6_000_000, 200_000)
     plan = LazyFrame(t).groupby("s").agg((col("p") * (lit(1.0) - col("d"))).sum().alias("tot"))

@@ -371,10 +371,25 @@ def test_thread_budget_changes_actual_parallelism(aot):
     (the calling thread also runs a share, so up to five threads are busy)."""
     if (os.cpu_count() or 1) < 4:
         pytest.skip("needs >= 4 cores")
+    from conftest import cpu_kernels_threaded
+    if not cpu_kernels_threaded():
+        pytest.skip("the CPU kernels of this build run on one thread (kernels_aot/_fpenv.mojo SERIAL): no budget to change")
     n = 30_000_000
     a = np.ones(n, dtype=np.float32)
     mask = np.ones(n, dtype=np.int32)
     aot.masked_global_sum(a, mask, threads=4)      # warm the pool and page in the data
+
+    if not os.path.isdir("/proc/self/task"):       # no per-thread CPU time (macOS): CPU time over wall time says how many ran
+        import time
+
+        def cpu_over_wall(threads):
+            w0, c0 = time.perf_counter(), time.process_time()
+            aot.masked_global_sum(a, mask, threads=threads)
+            return (time.process_time() - c0) / (time.perf_counter() - w0)
+
+        assert max(cpu_over_wall(1) for _ in range(4)) < 1.3
+        assert min(cpu_over_wall(4) for _ in range(4)) > 2.0
+        return
 
     def busy(threads):
         return [_busy_threads(lambda: aot.masked_global_sum(a, mask, threads=threads))

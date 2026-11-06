@@ -1,11 +1,12 @@
 """F-153: the hash join kernel through its C ABI (libmxhashjoin_cpu.so), the way a non-Mojo caller uses it."""
 import ctypes
+import os
 from array import array
 from pathlib import Path
 
 import pytest
 
-LIB = Path(__file__).resolve().parent.parent / "kernels_aot" / "libmxhashjoin_cpu.so"
+LIB = Path(os.environ.get("MXFRAME_HASHJOIN_LIB") or Path(__file__).resolve().parent.parent / "kernels_aot" / "libmxhashjoin_cpu.so")
 
 
 @pytest.fixture(scope="module")

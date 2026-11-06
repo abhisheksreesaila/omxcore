@@ -584,6 +584,7 @@ def test_the_light_compile_names_the_same_columns_as_the_real_one():
 
 
 @needs_native
+@needs_gpu
 def test_a_cpu_decision_with_a_queued_upload_runs_native_then_starts_the_upload(monkeypatch):
     t = data(400_000)
     calls = []

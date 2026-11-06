@@ -50,7 +50,7 @@ from .sqlprog import lower_rows
 from .planner import (plan_sinks, Planner, RulePlanner, PlannerOptions, PhysicalPlan, Stats, ColStat, G_NONE, G_DENSE, G_HASHED, commas, JoinStats, JoinPlan, JoinStep,
                       BUILD_AUTO, BUILD_LEFT, BUILD_RIGHT, GROUP_AUTO)
 from .sqlprog import SqlProgram, DictAccess, lower_sql, collect_columns, PHASE_ALL, PHASE_PLAIN, PHASE_HOL
-from .sqleval import ValCol, float_bits, ld_div, ld_div_wide
+from .sqleval import ValCol, float_bits, avg_div
 from .wide import wide_text
 from .exec import (_read_ahead, _table_addresses, _column_range, _is_range_kind, _key_columns, prepare_ranges, _alias_lists, _delta_nulls, make_stats,
                    delta_table, _gather, _sort_keys, _order_rows, _SortCols, _top_rows, _fill_column, _unique_name, _to_table, _ones_mask,
@@ -734,11 +734,12 @@ def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hre
                 elif arg_float:                                      # a sum of doubles over the count, in doubles
                     vc.v[i] = float_bits(Float64(from_bits=UInt64(Int64(acc.slots[vs][g]))) / Float64(nonnull))
                 else:
-                    var den = UInt128(nonnull) * UInt128(Int(pow10_checked(q.rexprs[sp_a.arg].scale)))
+                    var sc = q.rexprs[sp_a.arg].scale
+                    _ = pow10_checked(sc)                           # overflow guard: raises for a scale with no Int128 power of ten
                     if sp.agg_hi_slot[a] >= 0:
-                        vc.v[i] = float_bits(ld_div_wide((Int128(Int64(acc.slots[sp.agg_hi_slot[a]][g])) << Int128(32)) + Int128(Int64(acc.slots[vs][g])), den))
+                        vc.v[i] = float_bits(avg_div((Int128(Int64(acc.slots[sp.agg_hi_slot[a]][g])) << Int128(32)) + Int128(Int64(acc.slots[vs][g])), Int(nonnull), sc))
                     else:
-                        vc.v[i] = float_bits(ld_div(Int64(acc.slots[vs][g]), den))
+                        vc.v[i] = float_bits(avg_div(Int128(Int64(acc.slots[vs][g])), Int(nonnull), sc))
         if sp_a.kind == TEXT.value:
             vc.src = q.rexprs[sp_a.arg].src
         aggs.append(vc^)

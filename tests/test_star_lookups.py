@@ -243,7 +243,7 @@ except MemoryError:
     pass
 else:
     sys.exit("no MemoryError")
-print("GROWTH_MB", (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - base) // 1024)
+print("GROWTH_MB", (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - base) // (1 << 20 if sys.platform == "darwin" else 1 << 10))   # ru_maxrss: bytes on macOS, kB on Linux
 print("DECLINES", nx.decline_counts())
 """
 

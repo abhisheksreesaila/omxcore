@@ -19,8 +19,8 @@ cp build/omxcore.mojoc <app>/vendor/ && echo 834ef9a > <app>/vendor/OMXCORE_COMM
 ```
 
 The Mac build commands are unchanged from 3d2455d (below). **No new libSystem symbols** (`scripts/check_mac_link.sh`
-OK). For parallel saves on the Mac, build the app with `-D MXFRAME_JOB_THREADS` (the pthread symbols listed under
-23edc59, nothing more); without it, saves run on one thread.
+OK). For parallel saves in the app (built with `-D MXFRAME_SERIAL`), add `-D MXFRAME_JOB_THREADS` (the pthread symbols listed under
+23edc59, nothing more); without it, the app's saves run on one thread. A default Mac build (F-210) runs saves on every thread.
 
 ## Next stable (F-204, not yet stable), for apps: BREAKING builder changes
 
@@ -56,7 +56,7 @@ OK). For parallel saves on the Mac, build the app with `-D MXFRAME_JOB_THREADS` 
 
 | Area | What you get | Ticket |
 |---|---|---|
-| Parallel saves | `write_parquet(..., threads=n)` (0 = every thread the build has) compresses a row group's pages on several threads: Linux always; macOS / iOS with `-D MXFRAME_JOB_THREADS`; otherwise serial. The file is byte-identical for any thread count. 2M rows, zstd with the Mojo codec: 0.60 s before, 0.36 s on one thread, 0.06-0.07 s on 12 threads (libzstd: 0.22 s / 0.035 s). Saves of a streamed Frame used at most 4 threads (replaced by a byte budget in 5053a44) | F-187 |
+| Parallel saves | `write_parquet(..., threads=n)` (0 = every thread the build has) compresses a row group's pages on several threads: Linux and a default macOS build always; a serial build (`-D MXFRAME_SERIAL`, the app) with `-D MXFRAME_JOB_THREADS`; otherwise serial. The file is byte-identical for any thread count. 2M rows, zstd with the Mojo codec: 0.60 s before, 0.36 s on one thread, 0.06-0.07 s on 12 threads (libzstd: 0.22 s / 0.035 s). Saves of a streamed Frame used at most 4 threads (replaced by a byte budget in 5053a44) | F-187 |
 | Pages | big columns are written as ~1 MB data pages (every build, Linux included): pyarrow and DuckDB read them, and files open faster (0.040 s to 0.022 s) because pages decode in parallel | F-187 |
 | Size | zstd files within 0.2% of libzstd level 3 | F-187 |
 
