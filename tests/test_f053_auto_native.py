@@ -14,9 +14,12 @@ import pytest
 
 import omxcore.lazy_frame as lfm
 import omxcore.native_exec as nx
+import omxcore.pipeline_kernels as pk
 from omxcore import LazyFrame, auto_mode as am, calibration as cal, col, lit
 from omxcore import coproc_fused as cf
 from omxcore.np_arrow import array as A
+
+needs_gpu = pytest.mark.skipif(not pk.gpu_available(), reason="the cpu+gpu split needs the pipeline GPU library and a CUDA device (NVIDIA)")
 
 pytestmark = pytest.mark.skipif(not nx.available(), reason="libmxexec_cpu.so not built")
 
@@ -186,6 +189,7 @@ def test_no_coproc_policy_unless_a_split_is_predicted(monkeypatch, policies):
     assert policies == [None]
 
 
+@needs_gpu
 def test_a_predicted_split_sets_the_policy_and_keeps_the_answer(monkeypatch, policies):
     """Warm GPU, GPU priced far below the CPU, columns resident (F-057): the split path runs and is correct."""
     monkeypatch.setattr(cf, "MIN_UPLOAD_BYTES", 1)          # a test-sized input still qualifies
@@ -201,6 +205,7 @@ def test_a_predicted_split_sets_the_policy_and_keeps_the_answer(monkeypatch, pol
     assert _rows(got, False) == _rows(want, False)
 
 
+@needs_gpu
 def test_a_split_worthy_query_on_host_data_runs_native_and_queues_the_upload(monkeypatch, policies):
     """The first query of a split-worthy aggregate has no resident columns: it runs exactly as device="cpu"
     (native, no policy), and the upload that later queries split over starts once it has returned (F-057)."""

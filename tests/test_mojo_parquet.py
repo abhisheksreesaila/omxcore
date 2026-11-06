@@ -4,6 +4,7 @@ import json
 import os
 import struct
 import subprocess
+import sys
 from pathlib import Path
 
 import duckdb
@@ -1549,6 +1550,9 @@ def scratch():
 
 
 def run_budget_probe(probe, tmp_path, rows, threads, budget, data):
+    if sys.platform != "linux":
+        pytest.skip("the probe measures how far one save raises the peak resident memory, which needs /proc/self/clear_refs to "
+                    "restart the peak; macOS cannot, so its peak stays the process's all-time peak and the growth would read 0")
     path = tmp_path / f"b{threads}_{budget}_{data}.parquet"
     p = subprocess.run([str(probe), str(rows), str(path), str(threads), str(budget), data], capture_output=True, text=True)
     assert p.returncode == 0, p.stdout + p.stderr

@@ -68,7 +68,7 @@ def cpu_available() -> bool:
 _CUDA = None
 
 
-def _cuda_usable() -> bool:
+def cuda_usable() -> bool:
     """A CUDA driver that opens and has a device (the GPU kernel drives CUDA only). Asked once."""
     global _CUDA
     if _CUDA is None:
@@ -86,7 +86,7 @@ def _cuda_usable() -> bool:
 
 def gpu_available() -> bool:
     """The GPU library exists and a CUDA device can run it (the Metal build of the library, on a Mac, is not that)."""
-    return _find("libmxpipeline_gpu.so", "MXFRAME_PIPELINE_GPU_LIB") is not None and _cuda_usable()
+    return _find("libmxpipeline_gpu.so", "MXFRAME_PIPELINE_GPU_LIB") is not None and cuda_usable()
 
 
 _PHYSICAL = None

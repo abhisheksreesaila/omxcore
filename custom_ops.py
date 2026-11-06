@@ -275,7 +275,8 @@ def _max_accelerator():
                 if driver.accelerator_count() > 0:
                     from .compiler import _is_gpu_max_compatible
                     cand = driver.Accelerator()
-                    acc = cand if _is_gpu_max_compatible(cand) else None
+                    # CUDA only: the Python path's GPU kernels are CUDA kernels; an Apple (Metal) device is no accelerator for them
+                    acc = cand if _is_gpu_max_compatible(cand) and cand.api == "cuda" else None
             except Exception:
                 acc = None
             _ACCELERATOR["acc"] = acc
