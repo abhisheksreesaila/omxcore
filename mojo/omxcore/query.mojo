@@ -1618,20 +1618,15 @@ def prune_dead(ins: List[Int32], keep_below: Int, pred_reg: Int) -> List[Bool]:
                 i -= 1
                 continue
             live[d] = False
-        if (m & _R2) != 0:
-            live[Int(ins[i * 5 + 2])] = True
-        if (m & _R3) != 0:
-            live[Int(ins[i * 5 + 3])] = True
-        if (m & _R4) != 0:
-            live[Int(ins[i * 5 + 4])] = True
-        if (m & _RD) != 0:
+        for k in range(2, 5):                                    # an operand of an instruction this does not know may not be a register at all: stay inside `live`
+            if (m & (1 << (k - 1))) != 0:
+                var r = Int(ins[i * 5 + k])
+                if r >= 0 and r < 256:
+                    live[r] = True
+        if (m & _RD) != 0 and d >= 0 and d < 256:
             live[d] = True
         i -= 1
     return dead^
-from .kernels._fpenv import core_count
-from .kernels.pipeline_cpu import IP, LP, FP, BP, pipeline_keyed, pipeline_fused, _no_front
-from .kernels.hashagg_cpu import hash_aggregate
-from .exec import _table_addresses
 
 
 def _dead_after(ins: List[Int32], after: Int, r: Int, keep_below: Int, pred_reg: Int) -> Bool:
