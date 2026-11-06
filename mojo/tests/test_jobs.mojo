@@ -10,7 +10,8 @@ from omxcore import (Table, SharedTable, Frame, Query, QueryResult, col, lit, su
                      GROUP_HASHED, sql, read_csv, CsvOptions, SqlResult, DeviceTable, gpu_available, GPU)
 from std.os import listdir
 from std.time import perf_counter_ns
-from omxcore.kernels._fpenv import SERIAL
+from omxcore import JOBS_ARE_THREADED
+from omxcore.procmem import rss_kb
 
 comptime DIR = "mxframe_jobs_test/"
 
@@ -38,14 +39,6 @@ struct Rng(Movable):
 
 def pause(us: Int):
     external_call["usleep", c_int](Int32(us))
-
-
-def rss_kb() raises -> Int:
-    var f = open("/proc/self/statm", "r")
-    var text = f.read()
-    f.close()
-    var parts = text.split(" ")
-    return Int(String(parts[1])) * 4
 
 
 # ── comparing results ────────────────────────────────────────────────────────────────────────────
@@ -158,7 +151,8 @@ def test_compute_equals_plain() raises:
     for _ in range(9):                                  # (ranges of 2M rows: progress is seen part way when it runs by ranges)
         var again = compute_job(agg_query(t), CPU)
         most = max(most, watch(again, "compute again"))
-    expect(most >= 1, "progress was seen part way through a 6M-row query: the ranges ran (" + String(most) + ")")
+    comptime if JOBS_ARE_THREADED:                      # (a job that runs inside its start call is done before anyone can look)
+        expect(most >= 1, "progress was seen part way through a 6M-row query: the ranges ran (" + String(most) + ")")
     expect(same_result(r, plain), "integer aggregates over 6M rows: the job's result is the plain call's")
     expect(r.counts[0] > 0 and r.sums[0] == plain.sums[0], "a real answer (group 0 has rows)")
     var flo = Query(t).group_by(col("k"), groups=7).agg(sum(col("x")), min_of(col("x")), count()).compute(CPU)
@@ -254,7 +248,7 @@ def test_cancel_storm() raises:
     var grown = rss_kb() - base
     print("cancel storm:", CYCLES, "cycles,", done, "done,", cancelled, "cancelled, memory grew", grown, "KB after the first 40")
     expect(grown < 60_000, "memory grew " + String(grown) + " KB over 260 cycles (a leak per cycle would be tens of MB)")
-    comptime if not SERIAL:
+    comptime if JOBS_ARE_THREADED:
         expect(cancelled > 20, "the cancels reached running jobs (" + String(cancelled) + ")")
 
 
@@ -547,7 +541,7 @@ def test_cancelled_save_keeps_the_old_file() raises:
             expect(state == JOB_DONE and same_bytes(now, new_bytes), "a save that was past cancelling is whole")
     expect(no_temp_files(), "no temporary file is left behind")
     print("cancelled saves:", kept, "kept the old file,", replaced, "finished first")
-    comptime if not SERIAL:
+    comptime if JOBS_ARE_THREADED:
         expect(kept > 5, "the cancels reached running saves (" + String(kept) + ")")
 
 
@@ -662,13 +656,14 @@ def test_permutation_job() raises:
             _ = watch(job, "sort " + String(c))
             var got = job.result()
             expect(len(got) == len(plain) and same_ints(got, plain), "permutation_job == permutation: " + String(c) + " descending " + String(desc))
-    var slow = permutation_job(f, f.column("v"))
-    pause(5000)
-    slow.cancel()
-    var t0 = perf_counter_ns()
-    expect(slow.wait() == JOB_CANCELLED, "a cancelled sort has no result")
-    var ms = Float64(perf_counter_ns() - t0) / 1e6
-    expect(ms < 400.0, "the sort stops within a few checks of the cancel: " + String(ms) + " ms")
+    comptime if JOBS_ARE_THREADED:                      # (a job that runs inside its start call is done before cancel() is called)
+        var slow = permutation_job(f, f.column("v"))
+        pause(5000)
+        slow.cancel()
+        var t0 = perf_counter_ns()
+        expect(slow.wait() == JOB_CANCELLED, "a cancelled sort has no result")
+        var ms = Float64(perf_counter_ns() - t0) / 1e6
+        expect(ms < 400.0, "the sort stops within a few checks of the cancel: " + String(ms) + " ms")
 
 
 def test_cancel_latency() raises:
@@ -707,7 +702,7 @@ def test_cancel_latency() raises:
                     stopped_early += 1
             worst = max(worst, Float64(perf_counter_ns() - t0) / 1e6)
         print("cancel latency, query", qi, ": worst", worst, "ms,", hit, "of 6 cancels reached a running job; a whole run takes", want.ms, "ms")
-        comptime if not SERIAL:
+        comptime if JOBS_ARE_THREADED:
             expect(hit >= 3, "the cancels reached running jobs (" + String(hit) + ")")
             expect(stopped_early >= 1, "a cancelled job stopped part way through its rows (" + String(stopped_early) + " of " + String(hit) + ")")
         expect(worst < 250.0, "a cancel stops the job within about 100 ms (worst " + String(worst) + " ms): " + texts[qi])
@@ -748,7 +743,7 @@ def test_cancel_multiway() raises:
             hit += 1
         worst = max(worst, Float64(perf_counter_ns() - t0) / 1e6)
     print("cancel of a multi-way join: worst", worst, "ms,", hit, "of 6 reached a running job; a whole run takes", want.ms, "ms")
-    comptime if not SERIAL:
+    comptime if JOBS_ARE_THREADED:
         expect(hit >= 3, "the cancels reached running multi-way jobs (" + String(hit) + ")")
     expect(worst < 400.0, "a cancel stops a multi-way join within a few hundred ms (worst " + String(worst) + " ms)")
 

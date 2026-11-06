@@ -8,21 +8,9 @@
 # or a wrong total changes it).
 from std.sys import argv
 from std.time import perf_counter_ns
+from omxcore.procmem import peak_kb, anon_kb
 from omxcore import Catalog, sql_with, RulePlanner, PlannerOptions, read_csv, scan_csv, CsvOptions, TEXT, INT, DECIMAL, DATE, BOOL
 
-
-def status_kb(key: String) raises -> Int:
-    var text = String()
-    with open("/proc/self/status", "r") as fh:
-        text = fh.read()
-    for line in text.split("\n"):
-        if line.startswith(key):
-            var digits = String()
-            for b in line.as_bytes():
-                if b >= 48 and b <= 57:
-                    digits += chr(Int(b))
-            return Int(digits)
-    return -1
 
 
 def main() raises:
@@ -42,7 +30,7 @@ def main() raises:
         for g in range(scan2.row_groups()):
             var part = scan2.read_group(g, one)
             total += part.rows()
-        print("groups " + String(total) + " hwm " + String(status_kb("VmHWM:")) + " anon " + String(status_kb("RssAnon:")))
+        print("groups " + String(total) + " hwm " + String(peak_kb()) + " anon " + String(anon_kb()))
         return
     var popts = PlannerOptions()
     if len(args) > 6:
@@ -63,7 +51,7 @@ def main() raises:
             failed += c.failed_count
         cat.add_table("t", r.take_table().share())
     var t1 = perf_counter_ns()
-    var open_hwm = status_kb("VmHWM:")
+    var open_hwm = peak_kb()
     var res = sql_with(cat, text, RulePlanner(), popts)
     var t2 = perf_counter_ns()
     var sumcheck = 0
@@ -78,5 +66,5 @@ def main() raises:
                 sumcheck += Int(res.table.get(c, r))
     print('{"rows": ' + String(res.table.rows()) + ', "checksum": ' + String(sumcheck) + ', "row_groups": ' + String(groups) +
           ', "open_ms": ' + String(Float64(t1 - t0) / 1e6) + ', "query_ms": ' + String(Float64(t2 - t1) / 1e6) +
-          ', "open_hwm_kb": ' + String(open_hwm) + ', "vm_hwm_kb": ' + String(status_kb("VmHWM:")) + ', "rss_anon_kb": ' + String(status_kb("RssAnon:")) +
+          ', "open_hwm_kb": ' + String(open_hwm) + ', "vm_hwm_kb": ' + String(peak_kb()) + ', "rss_anon_kb": ' + String(anon_kb()) +
           ', "report_failed": ' + String(failed) + '}')

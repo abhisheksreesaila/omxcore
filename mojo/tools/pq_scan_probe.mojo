@@ -5,6 +5,7 @@
 # The file has: region (string), carrier (int64), day (date), revenue (decimal(.., 2)), cost (int64).
 from std.sys import argv
 from std.os import getenv
+from omxcore.procmem import peak_kb
 from omxcore import (Query, QueryResult, col, lit, least, sum, count, mean, min_of, max_of, read_parquet, scan_parquet,
                      CPU, GPU, AUTO, MORSELS_AUTO, MORSELS_ON, MORSELS_OFF)
 
@@ -47,14 +48,6 @@ def plan(var q: Query, which: String, nreg: Int, east: Int) raises -> Query:
         return q^.group_by(col("region"), groups=nreg).agg(sum(col("cost")), count())
     raise Error("unknown query " + which)
 
-
-def peak_kb() raises -> Int:
-    with open("/proc/self/status", "r") as f:
-        for line in f.read().split("\n"):
-            if line.startswith("VmHWM:"):
-                var parts = line.split()
-                return Int(String(parts[1]))
-    return -1
 
 
 def main() raises:

@@ -40,7 +40,7 @@ def build(serial):
     out = D / ("bench_serial" if serial else "bench")
     lib = ROOT / ".pixi/envs/default/lib"
     cmd = ["mojo", "build", "--disable-warnings", str(ROOT / "mojo/tools/pq_decode_bench.mojo"), "-I", str(ROOT / "build"),
-           "-Xlinker", f"-L{lib}", "-Xlinker", "-lzstd", "-Xlinker", "-lsnappy", "-Xlinker", f"-rpath={lib}", "-o", str(out)]
+           "-Xlinker", f"-L{lib}", "-Xlinker", "-lzstd", "-Xlinker", "-lsnappy", "-Xlinker", "-rpath", "-Xlinker", str(lib), "-o", str(out)]
     if serial:
         cmd[2:2] = ["-D", "MXFRAME_SERIAL"]
     subprocess.run(cmd, check=True, capture_output=True, text=True)

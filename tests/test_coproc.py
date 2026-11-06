@@ -79,6 +79,12 @@ def test_static_split_honours_gpu_fraction():
     assert res.stats["cpu"].rows == 700_000
 
 
+def _timed_sleep(seconds):
+    t = time.perf_counter()
+    time.sleep(seconds)
+    return time.perf_counter() - t
+
+
 def test_prepare_overlaps_with_compute():
     """While morsel k computes, morsel k+1 is being prepared (the copy stage)."""
     events = []
@@ -100,13 +106,14 @@ def test_prepare_overlaps_with_compute():
             events.append(("comp_end", h[0], time.perf_counter()))
         return h[1] - h[0]
 
+    unit = min(_timed_sleep(0.02) for _ in range(5))      # what this OS's sleep(20 ms) costs, overshoot included (macOS: ~27 ms)
     w = Worker(name="gpu", device="gpu", morsel_rows=10, prepare=prepare, compute=compute)
     t0 = time.perf_counter()
     res = run_router(60, [w], merge=sum)
     wall = time.perf_counter() - t0
     assert res.value == 60
-    # 6 morsels * (20ms prep + 20ms compute) = 240ms serial; overlapped ~ 140ms.
-    assert wall < 0.20
+    # 6 morsels * (prep + compute) = 12 sleeps serial; overlapped ~ 7 sleeps (140 ms where a sleep is 20 ms).
+    assert wall < 0.8 * 12 * unit
 
 
 def test_worker_error_is_raised_not_swallowed():

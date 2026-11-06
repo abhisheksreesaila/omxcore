@@ -21,7 +21,7 @@ def dump_tool():
     lib = ROOT / ".pixi/envs/default/lib"
     subprocess.run(["bash", str(ROOT / "scripts/build_mojo_pkg.sh")], check=True, capture_output=True, cwd=ROOT)
     subprocess.run(["mojo", "build", "--disable-warnings", str(ROOT / "mojo/tools/csv_dump.mojo"), "-I", str(BUILD),
-                    f"-Xlinker=-L{lib}", "-Xlinker=-lzstd", "-Xlinker=-lsnappy", f"-Xlinker=-rpath={lib}",
+                    f"-Xlinker=-L{lib}", "-Xlinker=-lzstd", "-Xlinker=-lsnappy", "-Xlinker=-rpath", f"-Xlinker={lib}",
                     "-o", str(DUMP)], check=True, capture_output=True, cwd=ROOT)
     return DUMP
 

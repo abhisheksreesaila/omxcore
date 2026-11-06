@@ -11,6 +11,7 @@ import pytest
 
 import _f011_scenarios as sc
 from omxcore.aot_kernels import GPU_AOT_AVAILABLE
+from omxcore.pipeline_kernels import cuda_usable
 
 SCRIPT = Path(__file__).with_name("_f011_scenarios.py")
 
@@ -19,8 +20,8 @@ def _run(name, device):
     if device == "cpu":
         sc.SCENARIOS[name](device)
         return
-    if not GPU_AOT_AVAILABLE:
-        pytest.skip("no GPU AOT kernels")
+    if not GPU_AOT_AVAILABLE or not cuda_usable():
+        pytest.skip("no GPU AOT kernels, or no CUDA device to run them (the Python path's GPU is NVIDIA only)")
     r = subprocess.run([sys.executable, str(SCRIPT), name, device], capture_output=True, text=True,
                        timeout=900)
     assert r.returncode == 0, (r.stdout + r.stderr)[-3000:]

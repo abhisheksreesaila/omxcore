@@ -9,21 +9,9 @@
 from std.sys import argv
 from std.time import perf_counter_ns
 from std.os import listdir
+from omxcore.procmem import peak_kb, anon_kb
 from omxcore import (Frame, JobCtl, Catalog, PlannerOptions, sql, sql_to_parquet, read_parquet, scan_parquet, scan_csv, read_csv, CsvOptions, ZSTD, Table)
 
-
-def status_kb(key: String) raises -> Int:
-    var text = String()
-    with open("/proc/self/status", "r") as fh:
-        text = fh.read()
-    for line in text.split("\n"):
-        if line.startswith(key):
-            var digits = String()
-            for b in line.as_bytes():
-                if b >= 48 and b <= 57:
-                    digits += chr(Int(b))
-            return Int(digits)
-    return -1
 
 
 def checksum(t: Table) raises -> Int:
@@ -54,7 +42,7 @@ def main() raises:
         var h = 0
         for r in range(len(order)):
             h = (h * 1000003 + order[r] + 7) % 1000000000000000007
-        print('{"rows": ' + String(len(order)) + ', "checksum": ' + String(h) + ', "vm_hwm_kb": ' + String(status_kb("VmHWM:")) + ', "query_ms": ' +
+        print('{"rows": ' + String(len(order)) + ', "checksum": ' + String(h) + ', "vm_hwm_kb": ' + String(peak_kb()) + ', "query_ms": ' +
               String(Float64(perf_counter_ns() - p0) / 1e6) + ', "spill_files_left": ' + String(len(listdir(dir)) if dir.byte_length() > 0 else 0) + "}")
         return
     var cat = Catalog()
@@ -71,7 +59,7 @@ def main() raises:
             cat.add_scan("t", scan_csv(path, CsvOptions(group_rows=100000)))
         else:
             cat.add_scan("t", scan_parquet(path))
-    var base_kb = status_kb("VmHWM:")
+    var base_kb = peak_kb()
     var t0 = perf_counter_ns()
     var rows = 0
     var sum = 0
@@ -108,6 +96,6 @@ def main() raises:
     var left = 0
     if dir.byte_length() > 0:
         left = len(listdir(dir))
-    print('{"rows": ' + String(rows) + ', "checksum": ' + String(sum) + ', "runs": ' + String(runs) + ', "vm_hwm_kb": ' + String(status_kb("VmHWM:")) +
-          ', "base_hwm_kb": ' + String(base_kb) + ', "rss_anon_kb": ' + String(status_kb("RssAnon:")) + ', "query_ms": ' + String(Float64(t1 - t0) / 1e6) +
+    print('{"rows": ' + String(rows) + ', "checksum": ' + String(sum) + ', "runs": ' + String(runs) + ', "vm_hwm_kb": ' + String(peak_kb()) +
+          ', "base_hwm_kb": ' + String(base_kb) + ', "rss_anon_kb": ' + String(anon_kb()) + ', "query_ms": ' + String(Float64(t1 - t0) / 1e6) +
           ', "streamed": ' + ("true" if streamed else "false") + ', "spill_files_left": ' + String(left) + "}")
