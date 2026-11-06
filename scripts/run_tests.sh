@@ -10,6 +10,12 @@ export TMPDIR="${MXFRAME_TEST_TMPDIR:-$HOME/.cache/mxframe-test-tmp}"
 mkdir -p "$TMPDIR"
 shim="${TMPDIR:-/tmp}/omxcore-pytest-$(printf '%s' "$root" | { sha1sum 2> /dev/null || shasum; } | cut -c1-10)"
 mkdir -p "$shim" && ln -sfn "$root" "$shim/omxcore" && ln -sfn "$root/compat/mxframe" "$shim/mxframe"
+# The committed kernels_aot/*.so are x86-64 ELF files: a Mac cannot load them. Build the arm64 ones first (once; it skips what
+# Metal cannot build, see build_pipeline.sh), then the Python path's tests find libraries they can open.
+if [ "$(uname)" = "Darwin" ] && head -c 4 "$root/kernels_aot/libmxpipeline_cpu.so" | grep -q ELF; then
+  echo "run_tests.sh: the committed kernel libraries are ELF; building them for this Mac (scripts/build_pipeline.sh)"
+  bash "$root/scripts/build_pipeline.sh"
+fi
 # Test paths (`tests/test_x.py`, `tests/test_x.py::name`) run alone, through the shim;
 # with none, the whole tests directory runs. Other arguments pass through.
 args=() paths=()

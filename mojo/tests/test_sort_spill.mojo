@@ -4,6 +4,7 @@
 # NULLS FIRST / LAST, DESC, TEXT case order, NaN and -0.0 are in the data. (tests/test_sort_spill.py compares the answers with DuckDB.)
 from std.os import listdir, mkdir
 from std.math import nan, inf
+from omxcore import JOBS_ARE_THREADED
 from omxcore import (Table, SharedTable, Frame, Catalog, PlannerOptions, sql, sql_to_parquet, SqlResult, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT,
                      write_parquet, scan_parquet, read_parquet, scan_csv, CsvOptions, ZSTD, sql_job, JOB_DONE, JOB_CANCELLED)
 
@@ -346,8 +347,9 @@ def test_cancel_removes_the_runs() raises:
         if state == JOB_CANCELLED:
             cancelled += 1
         no_files_left()
-    if cancelled == 0:
-        fail("no cancel reached a sort")
+    comptime if JOBS_ARE_THREADED:                       # (a job that runs inside its start call is finished before cancel() is called)
+        if cancelled == 0:
+            fail("no cancel reached a sort")
 
 
 def main() raises:

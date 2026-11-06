@@ -4,6 +4,7 @@
 # Parquet scan and over a CSV scan, with runs of 1,000 rows (many), 3,000 (two) and 100,000 (one run holding every row).
 from std.os import listdir, mkdir
 from std.math import nan, inf
+from omxcore import JOBS_ARE_THREADED
 from omxcore import (Table, SharedTable, Frame, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, write_parquet, scan_parquet, scan_csv, CsvOptions, ZSTD,
                      permutation_job, JOB_DONE, JOB_CANCELLED, JobCtl)
 
@@ -119,6 +120,7 @@ def main() raises:
         else:
             cancelled += 1
         no_files_left()
-    if cancelled == 0:
-        fail("no cancel reached a permutation job")
+    comptime if JOBS_ARE_THREADED:                       # (a job that runs inside its start call is finished before cancel() is called)
+        if cancelled == 0:
+            fail("no cancel reached a permutation job")
     print("ok   permutation job spills and cancels clean")

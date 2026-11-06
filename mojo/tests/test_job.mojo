@@ -4,7 +4,8 @@ from std.atomic import Atomic
 from std.ffi import external_call, c_int
 from std.memory.alloc import unsafe_alloc
 from omxcore import (Job, JobCtl, JobBody, JobDone, start_job, start_job_then, JOB_RUNNING, JOB_DONE, JOB_FAILED, JOB_CANCELLED, STAGE_AGGREGATE)
-from omxcore.kernels._fpenv import SERIAL
+from omxcore import JOBS_ARE_THREADED
+from omxcore.procmem import rss_kb
 
 
 def expect(cond: Bool, what: String) raises:
@@ -14,15 +15,6 @@ def expect(cond: Bool, what: String) raises:
 
 def pause(us: Int):
     external_call["usleep", c_int](Int32(us))
-
-
-def rss_kb() raises -> Int:
-    """Resident memory of this process, from /proc/self/statm (pages * 4)."""
-    var f = open("/proc/self/statm", "r")
-    var text = f.read()
-    f.close()
-    var parts = text.split(" ")
-    return Int(String(parts[1])) * 4
 
 
 struct Counter(Movable):
@@ -101,7 +93,7 @@ def test_result_and_progress() raises:
     expect(job.poll() == JOB_DONE, "the job is done")
     var p = job.progress()
     expect(p.done == 100 and p.total == 100 and p.stage == "aggregating", "progress ends at the total: " + String(p.done) + "/" + String(p.total) + " " + p.stage)
-    comptime if not SERIAL:
+    comptime if JOBS_ARE_THREADED:
         expect(seen_running, "the caller saw it run (it was off the caller's thread)")
     expect(job.result() == 4950, "the result is the sum 0..99")
     var again = False
@@ -239,7 +231,7 @@ def test_many_at_once() raises:
 def main() raises:
     test_result_and_progress()
     test_failure()
-    comptime if not SERIAL:
+    comptime if JOBS_ARE_THREADED:
         test_cancel()
         test_cancel_after_commit_does_nothing()
         test_callback()

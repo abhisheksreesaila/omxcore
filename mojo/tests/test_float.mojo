@@ -8,7 +8,7 @@ from omxcore import (float_text, Table, SharedTable, Frame, Catalog, Query, Quer
                      sum, count, mean, min_of, max_of, count_distinct, median, percentile, sql, PlannerOptions, GROUP_DENSE,
                      read_parquet, write_parquet, scan_parquet, read_csv, CsvOptions, ZSTD, CPU, AUTO)
 
-comptime DIR = "/home/abhisheksreesaila/.cache/mxframe_float_test/"
+comptime DIR = "mxframe_float_test/"          # relative: mojo_test.sh runs each test in its own scratch directory
 comptime NAN_BITS = Int64(0x7FF8000000000000)
 
 

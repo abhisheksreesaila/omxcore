@@ -5,16 +5,9 @@
 # rose above what the process held before the save (tests/test_mojo_parquet.py).
 from std.sys import argv
 from std.time import perf_counter_ns
+from omxcore.procmem import peak_kb, rss_kb, reset_peak
 from omxcore import Table, INT, write_parquet, ZSTD
 
-
-def status_kb(key: String) raises -> Int:
-    with open("/proc/self/status", "r") as f:
-        for line in f.read().split("\n"):
-            if line.startswith(key):
-                var parts = line.split()
-                return Int(String(parts[1]))
-    return -1
 
 
 def main() raises:
@@ -34,10 +27,9 @@ def main() raises:
             s ^= s >> 7
             s ^= s << 17
             t.append(c, Int64((s >> 1) % 1000) if small else Int64(s >> 1))
-    with open("/proc/self/clear_refs", "w") as f:
-        f.write("5")
-    var before = status_kb("VmRSS:")
+    _ = reset_peak()                                         # Linux only: on macOS the peak stays the process's all-time peak
+    var before = rss_kb()
     var t0 = perf_counter_ns()
     write_parquet(path, t, "", ZSTD, rows, threads=threads, budget=budget)
     var ms = Float64(perf_counter_ns() - t0) / 1e6
-    print('{"table_kb": ' + String(rows * 64 // 1024) + ', "before_kb": ' + String(before) + ', "peak_kb": ' + String(status_kb("VmHWM:")) + ', "save_ms": ' + String(ms) + "}")
+    print('{"table_kb": ' + String(rows * 64 // 1024) + ', "before_kb": ' + String(before) + ', "peak_kb": ' + String(peak_kb()) + ', "save_ms": ' + String(ms) + "}")

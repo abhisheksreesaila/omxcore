@@ -17,6 +17,8 @@
 # that edited kernels_aot/*.mojo by running this with no argument, then commit the .so files and
 # their .sources.json files.
 #
+# On macOS: no x86-64 level, no RUNPATH step (ELF only), and libmxkernels_aot_gpu is skipped, not built (Metal has no float64).
+#
 # All but `aot` are built for x86-64-v3 (AVX2 + FMA + BMI2, Haswell / Zen1 and newer), not the
 # build host's native CPU, so a wheel does not SIGILL on an older machine. Measured on SF10 Q1
 # (60M rows, 24 threads): 51 ms vs 56 ms native, i.e. no cost.
@@ -32,11 +34,11 @@ build() {
     local src="$1" lib="$2"; shift 2
     pixi run mojo build "kernels_aot/$src.mojo" -I kernels_aot "$@" --emit shared-lib \
         -o "kernels_aot/$lib.so"
-    bash scripts/set_runpath.sh "kernels_aot/$lib.so"
+    if [[ "$(uname)" == "Linux" ]]; then bash scripts/set_runpath.sh "kernels_aot/$lib.so"; fi   # ELF RUNPATH: Linux only
     pixi run python scripts/record_build_hash.py "kernels_aot/$lib.so"
     BUILT+=("kernels_aot/$lib.so")
 }
-V3=(--target-cpu x86-64-v3)
+if [[ "$(uname -m)" == "x86_64" ]]; then V3=(--target-cpu x86-64-v3); else V3=(); fi   # an x86-64 level means nothing on arm64
 
 case "$WHICH" in all|cpu|exec|gpu|keys|join|hashjoin|aot) ;; *) echo "unknown target: $WHICH" >&2; exit 2 ;; esac
 
@@ -61,6 +63,10 @@ if [[ "$WHICH" == "all" || "$WHICH" == "hashjoin" ]]; then
 fi
 if [[ "$WHICH" == "all" || "$WHICH" == "aot" ]]; then
     build kernels_aot libmxkernels_aot
-    build kernels_aot_gpu libmxkernels_aot_gpu
+    if [[ "$(uname)" == "Darwin" ]]; then
+        echo "skipped libmxkernels_aot_gpu: its kernels are float64 and Metal has no float64 (the Python path's GPU is CUDA only)"
+    else
+        build kernels_aot_gpu libmxkernels_aot_gpu
+    fi
 fi
 echo "built: ${BUILT[*]}"

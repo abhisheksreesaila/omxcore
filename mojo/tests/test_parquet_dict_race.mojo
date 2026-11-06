@@ -2,6 +2,7 @@
 # under a hand-made lock). One round is cheap; many rounds, each on a fresh scan, make a race a near certainty (F-199's lesson).
 from std.atomic import Atomic
 from std.memory.alloc import unsafe_alloc
+from omxcore import JOBS_ARE_THREADED
 from omxcore import (Table, TEXT, INT, write_parquet, scan_parquet, ParquetScan, JobCtl, JobBody, start_job, JOB_DONE, UNCOMPRESSED)
 
 comptime WORDS = 1500
@@ -61,6 +62,12 @@ struct Reader(JobBody):
 
 
 def main() raises:
+    comptime if not JOBS_ARE_THREADED:
+        # The race is between the caller and a job's thread. Where a job runs inside start_job (the default macOS build) there is no
+        # second thread, and the Reader would wait for a gate the caller only sets after start_job returns: it never would. The
+        # threaded build of this test is what scripts/mojo_test.sh runs on macOS (-D MXFRAME_JOB_THREADS).
+        print("skipped: jobs do not run on threads in this build, so there is nothing to race")
+        return
     make_file("dict_race.parquet")
     var want = digest(scan_parquet("dict_race.parquet"))
     var gate = unsafe_alloc[Int64](1)

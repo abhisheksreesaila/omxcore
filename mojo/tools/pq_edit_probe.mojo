@@ -8,16 +8,9 @@
 # Usage: pq_edit_probe <path> <out path> <cache MiB> [permute] [allow]     (the file is the one pq_scan_probe reads)
 from std.sys import argv
 from std.time import perf_counter_ns
+from omxcore.procmem import peak_kb
 from omxcore import Frame, Query, col, sum, count, scan_parquet, AUTO
 
-
-def peak_kb() raises -> Int:
-    with open("/proc/self/status", "r") as f:
-        for line in f.read().split("\n"):
-            if line.startswith("VmHWM:"):
-                var parts = line.split()
-                return Int(String(parts[1]))
-    return -1
 
 
 def ms_since(t0: Int) -> Float64:
