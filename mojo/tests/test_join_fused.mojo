@@ -165,6 +165,32 @@ def main() raises:
     var rc = Query(left).join(right1, ["k"], ["dk"]).join(r2t^.share(), ["w"], ["rk"]).agg(count(), sum(col("z"))).compute()
     expect(rc.counts[0] == by_hand_count and rc.values(1)[0] == chain_sum, "two joins in a row: " + String(rc.counts[0]) + " " + String(rc.values(1)[0]) + " wanted " + String(by_hand_count) + " " + String(chain_sum))
     expect(has_note(rc, "join path: fused"), "the second join of a chain is fused")
+    # (7c) two keys whose ranges multiply past 2^62 are hashed tuples, verified per pair: written, not fused, and still right
+    var hl = Table.empty()
+    var h1 = hl.add_column("a", INT)
+    var h2 = hl.add_column("b", INT)
+    var hr = Table.empty()
+    var g1 = hr.add_column("a", INT)
+    var g2 = hr.add_column("b", INT)
+    var gv = hr.add_column("v", INT)
+    var big = Int64(1) << 40
+    for i in range(500):
+        hl.append(h1, Int64(i % 50) * big)
+        hl.append(h2, Int64(i % 7) * big + Int64(i % 3))
+    for i in range(100):
+        hr.append(g1, Int64(i % 50) * big)
+        hr.append(g2, Int64(i % 7) * big + Int64(i % 3))
+        hr.append(gv, Int64(i))
+    var hwant = 0
+    var hsum = 0
+    for i in range(500):
+        for j in range(100):
+            if i % 50 == j % 50 and i % 7 == j % 7 and i % 3 == j % 3:
+                hwant += 1
+                hsum += j
+    var rh = Query(hl^.share()).join(hr^.share(), ["a", "b"], ["a", "b"]).agg(count(), sum(col("v"))).compute()
+    expect(rh.counts[0] == hwant and rh.values(1)[0] == hsum and hwant > 0, "hashed keys: " + String(rh.counts[0]) + " wanted " + String(hwant))
+    expect(has_note(rh, "join path: materialized") and has_note(rh, "hashed tuples"), "hashed keys are written, with the reason")
     # (8) an empty side: nothing matches (inner, semi), everything is unmatched (left, anti); GPU asked for: refused by name, nothing written
     var empty = Table.empty()
     _ = empty.add_column("dk", INT)
