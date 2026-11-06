@@ -28,7 +28,7 @@ from .holistic import (HolStates, HolSpec, HolResult, A_DISTINCT, A_PCT, A_MEDIA
                            float_key)
 from .sql import sql_error, parse_sql, SqlStatement, EXPLAIN_NONE, EXPLAIN_ANALYZE
 from .bind import (copy_query, Catalog, SqlSource, BoundQuery, SortKey, bind_sql, bind_statement, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, F_COUNT_STAR,
-                   F_COUNT, F_SUM, F_MIN, F_MAX, F_AVG, F_COUNT_DISTINCT, F_MEDIAN, F_STDDEV_SAMP, F_STDDEV_POP, F_VAR_SAMP, F_VAR_POP, F_QEDGE, B_QBIN, B_LIT, B_AGG, B_AND, B_CMP, C_EQ,
+                   F_COUNT, F_SUM, F_MIN, F_MAX, F_AVG, F_COUNT_DISTINCT, F_MEDIAN, F_STDDEV_SAMP, F_STDDEV_POP, F_VAR_SAMP, F_VAR_POP, F_QEDGE, B_QBIN, B_LIT, B_NULL, B_STR, B_AGG, B_AND, B_CMP, C_EQ,
                    BExpr, AggSpec, KeySpec, pow10_checked)
 from .plan import LogicalPlan, build_plan, executable
 from .post import run_post
@@ -48,7 +48,7 @@ from std.memory.alloc import unsafe_alloc
 from std.ffi import external_call
 from .sqlprog import lower_rows
 from .planner import (plan_sinks, Planner, RulePlanner, PlannerOptions, PhysicalPlan, Stats, ColStat, G_NONE, G_DENSE, G_HASHED, commas, JoinStats, JoinPlan, JoinStep,
-                      BUILD_AUTO, BUILD_LEFT, BUILD_RIGHT)
+                      BUILD_AUTO, BUILD_LEFT, BUILD_RIGHT, GROUP_AUTO)
 from .sqlprog import SqlProgram, DictAccess, lower_sql, collect_columns, PHASE_ALL, PHASE_PLAIN, PHASE_HOL
 from .sqleval import ValCol, float_bits, ld_div, ld_div_wide
 from .wide import wide_text
@@ -116,6 +116,12 @@ def _hash_group(kw: List[List[Int64]], g: Int) -> UInt64:
     return h
 
 
+comptime TWO_PHASE_DECLINED = "count(DISTINCT): too many (keys, value) groups for two phases"     # F-206: raised by the first phase, caught where the query is run
+comptime TWO_PHASE_MIN_ROWS = 262144         # F-206: a first phase over fewer rows has at most this many groups: it needs no trial
+comptime TWO_PHASE_MAX_GROUPS = 2000000      # F-206: more (keys, value) groups than this, or more than 1/3 of the rows that reach the groups (a pair for almost every row), and the pair set of the holistic path is the cheaper way ...
+comptime TWO_PHASE_MIN_GROUPS = 65536        # F-206: ... but this many is always fine (a pair for every row of a small dense key is as cheap in the pair set)
+comptime TWO_PHASE_SHARE = 3
+comptime TWO_PHASE_DENSE_MAX = 65536          # F-206: the first phase is dense only up to this many slots (the planner is told: a table of 300,000 slots for 7,000 groups costs more than the groups)
 comptime MERGE_PART_BITS = 8                  # 256 partitions: each is merged by one worker, with no sharing and no locks
 
 
@@ -279,6 +285,27 @@ struct PartAcc(Movable):
             self._route(f, ops, threads)
         self._route(batch, ops, threads)
         self.batches += 1
+
+    def group_count(self) -> Int:
+        """The groups held so far (F-206: how many (keys, value) groups the first phase of a COUNT(DISTINCT) has made)."""
+        if self.batches <= 1:
+            return self.first.groups()
+        var total = 0
+        for p in range(len(self.parts)):
+            total += len(self.parts[p].counts)
+        return total
+
+    def passed_count(self) -> Int:
+        """The rows the groups hold so far."""
+        var total = 0
+        if self.batches <= 1:
+            for c in self.first.counts:
+                total += c
+            return total
+        for p in range(len(self.parts)):
+            for c in self.parts[p].counts:
+                total += c
+        return total
 
     def finish(mut self) -> Partial:
         if self.batches <= 1:
@@ -613,7 +640,7 @@ def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hre
     # the groups that exist: only non-empty ones, except the one row of a query with no GROUP BY
     var t_a = perf_counter_ns()
     var gids = List[Int]()
-    var having_total = _having_groups(q, plan, sp, acc, gids)        # F-203: -1 when HAVING is not a plain comparison of aggregates with constants
+    var having_total = -1 if q.fold_keys >= 0 else _having_groups(q, plan, sp, acc, gids)        # F-203: -1 when HAVING is not a plain comparison of aggregates with constants (F-206: the groups are not the query's yet)
     if plan.group == G_NONE:
         gids.append(0)
     elif having_total >= 0:
@@ -625,7 +652,7 @@ def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hre
     else:
         for g in range(acc.groups()):
             gids.append(g)
-    if plan.group != G_NONE and q.limit >= 0 and (q.having < 0 or having_total >= 0):
+    if plan.group != G_NONE and q.limit >= 0 and (q.having < 0 or having_total >= 0) and q.fold_keys < 0:
         var before = len(gids)
         _topk_groups(q, plan, sp, acc, gids)
         if len(gids) < before:
@@ -713,11 +740,148 @@ def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hre
             vc.src = q.rexprs[sp_a.arg].src
         aggs.append(vc^)
     var t_c = perf_counter_ns()
+    if q.fold_keys >= 0:                                                   # F-206: the groups of (keys, value) become the query's groups
+        var folded = _fold_distinct(q, keys, aggs, n)
+        notes.append("count(DISTINCT): two phases: " + commas(n) + " groups of (keys, value) folded into " + commas(folded.n) + " groups in " + _ms(Float64(perf_counter_ns() - t_c) / 1e6) + " ms")
+        n = folded.n
+        swap(keys, folded.keys)
+        swap(aggs, folded.aggs)
     # HAVING, the select list, ORDER BY, OFFSET and LIMIT: a row query over the groups (post.mojo)
     var table = run_post(q, keys, aggs, dicts, opts, n, notes)
     notes.append("finish: groups " + _ms(Float64(t_b - t_a) / 1e6) + " ms, columns " + _ms(Float64(t_c - t_b) / 1e6) + " ms, then HAVING, ORDER BY and the select list over the groups " +
                  _ms(Float64(perf_counter_ns() - t_c) / 1e6) + " ms")
     return table^
+
+
+# ── F-206: COUNT(DISTINCT e) GROUP BY g as two phases ────────────────────────────────────────────────────
+
+struct _Folded(Movable):
+    var keys: List[ValCol]
+    var aggs: List[ValCol]
+    var n: Int
+
+    def __init__(out self):
+        self.keys = List[ValCol]()
+        self.aggs = List[ValCol]()
+        self.n = 0
+
+
+@always_inline
+def _fold_word(vc: ValCol, i: Int) -> Int64:
+    """A key's value as the word that decides equality: a float64's bits with -0.0 = 0.0 and every NaN one value (the groups of a FLOAT key are those of `float_key`)."""
+    return float_key(vc.v[i]) if vc.kind == FLOAT.value else vc.v[i]
+
+
+def _fold_distinct(q: BoundQuery, keys: List[ValCol], aggs: List[ValCol], n: Int) -> _Folded:
+    """Phase two: the groups of (g, e) -- g the first `q.fold_keys` keys, e the last key -- folded into the groups of g. A COUNT(DISTINCT e) is the number of
+    its g's groups whose e is not NULL (each (g, e) group is one distinct value), a COUNT(*) or COUNT(col) the sum of the groups' counts. One pass, one open-addressing
+    table of g's words; the groups of g are in the order their first (g, e) group came."""
+    var nk = q.fold_keys
+    var cap = 16
+    while cap < 2 * n:
+        cap *= 2
+    var mask = cap - 1
+    var table = List[Int32](length=cap, fill=-1)
+    var rep = List[Int]()                                               # the first (g, e) group of each group of g
+    var dist = List[Int64]()                                            # its e's that are not NULL
+    var is_dist = List[Bool](length=len(aggs), fill=False)
+    for a in q.fold_dist:
+        is_dist[a] = True
+    var sums = List[List[Int64]]()                                      # per aggregate that is not a COUNT(DISTINCT): the sum of the counts
+    for a in range(len(aggs)):
+        sums.append(List[Int64]())
+    for i in range(n):
+        var h = UInt64(0x9E3779B97F4A7C15)
+        for k in range(nk):
+            var w = UInt64(0x51ED270B) if keys[k].is_null(i) else UInt64(_fold_word(keys[k], i))
+            h = (h ^ w) * 0xD6E8FEB86659FD93
+            h = h ^ (h >> 32)
+        var slot = Int(h) & mask
+        var id = -1
+        while True:
+            var at = Int(table[slot])
+            if at < 0:
+                break
+            var j = rep[at]
+            var same = True
+            for k in range(nk):
+                var na = keys[k].is_null(i)
+                var nb = keys[k].is_null(j)
+                if na != nb or (not na and _fold_word(keys[k], i) != _fold_word(keys[k], j)):
+                    same = False
+                    break
+            if same:
+                id = at
+                break
+            slot = (slot + 1) & mask
+        if id < 0:
+            id = len(rep)
+            table[slot] = Int32(id)
+            rep.append(i)
+            dist.append(0)
+            for a in range(len(aggs)):
+                if not is_dist[a]:
+                    sums[a].append(0)
+        if not keys[nk].is_null(i):
+            dist[id] += 1
+        for a in range(len(aggs)):
+            if not is_dist[a]:
+                sums[a][id] += aggs[a].v[i]
+    var out = _Folded()
+    out.n = len(rep)
+    for k in range(nk):
+        var vc = ValCol(keys[k].kind, keys[k].scale, out.n)
+        vc.src = keys[k].src
+        for o in range(out.n):
+            if keys[k].is_null(rep[o]):
+                vc.set_null(o)
+            else:
+                vc.v[o] = keys[k].v[rep[o]]
+        out.keys.append(vc^)
+    for a in range(len(aggs)):
+        var vc = ValCol(aggs[a].kind, aggs[a].scale, out.n)
+        for o in range(out.n):
+            vc.v[o] = dist[o] if is_dist[a] else sums[a][o]
+        out.aggs.append(vc^)
+    return out^
+
+
+def _two_phase_agg(q: BoundQuery) -> Int:
+    """The COUNT(DISTINCT e) a query can run in two phases: it has GROUP BY keys, that is its only holistic aggregate, and the others are COUNT(*) or COUNT(col)
+    (their counts add up over the groups of e). -1 for any other query: it keeps the holistic path."""
+    if q.rows or q.distinct or q.fold_keys >= 0 or len(q.keys) == 0:
+        return -1
+    var d = -1
+    for a in range(len(q.aggs)):
+        var f = q.aggs[a].func
+        if f == F_COUNT_DISTINCT:
+            if d >= 0:
+                return -1
+            d = a
+        elif f != F_COUNT_STAR and f != F_COUNT:
+            return -1
+    if d < 0 or q.aggs[d].arg < 0:
+        return -1
+    var op = q.rexprs[q.aggs[d].arg].op
+    if op == B_LIT or op == B_NULL or op == B_STR:
+        return -1
+    return d
+
+
+def _two_phase_query(q: BoundQuery, d: Int) -> BoundQuery:
+    """The first phase: the same query grouped by one more key, the distinct value; the COUNT(DISTINCT) becomes a COUNT(*) that nothing reads (the groups are
+    counted by `_fold_distinct`)."""
+    var q2 = copy_query(q)
+    var sd = q.aggs[d].copy()
+    q2.fold_keys = len(q.keys)
+    var shown = sd.name                                                # the key is named after the value: count(DISTINCT l_shipmode) groups by `l_shipmode`
+    if shown.startswith("count(DISTINCT ") and shown.endswith(")"):
+        var inner = String(shown[byte=15:shown.byte_length() - 1])
+        shown = inner^
+    q2.keys.append(KeySpec(sd.arg, shown, "distinct " + sd.canon))
+    q2.aggs[d] = AggSpec(F_COUNT_STAR, -1, 0.0, sd.kind, sd.scale, sd.name, sd.canon)
+    q2.fold_dist.append(d)
+    return q2^
 
 
 # ── running ──────────────────────────────────────────────────────────────────────────────────────────
@@ -847,7 +1011,7 @@ def _gpu_blocker(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, sp: SqlProgr
         return "a " + ("frame" if src.kind == SRC_FRAME else "Parquet or CSV scan") + " runs on the CPU (the GPU runs a table)"
     if plan.group == G_HASHED:
         return "hashed groups run on the CPU (the GPU kernel takes no groups or dense groups)"
-    if sp.p.mat or two_pass:
+    if sp.p.mat or two_pass or q.fold_keys >= 0:
         return "count(DISTINCT), median, quantiles and min / max of TEXT run on the CPU"
     if sp.p.has_float or sp.p.repro:
         return "a FLOAT column or float arithmetic runs on the CPU (a float64 sum has one defined order there)"
@@ -924,8 +1088,14 @@ def _gpu_chunk(chunk: SharedTable, sp: SqlProgram, mut g: _Gpu, job: JobCtl) rai
     return None
 
 
+def _too_many_pairs(est_groups: Int, groups: Int, passed: Int) -> Bool:
+    """F-206: whether the first phase of a COUNT(DISTINCT) would make too many (keys, value) groups for a group table: `est_groups` is the whole run's guess from what has been
+    read, `groups` the groups made so far from `passed` rows."""
+    return est_groups > TWO_PHASE_MAX_GROUPS or (est_groups > TWO_PHASE_MIN_GROUPS and groups * TWO_PHASE_SHARE > passed)
+
+
 def _fold(sp: SqlProgram, plan: PhysicalPlan, chunk: SharedTable, mask_addr: Int, mut hs: HolStates, ops: List[Int], threads: Int,
-          mut pacc: PartAcc, mut dense_acc: QueryResult, fj: Optional[ArcPointer[FusedJoin]], mut gpu: _Gpu, job: JobCtl = JobCtl()) raises:
+          mut pacc: PartAcc, mut dense_acc: QueryResult, fj: Optional[ArcPointer[FusedJoin]], mut gpu: _Gpu, job: JobCtl = JobCtl(), trial: Bool = False) raises:
     """Runs the program over one chunk and folds its partial result into the accumulator. `job` (F-175) moves by the chunk's rows."""
     var n = chunk.rows()
     var exact = job.active() and not sp.p.repro
@@ -942,6 +1112,18 @@ def _fold(sp: SqlProgram, plan: PhysicalPlan, chunk: SharedTable, mask_addr: Int
                 pacc.add(_run_hashed(chunk, sp, mask_addr, plan.key_words(), threads, fj, at, end - at), ops, threads)
                 job.advance(end - at)
                 at = end
+            return
+        if trial and n >= TWO_PHASE_MIN_ROWS:                # F-206: the first 1/32 of the rows say how many groups the whole will make (a clustered key's groups grow with the rows); when
+            var cut = max(MORSEL_ROWS, n // 32) // 8 * 8                  # that passes the limit the pair set of the holistic path is cheaper; else the partial is kept and the rest is a second range
+            var first = _run_hashed(chunk, sp, mask_addr, plan.key_words(), threads, fj, 0, cut)
+            var passed = 0
+            for c in first.counts:
+                passed += c
+            if _too_many_pairs(first.groups() * (n // cut), first.groups(), passed):
+                raise Error(TWO_PHASE_DECLINED)
+            pacc.add(first^, ops, threads)
+            pacc.add(_run_hashed(chunk, sp, mask_addr, plan.key_words(), threads, fj, cut, n - cut), ops, threads)
+            job.advance(n)
             return
         pacc.add(_run_hashed(chunk, sp, mask_addr, plan.key_words(), threads, fj), ops, threads)
         job.advance(n)
@@ -1173,6 +1355,9 @@ def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
         if fj:
             ch.override = fj.value()[].probe
     var delta_rows = len(lsrc.overlay.delta)
+    var trial = False                                                 # F-206: the first phase of a COUNT(DISTINCT) is checked for too many (keys, value) groups as it goes
+    if q.fold_keys >= 0:
+        trial = chunk_rows_total(lsrc, ch) >= TWO_PHASE_MIN_ROWS      # (fewer rows make at most that many groups: no trial)
     if gpu.use:                                                       # F-191
         _gpu_open(src, opts, gpu)
     if fj and not ps and fj.value()[].pred_first and sp.p.pred_reg >= 0 and pred_reads_probe_only(sp.p, fj.value()[].n_probe_cols):
@@ -1203,7 +1388,9 @@ def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
         var fji = fj
         if ps:                                                         # this chunk's own join: its keys, the build sides' maps shared
             fji = ArcPointer(chunk_join(ps.value()[], chunk))
-        _fold(sp, plan, chunk, ch.mask_addr, hs, ops, threads, pacc, dense_acc, fji, gpu, opts.job)
+        _fold(sp, plan, chunk, ch.mask_addr, hs, ops, threads, pacc, dense_acc, fji, gpu, opts.job, trial and ch.n() == 1)
+        if trial and plan.group == G_HASHED and ch.n() > 1 and i + 1 < ch.n() and _too_many_pairs(pacc.group_count() * ch.n() // (i + 1), pacc.group_count(), pacc.passed_count()):
+            raise Error(TWO_PHASE_DECLINED)                           # (a scan's row groups: the groups so far, by the share of the chunks read)
     if sp.guard_slot >= 0 and dense_acc.counts[sp.guard_slot] > 0:
         raise Error(LIE + String(dense_acc.counts[sp.guard_slot]) + (" row lies" if dense_acc.counts[sp.guard_slot] == 1 else " rows lie") +
                     " outside the range of a group key that the footer gave")
@@ -1375,6 +1562,20 @@ def _flag_side[P: Planner](mut catalog: Catalog, q: BoundQuery, t: Int, needed: 
         kc.append(g - start)
     var kept = count_flags(Int(flags.unsafe_ptr()), n, opts.threads)
     return JoinSide(table, cols^, kc^, True, flags^, kept)
+
+
+def _empty_side(catalog: Catalog, q: BoundQuery, t: Int, needed: List[Int]) -> JoinSide:
+    """F-206: side `t` when an exact count found that its filter keeps no row: its whole table with every flag 0 (no second pass to read what is known to be nothing)."""
+    var start = q.tab_start[t]
+    var keycols = q.jk_l.copy() if t == 0 else q.jk_r.copy()
+    var table = catalog.sources[q.sources[t]].table
+    var cols = List[Int]()
+    for g in needed:
+        cols.append(g - start)
+    var kc = List[Int]()
+    for g in keycols:
+        kc.append(g - start)
+    return JoinSide(table, cols^, kc^, True, List[UInt8](length=table.rows(), fill=0), 0)
 
 
 def _read_side[P: Planner](mut catalog: Catalog, q: BoundQuery, t: Int, needed: List[Int], planner: P, opts: PlannerOptions, trust: Bool, build: Bool = False) raises -> JoinSide:
@@ -1833,7 +2034,10 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
         lrows = catalog.sources[q.sources[0]].rows()                 # (its rows before the filter: the side is not read to count them)
     elif may0:
         lrows = _count_side[P](catalog, q, 0, planner, opts, trust, res)
-        if lrows * DEFER_PASS_DEN < catalog.sources[q.sources[0]].table.rows():      # a selective filter: writing the few rows that pass beats probing them all ...
+        if lrows == 0 and kind == 0:                                 # F-206: an inner join with a side that keeps no row has no rows: nothing is read again
+            may0 = False
+            left = _empty_side(catalog, q, 0, lneed)
+        elif lrows * DEFER_PASS_DEN < catalog.sources[q.sources[0]].table.rows():      # a selective filter: writing the few rows that pass beats probing them all ...
             if len(q.conj_x) == 0:
                 pf0 = True                                       # ... unless the pipeline runs the filter first and probes only those rows (F-161): nothing is written
             else:
@@ -1846,7 +2050,10 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
         rrows = catalog.sources[q.sources[1]].rows()
     elif may1:
         rrows = _count_side[P](catalog, q, 1, planner, opts, trust, res)
-        if rrows * DEFER_PASS_DEN < catalog.sources[q.sources[1]].table.rows():
+        if rrows == 0 and kind == 0:
+            may1 = False
+            right = _empty_side(catalog, q, 1, rneed)
+        elif rrows * DEFER_PASS_DEN < catalog.sources[q.sources[1]].table.rows():
             if len(q.conj_x) == 0:
                 pf1 = True
             else:
@@ -2972,6 +3179,19 @@ def _run_sql_resolved[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: 
     checks; they are verified as the row groups are read (a null count that is wrong, a row outside a stated range), and when one
     is wrong the query runs again without the statistics, which the notes say."""
     opts.job.stage(STAGE_PLAN)
+    var d = _two_phase_agg(q)                                          # F-206: COUNT(DISTINCT e) GROUP BY g runs as GROUP BY (g, e), then a count per g
+    if d >= 0 and opts.group == GROUP_AUTO:                            # (a forced dense or hashed layout is the holistic path's: the options say how the aggregate runs)
+        try:
+            var o2 = opts.copy()
+            o2.dense_limit = min(o2.dense_limit, TWO_PHASE_DENSE_MAX)
+            return _run_sql_phases(catalog, _two_phase_query(q, d), planner, o2)
+        except e:
+            if String(e) != TWO_PHASE_DECLINED:
+                raise e^
+    return _run_sql_phases(catalog, q, planner, opts)             # (declined: the pairs are too many for a group table, the holistic path's pair set takes them)
+
+
+def _run_sql_phases[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: P, opts: PlannerOptions) raises -> SqlResult:
     if q.explain == EXPLAIN_ANALYZE:
         return _explain_analyze(catalog, q, planner, opts)
     var r: SqlResult

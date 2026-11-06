@@ -422,6 +422,8 @@ struct BoundQuery(Movable):
     var distinct: Bool               # SELECT DISTINCT (bound as a group-by on the select list)
     var routs: List[Int]
     var rorder: List[SortKey]
+    var fold_keys: Int               # F-206: >= 0 when this is the first phase of a COUNT(DISTINCT): the first `fold_keys` keys are the query's, the last one is the distinct value
+    var fold_dist: List[Int]         # F-206: the aggregates that were COUNT(DISTINCT) (they count the groups of their key with a non-NULL value)
 
     def src_name(self, g: Int) -> String:
         return self.col_names[g] if g < len(self.col_names) else String()
@@ -459,6 +461,8 @@ struct BoundQuery(Movable):
         self.distinct = False
         self.routs = List[Int]()
         self.rorder = List[SortKey]()
+        self.fold_keys = -1
+        self.fold_dist = List[Int]()
         self.source = -1
         self.rexprs = List[BExpr]()
         self.pexprs = List[BExpr]()
@@ -2965,4 +2969,6 @@ def copy_query(q: BoundQuery) -> BoundQuery:
     c.distinct = q.distinct
     c.routs = q.routs.copy()
     c.rorder = q.rorder.copy()
+    c.fold_keys = q.fold_keys
+    c.fold_dist = q.fold_dist.copy()
     return c^
