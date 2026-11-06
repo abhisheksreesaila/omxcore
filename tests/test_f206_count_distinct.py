@@ -91,6 +91,7 @@ TWO_PHASE = [
     ("ORDER BY it, LIMIT", "select g2, count(distinct xt) as n from fact group by g2 order by n desc, g2 limit 25", ["fact"]),
     ("expression key and value", "select g1 % 5 as b, count(distinct xi + 1) as n from fact group by g1 % 5 order by b", ["fact"]),
     ("expression of the count in the select list", "select g1, count(distinct xi) * 2 + 1 as n2 from fact group by g1 order by g1", ["fact"]),
+    ("the key is the value", "select xi, count(distinct xi) as n from fact group by xi order by xi", ["fact"]),
     ("two keys", "select g1, v % 4 as q, count(distinct xt) as n from fact group by g1, v % 4 order by g1, q", ["fact"]),
     ("groups whose value is all NULL count 0", "select g2, count(distinct xi) as n from fact where xi is null or v < 5 group by g2 order by g2", ["fact"]),
     ("nothing passes: no groups", "select g1, count(distinct xi) as n from fact where v < 0 group by g1", ["fact"]),

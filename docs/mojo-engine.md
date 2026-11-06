@@ -121,6 +121,14 @@ bounded heaps.
 
 `median` matches DuckDB (the mean of the two middle values, kept exact one decimal place finer).
 
+**SQL `count(DISTINCT e) ... GROUP BY g` runs as DuckDB's two phases (F-206)** when it is the only holistic aggregate (`count(*)` and
+`count(col)` may stand beside it): first `GROUP BY (g, e)` through the ordinary dense / hashed machinery, fused into joins like any aggregate,
+then the number of non-NULL `e` groups per `g` (`count(DISTINCT): two phases` in the notes). A trial keeps the pair set above for the shapes that
+make a group for almost every row (a unique key, a clustered key with a value on every row): the first 1/32 of the rows (the first row groups of a
+scan) say how many (g, e) groups the whole will make, and more than a third of the rows that reach the groups, or 2M, declines the two phases.
+Two `count(DISTINCT)` of different columns, no `GROUP BY`, and a median or a sum beside it keep the pair set. The Mojo builder's `count_distinct`
+keeps it too (its group-by is one dense key with a stated number of groups: there is no layout for a (group, value) table).
+
 ## 🔢 Types and exactness (F-157)
 
 INT and DECIMAL are exact scaled integers; a sum past int64 raises rather than wrapping. FLOAT64 (Parquet DOUBLE and

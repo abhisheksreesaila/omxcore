@@ -119,9 +119,9 @@ def _hash_group(kw: List[List[Int64]], g: Int) -> UInt64:
 comptime TWO_PHASE_DECLINED = "count(DISTINCT): too many (keys, value) groups for two phases"     # F-206: raised by the first phase, caught where the query is run
 comptime TWO_PHASE_MIN_ROWS = 262144         # F-206: a first phase over fewer rows has at most this many groups: it needs no trial
 comptime TWO_PHASE_MAX_GROUPS = 2000000      # F-206: more (keys, value) groups than this, or more than 1/3 of the rows that reach the groups (a pair for almost every row), and the pair set of the holistic path is the cheaper way ...
-comptime TWO_PHASE_MIN_GROUPS = 131072       # F-206: ... but this many is always fine
+comptime TWO_PHASE_MIN_GROUPS = 65536        # F-206: ... but this many is always fine (a pair for every row of a small dense key is as cheap in the pair set)
 comptime TWO_PHASE_SHARE = 3
-comptime TWO_PHASE_DENSE_MAX = 65536          # F-206: the first phase is dense only up to this many slots (the planner is told; a table of 300,000 slots for 7,000 groups costs more than the groups), and a forced dense layout past it is declined
+comptime TWO_PHASE_DENSE_MAX = 65536          # F-206: the first phase is dense only up to this many slots (the planner is told: a table of 300,000 slots for 7,000 groups costs more than the groups)
 comptime MERGE_PART_BITS = 8                  # 256 partitions: each is merged by one worker, with no sharing and no locks
 
 
@@ -874,7 +874,11 @@ def _two_phase_query(q: BoundQuery, d: Int) -> BoundQuery:
     var q2 = copy_query(q)
     var sd = q.aggs[d].copy()
     q2.fold_keys = len(q.keys)
-    q2.keys.append(KeySpec(sd.arg, "(distinct value of " + sd.name + ")", "distinct " + sd.canon))
+    var shown = sd.name                                                # the key is named after the value: count(DISTINCT l_shipmode) groups by `l_shipmode`
+    if shown.startswith("count(DISTINCT ") and shown.endswith(")"):
+        var inner = String(shown[byte=15:shown.byte_length() - 1])
+        shown = inner^
+    q2.keys.append(KeySpec(sd.arg, shown, "distinct " + sd.canon))
     q2.aggs[d] = AggSpec(F_COUNT_STAR, -1, 0.0, sd.kind, sd.scale, sd.name, sd.canon)
     q2.fold_dist.append(d)
     return q2^
@@ -1353,8 +1357,6 @@ def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
     var delta_rows = len(lsrc.overlay.delta)
     var trial = False                                                 # F-206: the first phase of a COUNT(DISTINCT) is checked for too many (keys, value) groups as it goes
     if q.fold_keys >= 0:
-        if plan.group == G_DENSE and plan.domain > TWO_PHASE_DENSE_MAX:
-            raise Error(TWO_PHASE_DECLINED)
         trial = chunk_rows_total(lsrc, ch) >= TWO_PHASE_MIN_ROWS      # (fewer rows make at most that many groups: no trial)
     if gpu.use:                                                       # F-191
         _gpu_open(src, opts, gpu)
@@ -3158,11 +3160,10 @@ def _run_sql_resolved[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: 
     is wrong the query runs again without the statistics, which the notes say."""
     opts.job.stage(STAGE_PLAN)
     var d = _two_phase_agg(q)                                          # F-206: COUNT(DISTINCT e) GROUP BY g runs as GROUP BY (g, e), then a count per g
-    if d >= 0:
+    if d >= 0 and opts.group == GROUP_AUTO:                            # (a forced dense or hashed layout is the holistic path's: the options say how the aggregate runs)
         try:
             var o2 = opts.copy()
-            if o2.group == GROUP_AUTO:
-                o2.dense_limit = min(o2.dense_limit, TWO_PHASE_DENSE_MAX)
+            o2.dense_limit = min(o2.dense_limit, TWO_PHASE_DENSE_MAX)
             return _run_sql_phases(catalog, _two_phase_query(q, d), planner, o2)
         except e:
             if String(e) != TWO_PHASE_DECLINED:
