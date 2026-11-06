@@ -34,7 +34,7 @@ from .plan import LogicalPlan, build_plan, executable
 from .post import run_post
 from .join import (needed_columns, side_query, joined_query, virtual_schema, all_needed, needed_after, table_of_column, filter_query, final_query, count_query,
                    with_probe_filter, final_needed, virtual_schema_multi, star_query)
-from .joincore import JoinKeys, JoinSide, KeyPlan, make_key_plan, column_ndv, normalize_keys, unmatchable_not_null, join_pairs, select_rows, gather_join, JoinPairs, JOIN_BUDGET_BYTES, build_budget_error
+from .joincore import JoinKeys, JoinSide, KeyPlan, make_key_plan, column_ndv, normalize_keys, unmatchable_not_null, join_pairs, select_rows, gather_join, JoinPairs, JOIN_BUDGET_BYTES, build_budget_error, count_flags, apply_build_keep, compact_side
 from .kernels.hashjoin_cpu import hj_build, JoinMap, PM_SEMI, PM_ANTI, PM_ANTI_NA, PM_NONE
 from .kargs import KernelRun
 from .winsql import plan_windows, finish_windows, point_wide_columns, fix_wide_columns, WIN_TABLE
@@ -1332,6 +1332,68 @@ def _join_side[P: Planner](mut catalog: Catalog, q: BoundQuery, t: Int, needed: 
     return JoinSide(r.take_table().share(), cols^, kc^, False)
 
 
+comptime FLAG_SHARE_DEN = 4          # F-205: a build side whose filter keeps at least 1 row in this many is not copied: the map is built from the whole table, the filter's flags as the keys' `ok` bytes
+
+
+def _flaggable(src: SqlSource) -> Bool:
+    """F-205: a table, or a Frame whose only edits are removed rows (its mask hides them: their flag stays 0), of enough rows. Any changed or appended row, formula or merged
+    word would make the table's rows not the source's rows."""
+    if src.table.rows() < DEFER_MIN_ROWS or len(src.overlay.delta) > 0:
+        return False
+    if src.kind == SRC_TABLE:
+        return True
+    if src.kind != SRC_FRAME or len(src.overlay.formulas) > 0 or len(src.overlay.aliases) > 0:
+        return False
+    for w in src.overlay.words:
+        if len(w) > 0:
+            return False
+    return True
+
+
+def _flag_side[P: Planner](mut catalog: Catalog, q: BoundQuery, t: Int, needed: List[Int], planner: P, opts: PlannerOptions, trust: Bool) raises -> Optional[JoinSide]:
+    """F-205: side `t` as its whole table plus one flag byte a row (the filter's answer), no filtered copy. None when the side has no filter, is not a table (or a Frame
+    with no changed rows) or has few rows: `_join_side` reads it."""
+    opts.job.check()
+    var conj = q.conj_l.copy() if t == 0 else q.conj_r.copy()
+    if len(conj) == 0 or not _flaggable(catalog.sources[q.sources[t]]):
+        return None
+    var start = q.tab_start[t]
+    var keycols = q.jk_l.copy() if t == 0 else q.jk_r.copy()
+    var table = catalog.sources[q.sources[t]].table
+    var n = table.rows()
+    var flags = List[UInt8](length=n, fill=0)
+    var o2 = opts.copy()
+    o2.keep_at = Int(flags.unsafe_ptr())
+    var sq = side_query(catalog, q, t, List[Int]())
+    sq.keep_flags = True
+    _ = _run_sql_once(catalog, sq, planner, o2, trust, String())
+    var cols = List[Int]()
+    for g in needed:
+        cols.append(g - start)
+    var kc = List[Int]()
+    for g in keycols:
+        kc.append(g - start)
+    var kept = count_flags(Int(flags.unsafe_ptr()), n, opts.threads)
+    return JoinSide(table, cols^, kc^, True, flags^, kept)
+
+
+def _read_side[P: Planner](mut catalog: Catalog, q: BoundQuery, t: Int, needed: List[Int], planner: P, opts: PlannerOptions, trust: Bool, build: Bool = False) raises -> JoinSide:
+    """Side `t` of a two-table join: flags over its table when it has a big filter (`_settle_side` copies it later if it does not build), else `_join_side`."""
+    var f = _flag_side[P](catalog, q, t, needed, planner, opts, trust)
+    if f:
+        return f.take()^
+    return _join_side[P](catalog, q, t, needed, planner, opts, trust, build)
+
+
+def _settle_side(var side: JoinSide, builds: Bool, kind: Int, threads: Int) raises -> JoinSide:
+    """A flagged side stays flagged only as the build side of an inner or left join that keeps a good share of its rows; else its passing rows are gathered (by the flags, the filter does not run again)."""
+    if len(side.keep) == 0:
+        return side^
+    if builds and kind <= 1 and side.kept * FLAG_SHARE_DEN >= side.table.rows():
+        return side^
+    return compact_side(side, threads)
+
+
 comptime DEFER_PASS_DEN = 2          # ... and when at least 1 row in this many passes its filter (else the few rows that pass are written: cheaper than probing them all)
 comptime STAR_RATIO = 3              # F-202: a star from the largest table when it has at least this many times the rows of any other table
 comptime STAR_MIN_ROWS = 100000
@@ -1778,8 +1840,8 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
                 may0 = False
                 left = _join_side[P](catalog, q, 0, lneed, planner, opts, trust)
     else:
-        left = _join_side[P](catalog, q, 0, lneed, planner, opts, trust)
-        lrows = left.table.rows()
+        left = _read_side[P](catalog, q, 0, lneed, planner, opts, trust)
+        lrows = left.rows()
     if str1:
         rrows = catalog.sources[q.sources[1]].rows()
     elif may1:
@@ -1791,8 +1853,8 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
                 may1 = False
                 right = _join_side[P](catalog, q, 1, rneed, planner, opts, trust)
     else:
-        right = _join_side[P](catalog, q, 1, rneed, planner, opts, trust)
-        rrows = right.table.rows()
+        right = _read_side[P](catalog, q, 1, rneed, planner, opts, trust)
+        rrows = right.rows()
     var left_builds = kind == 0 and lrows < rrows                    # left, semi and anti joins build on the right table
     if kind == 0 and opts.build_side == BUILD_LEFT:
         left_builds = True
@@ -1801,16 +1863,16 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
     var defer_probe = -1                                             # the side whose filter is left to the pipeline, or -1
     var streaming = False                                            # ... and it is a scan or a Frame whose chunks probe one at a time
     if (str0 or may0) and left_builds:
-        left = _join_side[P](catalog, q, 0, lneed, planner, opts, trust, True)       # the build side is read
-        lrows = left.table.rows()
+        left = _read_side[P](catalog, q, 0, lneed, planner, opts, trust, True)       # the build side is read
+        lrows = left.rows()
     elif str0:
         defer_probe = 0
         streaming = True
     elif may0:
         defer_probe = 0
     if (str1 or may1) and not left_builds:
-        right = _join_side[P](catalog, q, 1, rneed, planner, opts, trust, True)
-        rrows = right.table.rows()
+        right = _read_side[P](catalog, q, 1, rneed, planner, opts, trust, True)
+        rrows = right.rows()
     elif str1:
         defer_probe = 1
         streaming = True
@@ -1825,6 +1887,8 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
         else:
             rneed = needed_columns(qe, 1)
             right = _plain_side(catalog, qe, 1, rneed)
+    left = _settle_side(left^, left_builds, kind, opts.threads)      # F-205: a flagged side that does not build is gathered by its flags
+    right = _settle_side(right^, not left_builds, kind, opts.threads)
     ref built = left if left_builds else right                       # a build side read as a row query (not the source table itself) counts against the budget
     if not built.zero_copy and built.table.rows() * max(len(built.cols), 1) * 8 > (opts.join_budget if opts.join_budget > 0 else JOIN_BUDGET_BYTES):
         raise build_budget_error(catalog.sources[q.sources[0 if left_builds else 1]].name, built.table.rows(), len(built.cols), opts.join_budget if opts.join_budget > 0 else JOIN_BUDGET_BYTES)
@@ -1860,6 +1924,7 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
             normalize_keys(left.table, right.table, left.key_cols, right.key_cols, keys, opts.threads)
         else:
             normalize_keys(right.table, left.table, right.key_cols, left.key_cols, keys, opts.threads)
+        apply_build_keep(keys, left.keep if left_builds else right.keep, opts.threads)       # F-205
         var nb0 = left.table.rows() if left_builds else right.table.rows()
         fmode = 0
         na_note = String()
@@ -1898,7 +1963,7 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
             streaming = False
             continue
         break
-    var nb = left.table.rows() if left_builds else right.table.rows()
+    var nb = left.rows() if left_builds else right.rows()
     var np = right.table.rows() if left_builds else left.table.rows()
     if streaming:
         np = probe_src.rows()
@@ -1917,6 +1982,9 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
     elif defer_probe >= 0:
         res.notes.append("join probe filter: the filter of " + _side_names(q, defer_probe) + " runs in the pipeline (" + commas(left.table.rows() if defer_probe == 0 else right.table.rows()) +
                          " rows read, " + commas(lrows if defer_probe == 0 else rrows) + " pass): no filtered copy of it is written")
+    if len(built.keep) > 0:
+        res.notes.append("join build filter: " + _side_names(q, 0 if left_builds else 1) + " keeps " + commas(built.kept) + " of " + commas(built.table.rows()) +
+                         " rows: the filter's flags are the keys' ok bytes, no filtered copy is written")
     res.notes.append("join build side: " + (_side_names(q, 0) if left_builds else _side_names(q, 1)) + " (" + commas(nb) + " rows, " +
                      ("the smaller side" if (kind == 0 and opts.build_side == BUILD_AUTO) else "forced by the options" if kind == 0 else "the right side: a " + _kind_name(kind) + " join builds on it") + "): " + m.kind())
     res.notes.append("join keys: " + keys.layout)

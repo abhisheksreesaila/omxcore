@@ -74,6 +74,48 @@ def _rows_hook(chunk: Int, row0: Int, sel: IP, nsel: Int, use_sel: Bool, dst: IP
     return True
 
 
+def _flags_hook(chunk: Int, row0: Int, sel: IP, nsel: Int, use_sel: Bool, dst: IP, regs: FP) -> Bool:
+    """F-205: marks a block's selected rows in the caller's flag bytes (control word [2]: their address, one byte a row of the chunk)."""
+    for j in range(nsel):
+        dst[j] = 0                                              # one group
+    var ctl = LP(unsafe_from_address=Int(LP(unsafe_from_address=Int(regs + CTL_REG * VEC))[0]))
+    var flags = BP(unsafe_from_address=Int(ctl[2]))
+    if use_sel:
+        for j in range(nsel):
+            flags[row0 + Int(sel[j])] = 1
+    else:
+        for j in range(nsel):
+            flags[row0 + j] = 1
+    return True
+
+
+def run_flags(src: SqlSource, inp: _Inputs, sp: SqlProgram, opts: PlannerOptions) raises:
+    """F-205: the row query's filter over a plain table (or a Frame's shared rows, unchanged rows only), one flag byte a row at `opts.keep_at`
+    (1: the row passes, a row the Frame's mask hides stays 0). No row is collected, no column is copied."""
+    if src.kind == SRC_SCAN or len(src.overlay.delta) > 0 or opts.keep_at == 0:
+        raise Error("internal: flags are written for a table, or a Frame with no changed rows")
+    var ch = _open_chunks(src, inp.used)
+    var chunk = _load_chunk(src, ch, 0)
+    var n = chunk.rows()
+    if n == 0:
+        return
+    ref p = sp.p
+    var run = KernelRun(p, sp.set_bytes, sp.set_meta, chunk, ch.mask_addr)
+    var ctl = run.region(4)
+    var cw = run.i64(ctl)
+    cw[0] = 0
+    cw[1] = 0
+    cw[2] = Int64(opts.keep_at)
+    cw[3] = 0
+    run.control(ctl)
+    opts.job.check()
+    var rc = run.keyed(_flags_hook, 1, 0, n, opts.threads)
+    if rc == E_OVERFLOW:
+        raise Error(overflow_message(p.conv_text()))
+    if rc != 0:
+        raise Error("the CPU kernel failed with code " + String(rc))
+
+
 struct RowChunk(Movable):
     """The rows one kernel run selected, compacted: their numbers in the chunk and the computed expressions' values."""
     var ids: List[Int32]
@@ -993,6 +1035,9 @@ def prepare_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, dicts: DictA
 
 def execute_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOptions, dicts: DictAccess, mut notes: List[String],
                  inp: _Inputs, var stage: RowStage, trust: Bool, fj: Optional[ArcPointer[FusedJoin]] = None, stream: Bool = False) raises -> Table:
+    if q.keep_flags:
+        run_flags(src, inp, stage.sp, opts)
+        return Table.empty()
     if plan.top_k > 0:
         return run_topk_rows(src, q, plan, opts, dicts, notes, inp, stage.sp, stage.items, trust, fj)
     return run_rows(src, q, plan, opts, dicts, notes, inp, stage.sp, stage.items, trust, fj, stream)
