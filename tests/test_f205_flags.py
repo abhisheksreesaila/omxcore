@@ -63,6 +63,21 @@ def world(tmp_path_factory):
         con.execute(f"delete from dim where rid = {r}")
     (d / "dim_removed.edits").write_text("".join(f"remove\t{r}\n" for r in gone))
     out["dim_removed"] = {"con": con, "edits": d / "dim_removed.edits", "table": "dim"}
+    # dim with appended rows only (nothing changed or removed): the new rows live outside the table, so the flag path must decline
+    con = oracle_connection()
+    for t in ("fact", "dim", "small"):
+        if t == "dim":
+            con.execute(f"create table dim as select row_number() over () - 1 as rid, * from read_parquet('{paths['dim']}')")
+        else:
+            con.execute(f"create table {t} as select * from read_parquet('{paths[t]}')")
+    lines = []
+    for j in range(40):
+        rid = 90000 + j
+        vals = (rid, j * 1000 % 45000, j % 100, "plain 1" if j % 2 else "special requests", f"2021-03-{1 + j % 28:02d}")
+        lines.append("append\t" + "\t".join(str(v) for v in vals))
+        con.execute(f"insert into dim (rid, did, dk, dv, dt, dd) values ({rid}, {vals[0]}, {vals[1]}, {vals[2]}, '{vals[3]}', date '{vals[4]}')")
+    (d / "dim_appended.edits").write_text("\n".join(lines) + "\n")
+    out["dim_appended"] = {"con": con, "edits": d / "dim_appended.edits", "table": "dim"}
     return out
 
 
@@ -170,6 +185,26 @@ def test_dim_frame_with_removed_rows_keeps_the_flag_path(probe, world, sql):
 
 
 @pytest.mark.parametrize("sql", FRAME_SQL)
+def test_dim_frame_with_appended_rows_only_declines_the_flags(probe, world, sql):
+    """Appended rows are a chunk outside the table: flags over the table would miss them, so the guard declines and the filtered rows are read (appends included)."""
+    res, cur = run_frame(probe, world, sql, ["fact", "dim"], "dim_appended")
+    same(res, cur, sql, "dim frame, appends only")
+    assert not has(res, FLAG), res["notes"]
+
+
+def test_left_join_with_a_where_filter_on_the_preserved_side(probe, world):
+    """The preserved (left, probing) side is a 150,000-row table with a WHERE filter: it never builds, so no flags stay on it; the right side may still build from its flags."""
+    sql = "select count(*) as c, count(did) as cd, sum(v) as sv from fact left join dim on k = dk where v < 500"
+    res, cur = run_table(probe, world, sql, ["fact", "dim"])
+    same(res, cur, sql, "left join, filter on the left")
+    assert not has(res, FLAG), res["notes"]
+    sql = "select count(*) as c, count(dv) as cv from fact left join dim on k = dk and dv < 90 where v < 500"
+    res, cur = run_table(probe, world, sql, ["fact", "dim"])
+    same(res, cur, sql, "left join, filter on both sides")
+    assert "dim keeps" in note(res, FLAG)
+
+
+@pytest.mark.parametrize("sql", FRAME_SQL)
 def test_dim_frame_with_changed_rows_is_read_as_before(probe, world, sql):
     """Changed and appended rows live outside the table: the flag path declines (the filtered rows are read), and the answer is DuckDB's."""
     res, cur = run_frame(probe, world, sql, ["fact", "dim"], "dim_changed")
@@ -224,6 +259,7 @@ def test_every_entry_point_equals_duckdb_on_a_big_world(probes, tmp_path, seed):
         b = run(sqlp, ["--mode", "frame", "--edits", str(t / "f.edits"), "--redits", str(t / "d.edits"), sql, f"fact={t}/fact_base.parquet", f"dim={t}/dim_base.parquet"])
         same_rows(sql_rows(b), want, "(b) sql frame: " + what)
         fast(b, "(b) " + what)
+        assert has(b, FLAG) == (how == "inner"), (what, b["notes"])        # the dimension Frame has removed rows only: its flags stand in for its copy
         common = ["--how", how, "--on", "k=dk", "--aggs", aggs, "--where", where, "--group", f"g:{GROUPS}"]
         c = run(bp, ["--mode", "table"] + common + [f"left={t}/fact.parquet", f"right={t}/dim.parquet"])
         same_rows(builder_rows(c, True), want, "(c) builder table: " + what)
