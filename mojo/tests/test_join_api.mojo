@@ -83,8 +83,8 @@ def main() raises:
     expect(r3.counts[0] == by_hand, "INT and TEXT keys: " + String(r3.counts[0]) + " wanted " + String(by_hand))
     # the joined table's columns: this table's, then the other's, a repeated name suffixed
     var joined = Query(left).join(right, ["k"], ["k"])
-    expect(joined.table.columns() == 8 and joined.table.name(4) == "k_1" and joined.table.name(5) == "kk" and joined.table.name(6) == "tag_1", "column names")
-    expect(joined.table.rows() == pairs, "rows of the joined table")
+    expect(joined.table.columns() == 8 and joined.table.name(4) == "k_1" and joined.table.name(5) == "kk" and joined.table.name(6) == "tag_1" and joined.table.rows() == 0, "column names")
+    expect(joined.joined_table().rows() == pairs and joined.joined_table().name(4) == "k_1", "rows of the joined table")
     # the builder's rules after the join: a dense group key
     var r4 = Query(left).join(right, ["k"], ["k"]).group_by(col("w") % 5, 5).agg(count()).compute()
     var total = 0
@@ -114,16 +114,16 @@ def main() raises:
         if not has:
             no_partner += 1
     var lj = Query(left).join(right, ["k"], ["k"], "left")
-    expect(lj.table.rows() == pairs + no_partner + null_keys, "left join rows: " + String(lj.table.rows()) + " wanted " + String(pairs + no_partner + null_keys))
-    expect(lj.table.null_count(5) == no_partner + null_keys, "the right's columns are NULL where nothing matches: " + String(lj.table.null_count(5)))
+    expect(lj.joined_table().rows() == pairs + no_partner + null_keys, "left join rows: " + String(lj.joined_table().rows()) + " wanted " + String(pairs + no_partner + null_keys))
+    expect(lj.joined_table().null_count(5) == no_partner + null_keys, "the right's columns are NULL where nothing matches: " + String(lj.joined_table().null_count(5)))
     var rl = Query(left).join(right, ["k"], ["k"], "left").agg(count(), sum(col("id"))).compute()
     expect(rl.counts[0] == pairs + no_partner + null_keys, "a left join counted")
     # semi and anti: this table's columns only; a NULL key has no partner (so anti keeps it)
     var sj = Query(left).join(right, ["k"], ["k"], "semi")
     var aj = Query(left).join(right, ["k"], ["k"], "anti")
     expect(sj.table.columns() == 4 and aj.table.columns() == 4, "semi and anti keep this table's columns")
-    expect(aj.table.rows() == no_partner + null_keys, "anti rows: " + String(aj.table.rows()))
-    expect(sj.table.rows() + aj.table.rows() == n_left, "semi and anti split the rows")
+    expect(aj.joined_table().rows() == no_partner + null_keys, "anti rows: " + String(aj.joined_table().rows()))
+    expect(sj.joined_table().rows() + aj.joined_table().rows() == n_left, "semi and anti split the rows")
     refused = False
     try:
         _ = Query(left).where(col("id") > 3).join(right, ["k"], ["k"])

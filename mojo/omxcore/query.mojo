@@ -44,13 +44,12 @@ from .gpu import (DeviceTable, HAS_GPU, NO_GPU_MESSAGE, gpu_available, _ScanCont
                   _pinned_prepare, _res_open, _res_begin, _res_resident, _res_stage, gpu_budget, gpu_capacity, gpu_free_bytes, human_bytes, gpu_fail_piece, INJECTED_OOM, GPU_RETRY_FACTOR_PERCENT)
 from .holistic import (HolStates, HolSpec, HolResult, window_blocks, heap_offer, float_key, A_DISTINCT, A_PCT, A_TOPK, A_MEDIAN,
                        A_VAR_POP, A_VAR_SAMP, A_STDDEV_POP, A_STDDEV_SAMP, A_QEDGE, is_spread, spread_needs)
-from .joincore import JoinKeys, JoinSide, normalize_keys, join_pairs, select_rows, gather_join, JOIN_BUDGET_BYTES
-from .kernels.hashjoin_cpu import hj_build, PM_SEMI, PM_ANTI
+from .joinq import compute_joined, realize_source, joined_schema, materialize_join, how_kind      # F-204
 from .frame import text_ranks
 from .job import JobCtl, STAGE_PLAN, STAGE_AGGREGATE, STAGE_FINISH      # F-175
 from .window import WindowFn, Window, W_SUM, W_COUNT, W_COUNT_STAR, W_AVG, W_MIN, W_MAX      # F-168
 from .exprsql import sql_of, window_clause, call_sql, quote_name      # F-160
-from .bind import ViewSource, SqlSource, SRC_FRAME, SRC_SCAN      # F-160
+from .bind import ViewSource, SqlSource, Catalog, SRC_FRAME, SRC_SCAN      # F-160
 
 # plan node kinds
 comptime P_SCAN = 0
@@ -260,6 +259,27 @@ struct QuantileBins(Copyable, Movable):
         return acc^
 
 
+struct LazyJoin(Movable):
+    """F-204: the join a query starts with, kept as its parts (joinq.mojo runs it when the query computes): both tables (a Frame's rows as its edits leave
+    them), the key columns of each, `how`, the names of the joined columns (this table's, then the other's) and the keys as text for the notes."""
+    var left: SharedTable
+    var right: SharedTable
+    var lkeys: List[Int]
+    var rkeys: List[Int]
+    var how: String
+    var names: List[String]
+    var key_text: String
+
+    def __init__(out self, left: SharedTable, right: SharedTable, var lkeys: List[Int], var rkeys: List[Int], how: String, var names: List[String], var key_text: String):
+        self.left = left
+        self.right = right
+        self.lkeys = lkeys^
+        self.rkeys = rkeys^
+        self.how = how
+        self.names = names^
+        self.key_text = key_text^
+
+
 struct Query(Movable, ViewSource):
     """A plan over one shared table, or over a session's view of it (`Query(frame)`: its edits, appended and removed
     rows, merges and formula columns, copied when the query is built), built by chaining; `compute` runs it."""
@@ -277,8 +297,10 @@ struct Query(Movable, ViewSource):
     var _threads: Int                    # worker threads the CPU kernel starts (0: one a core); a float64 sum is the same for any number
     var edits: Int                       # F-160: the frame's edit counter when `Query(frame)` copied it (0 for a table or scan): a view's cache key
     var windows: List[WindowFn]          # F-168: window functions over the rows the plan keeps (`window`; `compute_windows` in winquery.mojo runs them)
+    var jn: Optional[LazyJoin]           # F-204: the query starts with a join (`join`): `table` is then the joined schema with no rows
 
     def __init__(out self, table: SharedTable):
+        self.jn = None
         self.windows = List[WindowFn]()
         self.edits = 0
         self.table = table
@@ -297,6 +319,7 @@ struct Query(Movable, ViewSource):
         """A plan over a Parquet file that may be bigger than memory: `compute` reads one row group at a time (only the
         columns the plan uses), runs the kernel on it on the CPU and merges the partial results, so the answer is
         `read_parquet` + the same query, exactly, and the peak memory is one row group plus the result."""
+        self.jn = None
         self.windows = List[WindowFn]()
         self.edits = 0
         self.table = scan.schema
@@ -312,6 +335,7 @@ struct Query(Movable, ViewSource):
         self.overlay = Overlay(scan.schema)
 
     def __init__(out self, frame: Frame) raises:
+        self.jn = None
         self.windows = List[WindowFn]()
         self.edits = 0
         self.table = frame.base
@@ -335,9 +359,11 @@ struct Query(Movable, ViewSource):
         self.nodes.append(PlanNode(P_FILTER, self._top(), [predicate.copy()], List[Agg](), 0))
         return self^
 
-    def window(var self, *fns: WindowFn) -> Self:
+    def window(var self, *fns: WindowFn) raises -> Self:
         """Window functions over the rows the plan's `where`s keep (F-168): `Query(t).where(...).window(row_number().over(w), sum(col("v")).over(w))`;
-        `compute_windows(query)` (winquery.mojo) returns the source's columns and one more per function."""
+        `compute_windows(query)` (winquery.mojo) returns the source's columns and one more per function. After a `join` the joined rows are written first (F-204)."""
+        if self.jn:
+            self = self^._unjoined()
         for f in fns:
             self.windows.append(f.copy())
         return self^
@@ -346,6 +372,8 @@ struct Query(Movable, ViewSource):
         """F-160: the plan as SQL over a source called `source`: `SELECT * [, f(...) OVER (...) AS name ...] FROM source [WHERE ...]`, the rows its `where`s keep
         and the columns of its window functions (a `group_by` or an aggregate is not written: use SQL). It is the text of a catalog view made from a Query
         (`Catalog.view(name, query)`) and of `compute_windows`."""
+        if self.jn:
+            raise Error("a Query that starts with a join has no rows to read yet: bake it with `Query(q.joined_table())` first")
         var where = String()
         for node in self.nodes:
             if node.kind == P_AGGREGATE:
@@ -364,8 +392,10 @@ struct Query(Movable, ViewSource):
             text += " WHERE " + where
         return text^
 
-    def view_source(self, name: String) -> SqlSource:
+    def view_source(self, name: String) raises -> SqlSource:
         """F-160: the plan's data as a catalog source called `name`: the table, the frame's edits or the Parquet scan it was built over."""
+        if self.jn:
+            raise Error("a Query that starts with a join has no rows to read yet: bake it with `Query(q.joined_table())` first")
         var src = SqlSource(name, self.table)
         if self.scan:
             src.kind = SRC_SCAN
@@ -458,70 +488,93 @@ struct Query(Movable, ViewSource):
         from another table is refused here, not silently answered with the wrong data."""
         if self.scan:
             raise Error("on_device: a Parquet scan runs on the CPU, one row group at a time")
+        if self.jn:
+            raise Error("on_device: a Query that starts with a join runs on the CPU (the join is fused into the pipeline)")
         if not device_table.mirrors(self.table):
             raise Error("on_device: this DeviceTable was not made from the query's table")
         self.device = device_table
         return self^
 
     def join(var self, other: SharedTable, left_on: List[String], right_on: List[String], how: String = "inner") raises -> Self:
-        """The inner equi-join of this query's table with `other` on `left_on[i] = right_on[i]`, as a new query over the joined rows (this table's
+        """The equi-join of this query's table (or Frame: its edited rows) with `other` on `left_on[i] = right_on[i]`, as a new query over the joined rows (this table's
         columns, then `other`'s; a repeated name gets a suffix). The builder's own rules apply from there on (`where`, `group_by`, `agg`).
         The join is the engine's (the same kernel and key rules as SQL): a NULL key never matches, TEXT keys match by bytes whatever the
         dictionaries, DECIMAL scales are aligned (INT is scale 0), FLOAT keys follow DuckDB (-0.0 = 0.0, NaN = NaN), int64 keys past 2^53 are
         exact, and for an inner join the smaller table is the one the hash table is built on. `how`: "inner"; "left" (every row of this table; the
         other's columns are NULL where nothing matches); "semi" (this table's rows that have a partner, this table's columns only); "anti" (the rows
-        that have none: a NULL key has none). A left, semi or anti join builds on `other`. The join must come first, over a plain table (bake a
-        Frame, read a file, first)."""
+        that have none: a NULL key has none). A left, semi or anti join builds on `other`. The join must come first.
+
+        F-204: no joined row is written. `compute` runs the join the way SQL does (joinq.mojo): the probe table is scanned by the pipeline, each block looks
+        its partners up, and only the build-side columns the plan reads are gathered, when the build keys are unique, repeat up to EXPAND_MAX_REP times, or the
+        join is a semi / anti one (`QueryResult.notes`: `join path: fused`); otherwise (a holistic aggregate, hashed keys, a hot key) the rows are written, only the
+        columns the plan reads (`join path: materialized`). The joined query's `table` is the joined schema with no rows: `joined_table()` writes the rows."""
+        return self^._join(other, left_on, right_on, how)
+
+    def join(var self, other: Frame, left_on: List[String], right_on: List[String], how: String = "inner") raises -> Self:
+        """`join` with a Frame on the other side: its rows as its edits leave them (a Frame over a Parquet scan is not joined here: SQL streams it)."""
+        if other.scan:
+            raise Error("join: a Frame over a Parquet scan is not joined by the builder: SQL streams it (`Catalog.add_frame`)")
+        var cat = Catalog()
+        cat.add_frame("other", other)
+        return self^._join(realize_source(cat.sources[0].copy()), left_on, right_on, how)
+
+    def _join(var self, other: SharedTable, left_on: List[String], right_on: List[String], how: String) raises -> Self:
         if how != "inner" and how != "left" and how != "semi" and how != "anti":
             raise Error("a `" + how + "` join is not supported: how is inner, left, semi or anti")
         if len(self.nodes) > 1:
             raise Error("join must come first: filters and aggregates come after it")
-        if self.framed or self.scan:
-            raise Error("join: a Frame or a Parquet scan is not joined by the builder: bake the frame or read the file into a table first (SQL joins them as they are)")
+        if self.scan:
+            raise Error("join: a Parquet scan is not joined by the builder: read the file into a table first (SQL joins it as it is)")
         if len(left_on) == 0 or len(left_on) != len(right_on):
             raise Error("join: `left_on` and `right_on` name the same number of columns, at least one")
+        var left = self.joined_table()                                  # (a table: itself; a Frame: its edited rows; a joined query: its rows)
         var lcols = List[Int]()
         var rcols = List[Int]()
         for k in range(len(left_on)):
-            var l = self.table.index(left_on[k])
+            var l = left.index(left_on[k])
             var r = other.index(right_on[k])
             if l < 0:
                 raise Error("join: no column `" + left_on[k] + "` in this query's table")
             if r < 0:
                 raise Error("join: no column `" + right_on[k] + "` in the other table")
-            var lk = self.table.kind(l).value
+            var lk = left.kind(l).value
             var rk = other.kind(r).value
             var numeric = (lk == INT.value or lk == DECIMAL.value) and (rk == INT.value or rk == DECIMAL.value)
             if not (numeric or lk == rk):
                 raise Error("join: cannot join `" + left_on[k] + "` with `" + right_on[k] + "`: the two columns are different kinds of value")
             lcols.append(l)
             rcols.append(r)
-        var lc = List[Int]()
-        for c in range(self.table.columns()):
-            lc.append(c)
-        var rc = List[Int]()
-        for c in range(other.columns()):
-            rc.append(c)
-        var left = JoinSide(self.table, lc^, lcols.copy(), True)
-        var right = JoinSide(other, rc^ if (how == "inner" or how == "left") else List[Int](), rcols.copy(), True)
-        var left_builds = how == "inner" and self.table.rows() < other.rows()
-        var keys = JoinKeys()
-        if left_builds:
-            normalize_keys(self.table, other, lcols, rcols, keys, self._threads)
-        else:
-            normalize_keys(other, self.table, rcols, lcols, keys, self._threads)
-        var nb = self.table.rows() if left_builds else other.rows()
-        var np = other.rows() if left_builds else self.table.rows()
-        var m = hj_build(keys.bk_addr, keys.bo_addr, nb, self._threads, how == "semi" or how == "anti")
-        var joined: Table
-        if how == "semi" or how == "anti":
-            var pick = select_rows(m, keys, np, PM_SEMI if how == "semi" else PM_ANTI, self._threads)
-            joined = gather_join(left, right, pick, False, self._threads)
-        else:
-            var ncols = self.table.columns() + other.columns()
-            var pairs = join_pairs(m, keys, np, JOIN_BUDGET_BYTES // (8 * max(ncols, 1)), self._threads, how == "left")
-            joined = gather_join(left, right, pairs, left_builds, self._threads, how == "left")
-        var out = Query(joined^.share())
+        var kind = how_kind(how)
+        var schema = joined_schema(left, other, kind)
+        var names = List[String]()
+        for c in range(schema.columns()):
+            names.append(schema.name(c))
+        var key_text = String()
+        for k in range(len(left_on)):
+            key_text += ("" if k == 0 else ", ") + left_on[k] + " = " + right_on[k]
+        var out = Query(schema^.share())
+        out.jn = LazyJoin(left, other, lcols^, rcols^, how, names^, key_text^)
+        out._threads = self._threads
+        out._morsels = self._morsels
+        out._block_rows = self._block_rows
+        out._window_rows = self._window_rows
+        return out^
+
+    def joined_table(self) raises -> SharedTable:
+        """The rows this query reads as a table: a table is itself, a Frame its edited rows, a query that starts with a join the joined rows (every column, written now)."""
+        if self.jn:
+            ref jn = self.jn.value()
+            var all = List[Bool](length=len(jn.names), fill=True)
+            var note = String()
+            return materialize_join(jn, all, self._threads, note)^.share()
+        if self.framed:
+            return realize_source(self.view_source("t"))
+        return self.table
+
+    def _unjoined(var self) raises -> Self:
+        """The same plan over the joined rows as a table (what `window` needs)."""
+        var out = Query(self.joined_table())
+        out.nodes = self.nodes.copy()
         out._threads = self._threads
         out._morsels = self._morsels
         out._block_rows = self._block_rows
@@ -534,6 +587,8 @@ struct Query(Movable, ViewSource):
         the same either way, edits of a frame included. `job` (F-175, job.mojo): the background job this runs for, whose cancel
         is checked between row ranges, windows, row groups and blocks and whose progress it advances; a plain call passes none."""
         job.stage(STAGE_PLAN)
+        if self.jn:
+            return compute_joined(self, device, job)                    # F-204 (joinq.mojo)
         if self.scan:
             var scan_nodes = self.nodes.copy()
             if self.framed:                              # formulas inlined, merges remapped (as below)
@@ -669,8 +724,10 @@ struct QueryResult(Movable):
     var agg_float: List[Bool]       # per aggregate: its value is a float64 (`floats(i)`; `values(i)` holds its bits)
     var nan_slot_of: List[Int]      # per float min / max: the slot counting the NaNs the kernel left out, else -1
     var hfloat: List[Bool]          # per holistic aggregate: its source is float64 (median, quantile_disc, top_k give float bits)
+    var notes: List[String]         # F-204: how a joined query ran (`join path: fused ...`); empty for a query over one table
 
     def __init__(out self):
+        self.notes = List[String]()
         self.device = CPU
         self.pieces = 0
         self.gpu_pieces = 0

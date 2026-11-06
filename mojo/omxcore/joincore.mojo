@@ -794,17 +794,22 @@ def _gather_column(src: Int, valid: Int, rows_a: Int, n: Int, dst_a: Int, nul_a:
     par_n(work, tasks, tasks)
 
 
-def gather_join(left: JoinSide, right: JoinSide, pairs: JoinPairs, left_builds: Bool, threads: Int, outer: Bool = False) raises -> Table:
+def gather_join(left: JoinSide, right: JoinSide, pairs: JoinPairs, left_builds: Bool, threads: Int, outer: Bool = False,
+                names: List[String] = List[String]()) raises -> Table:
     """The joined table: the carried columns of the left side at its rows of the pairs, then the right side's (the build side's rows are the
-    pairs' build rows, the probe side's the pairs' probe rows). `outer`: the build side's rows may be -1 (its columns are NULL there)."""
+    pairs' build rows, the probe side's the pairs' probe rows). `outer`: the build side's rows may be -1 (its columns are NULL there).
+    `names` (F-204): the name of each carried column in order (the builder carries only the columns its plan reads, under the names of the
+    full joined schema); empty: the side's own, made unique."""
     var n = pairs.n
     var t = Table.empty()
+    var at = 0
     for side in range(2):
         ref sd = left if side == 0 else right
         var rows_a = (pairs.build_a if left_builds else pairs.probe_a) if side == 0 else (pairs.probe_a if left_builds else pairs.build_a)
         for c in sd.cols:
             var kind = sd.table.kind(c)
-            var col = t.add_column(_unique_name(t, sd.table.name(c)), kind, scale=sd.table.scale(c))
+            var col = t.add_column(names[at] if len(names) > 0 else _unique_name(t, sd.table.name(c)), kind, scale=sd.table.scale(c))
+            at += 1
             var vals = List[Int64](unsafe_uninit_length=n)
             var has_nulls = sd.table.null_count(c) > 0 or (outer and (side == 0) == left_builds)       # outer: the build side's columns hold NULLs for unmatched rows
             var nul = List[UInt8](length=n if has_nulls else 0, fill=0)
