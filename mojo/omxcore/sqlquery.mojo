@@ -19,7 +19,7 @@ from .query import OVERFLOW_MESSAGE
 from .sql import (SqlStatement, SqlQuery, SqlExpr, SelectItem, TableRef, WinSpec, Cte, SubQuery, OrderItem, parse_query, sql_error, lower_ascii, EXPLAIN_NONE, EXPLAIN_ANALYZE,
                   SET_NONE, SET_UNION_ALL, SET_UNION, SET_INTERSECT, SET_EXCEPT, split_copy, CopyTo, CTE_AUTO, CTE_MATERIALIZED, CTE_INLINED,
                   X_SCALAR_Q, X_IN_Q, X_EXISTS_Q, X_SUBIN, X_EXISTS, X_NOT, X_COL, X_INT, X_NULL, X_CAST, X_TRUE, X_FALSE, X_IN, X_BIN, X_CALL, X_ISBOOL, JK_INNER, JK_LEFT)
-from .bind import Catalog, _split_and_expr, _and_chain, _has_aggregate
+from .bind import Catalog, SRC_TABLE, _split_and_expr, _and_chain, _has_aggregate
 from .subq import (SIDE_OUTER, side_of, Scope, scope_of, Flat, flatten, flat_source, clone_shell, collect, is_subquery_node, add_node, column_node, equal_node, and_node,
                    copy_expr, hidden_tag, find_entry, Correlation, set_items, set_literal, set_typed_null, literal_node, statement_is_correlated, analyze, build_exists_source, build_value_source, group_by_keys, key_name)
 from .setops import union_all
@@ -603,6 +603,7 @@ struct Step(Movable):
     var kid: Int
     var pd: String
     var rk_inner: List[String]
+    var rk_joined: List[String]      # F-202: the key columns of a D whose table is joined to others, "qualifier\x01name" (the cut is an IN list of the outer rows' keys, not an EXISTS)
     var rk_outer: List[Int]
     var note_pre: String
     var note_post: String
@@ -619,6 +620,7 @@ struct Step(Movable):
         self.kid = -1
         self.pd = String()
         self.rk_inner = List[String]()
+        self.rk_joined = List[String]()
         self.rk_outer = List[Int]()
         self.note_pre = String()
         self.note_post = String()
@@ -638,6 +640,7 @@ struct Step(Movable):
     def copy_of(self, conj: Int = -2) -> Step:
         var c = Step(self.conj if conj == -2 else conj, self.d, self.join_on, self.left)
         c.pend(self.kid, self.pd, self.rk_inner, self.rk_outer, self.note_pre, self.note_post)
+        c.rk_joined = self.rk_joined.copy()
         c.vname = self.vname
         c.fix = self.fix
         c.alt_node = self.alt_node
@@ -657,6 +660,21 @@ def _bare_keys(k: SqlStatement, cor: Correlation) -> List[String]:
         if k.exprs[ke].kind != X_COL:
             return List[String]()
         out.append(k.exprs[ke].text)
+    return out^
+
+
+def _joined_keys(k: SqlStatement, cor: Correlation) -> List[String]:
+    """F-202: `_bare_keys` for a D whose table is joined to others: the first key as "qualifier\x01name" (the cut is an IN list, which needs no subquery beside the join)."""
+    var out = List[String]()
+    if not (k.has_right or len(k.extra) > 0) or k.table_kid >= 0 or len(k.ctes) > 0 or len(cor.key_in) == 0:
+        return out^
+    for e in range(len(k.exprs)):
+        if is_subquery_node(k.exprs[e].kind) or k.exprs[e].kind == X_SUBIN or k.exprs[e].kind == X_EXISTS:
+            return List[String]()
+    var ke = cor.key_in[0]
+    if k.exprs[ke].kind != X_COL:
+        return List[String]()
+    out.append(k.exprs[ke].text2 + "\x01" + k.exprs[ke].text)
     return out^
 
 
@@ -707,6 +725,42 @@ def run_pending[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut st: Sql
             k.exprs[len(k.exprs) - 1].items.append(len(k.subs) - 1)
             k.where = and_node(k, k.where, len(k.exprs) - 1)
             reduced = True
+    if not reduced and len(s.rk_joined) > 0 and len(s.rk_inner) == 0 and ci >= 0 and ki >= 0 and catalog.sources[ci].rows() * den < catalog.sources[ki].rows():
+        # F-202: D's table is joined to others (TPC-H Q2's partsupp with supplier, nation, region): the outer rows' distinct keys, when there are few, become an
+        # IN list on the key column, and the join runs over the few rows of D's table that match them
+        var parts = s.rk_joined[0].split("\x01")
+        var oname = st.exprs[s.rk_outer[0]].text
+        var oc = -1
+        for c in range(catalog.sources[ci].table.columns()):
+            if lower_ascii(catalog.sources[ci].table.name(c)) == lower_ascii(oname):
+                oc = c
+        if oc >= 0 and catalog.sources[ci].kind == SRC_TABLE and catalog.sources[ci].table.kind(oc) == INT and len(parts) == 2:     # (a Frame's base rows are not the rows it holds)
+            var seen = Dict[Int, Bool]()
+            var vals = List[Int64]()
+            var usable = True
+            ref ct = catalog.sources[ci].table
+            for r0 in range(ct.rows()):
+                if ct.is_null(oc, r0):
+                    continue
+                var v = ct.get(oc, r0)
+                if v < 0:
+                    usable = False
+                    break
+                if Int(v) not in seen:
+                    seen[Int(v)] = True
+                    vals.append(v)
+                    if len(vals) > MAX_IN_LIST:
+                        usable = False
+                        break
+            if usable and len(vals) > 0:
+                var colx = column_node(k, String(parts[1]), String(parts[0]), k.table_line, k.table_col)
+                var items = List[Int]()
+                for v in vals:
+                    k.exprs.append(SqlExpr(X_INT, String(Int(v)), String(), -1, -1, -1, List[Int](), False, k.table_line, k.table_col))
+                    items.append(len(k.exprs) - 1)
+                k.exprs.append(SqlExpr(X_IN, String(), String(), colx, -1, -1, items^, False, k.table_line, k.table_col))
+                k.where = and_node(k, k.where, len(k.exprs) - 1)
+                reduced = True
     run.stmts[s.kid] = k^
     if s.alt_node >= 0:
         st.exprs[s.alt_node].items[0] = s.alt_sub
@@ -1065,6 +1119,7 @@ def _correlated_scalar[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut 
     if calls > 0 and not is_count:
         raise sql_error(line, col, "a correlated scalar subquery with COUNT inside an expression is not supported yet (an empty group is 0, not NULL)")
     var rk = _bare_keys(k, cor)
+    var rkj = _joined_keys(k, cor)
     build_value_source(k, cor, value, tag)
     group_by_keys(k, cor)
     run.stmts[kid] = k^
@@ -1093,6 +1148,7 @@ def _correlated_scalar[P: Planner](mut run: QueryRun, mut catalog: Catalog, mut 
         st.exprs[n] = vnode^
     var step = Step(conj, d, on, left)
     step.pend(kid, d, rk, okeys, "correlated scalar subquery: ", " keys), a " + ("left join" if left else "join"))
+    step.rk_joined = rkj^
     if not is_count and cmp and st.exprs[conj].text == "=":
         step.fix = n                                                            # (once D is known: an `=` against a numeric D.__v is written `__v + 0`, run_pending)
         step.vname = "__v" + tag

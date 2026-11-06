@@ -239,3 +239,14 @@ ILIKE_PATTERNS = ["%SPECIAL%Requests%", "SPECIAL%REQUESTS", "A%B%", "%CAFÉ%", "
 def test_ilike_with_several_literals_equals_duckdb(mx, words, pattern):
     p = pattern.replace("'", "''")
     check(mx, f"SELECT id, s ILIKE '{p}' AS m, s NOT ILIKE '{p}' AS n FROM w ORDER BY id", words["con"], files={"w": words["paths"]["w"]}, ordered=True)
+
+
+# a correlated scalar subquery whose table is joined to others (TPC-H Q2's shape): D is cut to the outer rows' keys with an IN list
+@pytest.mark.parametrize("sql", [
+    "SELECT da.a, da.an FROM da WHERE da.seg = 2 AND da.a < 400 AND da.a = (SELECT min(f.a) FROM f, db WHERE f.a = da.a AND f.b = db.b AND db.bk < 12) ORDER BY da.a",
+    "SELECT da.a, da.an FROM da WHERE da.seg = 1 AND da.a < 600 AND (SELECT min(f.x) FROM f, db WHERE f.a = da.a AND f.b = db.b AND db.bk < 12) > 40 ORDER BY da.a",
+    "SELECT da.a FROM da WHERE da.a < 500 AND (SELECT count(*) FROM f, db WHERE f.a = da.a AND f.b = db.b AND db.bk > 20) >= 2 ORDER BY da.a",
+])
+def test_a_correlated_subquery_over_joined_tables_is_cut_to_the_outer_keys(mx, data, sql):
+    res = q(mx, data, sql, ["da", "f", "db"], ordered=True)
+    note(res, "cut to the keys of the")
