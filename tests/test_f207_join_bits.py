@@ -21,7 +21,10 @@ TWO = [
     ("the dimension's key is read", "SELECT da.id, count(*) AS c FROM f JOIN da ON f.a = da.id WHERE da.seg = 2 GROUP BY da.id ORDER BY c DESC, da.id LIMIT 6", ["f", "da"], False),
     ("repeated build keys", "SELECT f.a % 5 AS g, count(*) FROM f JOIN db ON f.a = db.bk GROUP BY f.a % 5 ORDER BY g", ["f", "db"], False),
     ("a left join", "SELECT f.a % 5 AS g, count(*), count(da.id) FROM f LEFT JOIN da ON f.a = da.id AND da.seg = 2 GROUP BY f.a % 5 ORDER BY g", ["f", "da"], False),
-    ("a holistic aggregate (the join is not fused)", "SELECT f.a % 5 AS g, count(DISTINCT f.x) FROM f JOIN da ON f.a = da.id WHERE da.seg = 2 GROUP BY f.a % 5 ORDER BY g",
+    # since F-206 COUNT(DISTINCT) runs in two phases through the fused join, so it reads no build column: a bitmap
+    ("count distinct (two phases, fused)", "SELECT f.a % 5 AS g, count(DISTINCT f.x) FROM f JOIN da ON f.a = da.id WHERE da.seg = 2 GROUP BY f.a % 5 ORDER BY g",
+     ["f", "da"], True),
+    ("a holistic aggregate (the join is not fused)", "SELECT f.a % 5 AS g, count(DISTINCT f.x), sum(f.x) FROM f JOIN da ON f.a = da.id WHERE da.seg = 2 GROUP BY f.a % 5 ORDER BY g",
      ["f", "da"], False),
     ("a row query", "SELECT f.id, f.x FROM f JOIN da ON f.a = da.id WHERE da.seg = 3 AND f.x > 40 ORDER BY f.x DESC, f.id LIMIT 12", ["f", "da"], True),
     # semi and anti joins only ask whether a key is there: a bitmap too, repeated keys included (db.bk repeats)

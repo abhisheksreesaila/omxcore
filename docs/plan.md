@@ -1963,3 +1963,7 @@ Evidence (random suite, omxcore ms / DuckDB ms under load; SQL from `scripts/gat
 - Changed layout notes an older test asserted: an inner join that reads no build-side column says `presence bitmap: N keys in M values, one bit each` (was `direct array, unique keys`), `tests/test_mojo_join.py` and `tests/test_f161_join_speed.py` follow.
 
 - Review: PASS. Should-fix, open: worker identity in the top-N front is the `sel` address (sound only if the front stage and the hook share it per worker); an unfused inner join with no build column builds the map twice (correct, slower).
+
+## F-208 `median` of a DECIMAL column has DuckDB's type [todo] (found 2026-11-06 while merging F-206 / F-207)
+- [ ] `median(x)` over DECIMAL(p, 2) comes back DECIMAL scale 3; DuckDB keeps scale 2 (`SELECT f.a % 5, median(f.x) ... GROUP BY ...` in tests/test_f207_join_bits.py's world). Match DuckDB's result type for median / quantile over DECIMAL, INT and DATE, with tests.
+- Seen too: `tests/test_f056_step3c.py::test_peak_memory_of_an_external_sort_is_bounded_by_the_budget` measured 4,207,680 bytes against a 4 MiB bound once under load; it passed on rerun.
