@@ -116,6 +116,11 @@ def _hash_group(kw: List[List[Int64]], g: Int) -> UInt64:
     return h
 
 
+comptime TWO_PHASE_DECLINED = "count(DISTINCT): too many (keys, value) groups for two phases"     # F-206: raised by the first phase, caught where the query is run
+comptime TWO_PHASE_MIN_ROWS = 1048576        # F-206: a hashed first phase over fewer rows has at most this many groups: it needs no trial
+comptime TWO_PHASE_MAX_GROUPS = 2000000      # F-206: more (keys, value) groups than this (or than 1/8 of the rows) and the pair set of the holistic path is the cheaper way
+comptime TWO_PHASE_MIN_GROUPS = 131072       # F-206: ... but this many is always fine
+comptime TWO_PHASE_DENSE_MAX = 1048576       # F-206: a dense first phase over a domain of more slots than this is declined (its groups are read slot by slot)
 comptime MERGE_PART_BITS = 8                  # 256 partitions: each is merged by one worker, with no sharing and no locks
 
 
@@ -279,6 +284,15 @@ struct PartAcc(Movable):
             self._route(f, ops, threads)
         self._route(batch, ops, threads)
         self.batches += 1
+
+    def group_count(self) -> Int:
+        """The groups held so far (F-206: how many (keys, value) groups the first phase of a COUNT(DISTINCT) has made)."""
+        if self.batches <= 1:
+            return self.first.groups()
+        var total = 0
+        for p in range(len(self.parts)):
+            total += len(self.parts[p].counts)
+        return total
 
     def finish(mut self) -> Partial:
         if self.batches <= 1:
@@ -1058,7 +1072,7 @@ def _gpu_chunk(chunk: SharedTable, sp: SqlProgram, mut g: _Gpu, job: JobCtl) rai
 
 
 def _fold(sp: SqlProgram, plan: PhysicalPlan, chunk: SharedTable, mask_addr: Int, mut hs: HolStates, ops: List[Int], threads: Int,
-          mut pacc: PartAcc, mut dense_acc: QueryResult, fj: Optional[ArcPointer[FusedJoin]], mut gpu: _Gpu, job: JobCtl = JobCtl()) raises:
+          mut pacc: PartAcc, mut dense_acc: QueryResult, fj: Optional[ArcPointer[FusedJoin]], mut gpu: _Gpu, job: JobCtl = JobCtl(), max_groups: Int = 0) raises:
     """Runs the program over one chunk and folds its partial result into the accumulator. `job` (F-175) moves by the chunk's rows."""
     var n = chunk.rows()
     var exact = job.active() and not sp.p.repro
@@ -1075,6 +1089,15 @@ def _fold(sp: SqlProgram, plan: PhysicalPlan, chunk: SharedTable, mask_addr: Int
                 pacc.add(_run_hashed(chunk, sp, mask_addr, plan.key_words(), threads, fj, at, end - at), ops, threads)
                 job.advance(end - at)
                 at = end
+            return
+        if max_groups > 0 and n >= TWO_PHASE_MIN_ROWS:                # F-206: the first 1/32 of the rows say how many groups the whole will make (a clustered key's groups grow with the rows); when
+            var cut = max(MORSEL_ROWS, n // 32) // 8 * 8                  # that passes the limit the pair set of the holistic path is cheaper; else the partial is kept and the rest is a second range
+            var first = _run_hashed(chunk, sp, mask_addr, plan.key_words(), threads, fj, 0, cut)
+            if first.groups() * (n // cut) > max_groups:
+                raise Error(TWO_PHASE_DECLINED)
+            pacc.add(first^, ops, threads)
+            pacc.add(_run_hashed(chunk, sp, mask_addr, plan.key_words(), threads, fj, cut, n - cut), ops, threads)
+            job.advance(n)
             return
         pacc.add(_run_hashed(chunk, sp, mask_addr, plan.key_words(), threads, fj), ops, threads)
         job.advance(n)
@@ -1306,6 +1329,13 @@ def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
         if fj:
             ch.override = fj.value()[].probe
     var delta_rows = len(lsrc.overlay.delta)
+    var max_groups = 0                                                # F-206: the first phase of a COUNT(DISTINCT) may make this many (keys, value) groups
+    if q.fold_keys >= 0:
+        if plan.group == G_DENSE and plan.domain > TWO_PHASE_DENSE_MAX:
+            raise Error(TWO_PHASE_DECLINED)
+        var all_rows = chunk_rows_total(lsrc, ch)
+        if all_rows >= TWO_PHASE_MIN_ROWS:                            # (fewer rows make at most that many groups: no trial)
+            max_groups = min(TWO_PHASE_MAX_GROUPS, max(TWO_PHASE_MIN_GROUPS, all_rows // 8))
     if gpu.use:                                                       # F-191
         _gpu_open(src, opts, gpu)
     if fj and not ps and fj.value()[].pred_first and sp.p.pred_reg >= 0 and pred_reads_probe_only(sp.p, fj.value()[].n_probe_cols):
@@ -1336,7 +1366,9 @@ def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
         var fji = fj
         if ps:                                                         # this chunk's own join: its keys, the build sides' maps shared
             fji = ArcPointer(chunk_join(ps.value()[], chunk))
-        _fold(sp, plan, chunk, ch.mask_addr, hs, ops, threads, pacc, dense_acc, fji, gpu, opts.job)
+        _fold(sp, plan, chunk, ch.mask_addr, hs, ops, threads, pacc, dense_acc, fji, gpu, opts.job, max_groups if ch.n() == 1 else 0)
+        if max_groups > 0 and plan.group == G_HASHED and ch.n() > 1 and i + 1 < ch.n() and pacc.group_count() * ch.n() // (i + 1) > max_groups:
+            raise Error(TWO_PHASE_DECLINED)                           # (a scan's row groups: the groups so far, by the share of the chunks read)
     if sp.guard_slot >= 0 and dense_acc.counts[sp.guard_slot] > 0:
         raise Error(LIE + String(dense_acc.counts[sp.guard_slot]) + (" row lies" if dense_acc.counts[sp.guard_slot] == 1 else " rows lie") +
                     " outside the range of a group key that the footer gave")
@@ -3107,8 +3139,12 @@ def _run_sql_resolved[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: 
     opts.job.stage(STAGE_PLAN)
     var d = _two_phase_agg(q)                                          # F-206: COUNT(DISTINCT e) GROUP BY g runs as GROUP BY (g, e), then a count per g
     if d >= 0:
-        return _run_sql_phases(catalog, _two_phase_query(q, d), planner, opts)
-    return _run_sql_phases(catalog, q, planner, opts)
+        try:
+            return _run_sql_phases(catalog, _two_phase_query(q, d), planner, opts)
+        except e:
+            if String(e) != TWO_PHASE_DECLINED:
+                raise e^
+    return _run_sql_phases(catalog, q, planner, opts)             # (declined: the pairs are too many for a group table, the holistic path's pair set takes them)
 
 
 def _run_sql_phases[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: P, opts: PlannerOptions) raises -> SqlResult:

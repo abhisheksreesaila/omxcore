@@ -152,3 +152,66 @@ def test_a_join_stays_fused(probe, world):
     res = run_probe(probe, sql, files_of(world, ["fact", "dim"]), mode="table")
     assert any("join path: fused" in n for n in res["notes"]), res["notes"]
     assert not any("materialized" in n and "join path" in n for n in res["notes"]), res["notes"]
+
+
+# ── the cost rule: many (keys, value) groups keep the holistic path ─────────────────────────────────────────────────────
+
+@pytest.fixture(scope="module")
+def big(tmp_path_factory):
+    """1.2M rows (past the trial's 1,048,576): gh few groups under a large key domain (hashed), gu unique, gp clustered (3 rows a key), x small."""
+    d = tmp_path_factory.mktemp("f206big")
+    con = oracle_connection()
+    con.execute("""create table bt as select i as id, (i % 400) * 1000003 as gh, i as gu, i // 3 as gp,
+        case when i % 17 = 0 then null else (i * 7) % 13 end as x from range(1200000) r(i)""")
+    path = d / "bt.parquet"
+    con.execute(f"copy bt to '{path}' (format parquet, row_group_size 100000)")
+    return {"path": path, "con": con}
+
+
+@pytest.mark.parametrize("mode", ["table", "scan"])
+def test_few_groups_over_many_rows_run_two_phases(probe, big, mode):
+    """The first 1/32 of the rows (a table) or the first row groups (a scan) make few groups: the trial passes, the rest is folded in."""
+    sql = "select gh, count(distinct x) as n, count(*) as c from bt group by gh order by gh"
+    res = run_probe(probe, sql, {"bt": big["path"]}, mode=mode)
+    same(res, big["con"].execute(sql), sql, mode)
+    assert two_phase(res), res["notes"]
+
+
+@pytest.mark.parametrize("mode", ["table", "scan"])
+@pytest.mark.parametrize("key", ["gu", "gp"])
+def test_many_groups_keep_the_pair_set_of_the_holistic_path(probe, big, mode, key):
+    """A unique key (1.2M pairs) and a clustered one (400,000, past 1/8 of the rows) are declined by the trial: same answers, no two-phase note."""
+    sql = f"select {key}, count(distinct x) as n from bt group by {key} having count(distinct x) = 0 or {key} % 4999 = 0 order by {key}"
+    res = run_probe(probe, sql, {"bt": big["path"]}, mode=mode)
+    same(res, big["con"].execute(sql), sql, f"{mode} {key}")
+    assert not two_phase(res), res["notes"]
+
+
+# ── random queries ──────────────────────────────────────────────────────────────────────────────────────────────────────
+
+KEYS = ["g1", "g2", "gf", "xt", "g1 % 5", "v % 7", "xi", "dg", "dt"]
+VALUES = ["xi", "xb", "xt", "xd", "xc", "xf", "xl", "xi + v", "g1", "dg", "dt"]
+FILTERS = ["", "where v < 500", "where xi is not null", "where xb > 20000 and v % 3 = 0", "where v < 30", "where xt <> 'w3'", "where false"]
+
+
+def random_query(rng):
+    """(sql, tables): one key, one COUNT(DISTINCT value), maybe counts beside it, a filter, a join, HAVING; ordered over every output column, so LIMIT is exact."""
+    key = rng.choice(KEYS)
+    value = rng.choice(VALUES)
+    joined = rng.random() < 0.5 or any(c in (key, value) for c in ("dg", "dt"))
+    extra = rng.choice(["", ", count(*) as c", ", count(xi) as ci"])
+    having = rng.choice(["", f" having count(distinct {value}) > 1", " having count(*) > 3"])
+    limit = rng.choice(["", " limit 40"])
+    inner = (f"select {key} as k1, count(distinct {value}) as n{extra} from {'fact join dim on k = dk' if joined else 'fact'} {rng.choice(FILTERS)} "
+             f"group by {key}{having}")
+    cols = ["n"] + ([extra.split(" as ")[1]] if extra else [])
+    sql = f"select * from ({inner}) order by n desc, " + "".join(c + ", " for c in cols[1:]) + f"k1{limit}"
+    return sql, ["fact", "dim"] if joined else ["fact"]
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_random_queries_equal_duckdb(probe, world, seed):
+    import random
+    sql, tables = random_query(random.Random(seed))
+    res = run_probe(probe, sql, files_of(world, tables), mode="table")
+    same(res, world["con"].execute(sql), sql, f"seed {seed}")
