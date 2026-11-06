@@ -65,8 +65,28 @@ def cpu_available() -> bool:
     return _find("libmxpipeline_cpu.so", "MXFRAME_PIPELINE_CPU_LIB") is not None
 
 
+_CUDA = None
+
+
+def _cuda_usable() -> bool:
+    """A CUDA driver that opens and has a device (the GPU kernel drives CUDA only). Asked once."""
+    global _CUDA
+    if _CUDA is None:
+        _CUDA = False
+        for name in ("libcuda.so.1", "libcuda.so"):
+            try:
+                lib = ctypes.CDLL(name)
+            except OSError:
+                continue
+            n = ctypes.c_int(0)
+            _CUDA = lib.cuInit(0) == 0 and lib.cuDeviceGetCount(ctypes.byref(n)) == 0 and n.value > 0
+            break
+    return _CUDA
+
+
 def gpu_available() -> bool:
-    return _find("libmxpipeline_gpu.so", "MXFRAME_PIPELINE_GPU_LIB") is not None
+    """The GPU library exists and a CUDA device can run it (the Metal build of the library, on a Mac, is not that)."""
+    return _find("libmxpipeline_gpu.so", "MXFRAME_PIPELINE_GPU_LIB") is not None and _cuda_usable()
 
 
 _PHYSICAL = None
