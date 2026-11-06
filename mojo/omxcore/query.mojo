@@ -514,6 +514,8 @@ struct Query(Movable, ViewSource):
         """`join` with a Frame on the other side: its rows as its edits leave them (a Frame over a Parquet scan is not joined here: SQL streams it)."""
         if other.scan:
             raise Error("join: a Frame over a Parquet scan is not joined by the builder: SQL streams it (`Catalog.add_frame`)")
+        if other.edits == 0:                                            # never edited: its table is the rows
+            return self^._join(other.base, left_on, right_on, how)
         var cat = Catalog()
         cat.add_frame("other", other)
         return self^._join(realize_source(cat.sources[0].copy()), left_on, right_on, how)
@@ -567,7 +569,7 @@ struct Query(Movable, ViewSource):
             var all = List[Bool](length=len(jn.names), fill=True)
             var note = String()
             return materialize_join(jn, all, self._threads, note)^.share()
-        if self.framed:
+        if self.framed and self.edits > 0:                              # (a Frame nobody edited reads as its table)
             return realize_source(self.view_source("t"))
         return self.table
 

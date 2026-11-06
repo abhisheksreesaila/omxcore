@@ -172,6 +172,10 @@ def compute_joined(q: Query, device: Int, job: JobCtl) raises -> QueryResult:
     var np = (jn.right.rows() if left_builds else jn.left.rows())
     var side_note = "join: " + jn.how + " on " + jn.key_text + ": " + commas(jn.left.rows()) + " rows and " + commas(jn.right.rows()) + " rows"
     if not fusable:
+        if device == GPU:                                              # a joined query has no DeviceTable: the refusal is the one a table without it gets, before any row is written
+            var bare = Query(q.table)
+            bare.nodes = q.nodes.copy()
+            return bare.compute(GPU, job)
         var gathered = String()
         var jt = materialize_join(jn, used, q._threads, gathered)
         var inner = Query(jt^.share())
