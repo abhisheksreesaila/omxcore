@@ -181,3 +181,61 @@ def test_a_dimension_with_repeated_keys_is_not_a_star(mx, data):
 def test_a_star_with_an_empty_dimension_and_null_cross_keys(mx, data):
     q(mx, data, "SELECT count(*), sum(f.x) FROM f, nothing, db WHERE f.a = nothing.a AND f.b = db.b AND nothing.ak = db.bk", ["f", "nothing", "db"])
     q(mx, data, "SELECT count(*) FROM f, da, db WHERE f.a = da.a AND f.b = db.b AND da.ak = db.bk AND da.ak IS NULL", ["f", "da", "db"])
+
+
+# the star's boundaries: STAR_RATIO = 3 (the fact table has at least 3x the rows of every other), and keys a sample calls unique that are not
+@pytest.fixture(scope="session")
+def bounds(tmp_path_factory):
+    d = tmp_path_factory.mktemp("f202b")
+    con = oracle_connection()
+    con.execute("create table bf as select i as id, (i * 7) % 70000 as k70, (i * 11) % 60000 as k60, (i * 13) % 50 as ks, i % 17 as g, ((i % 400) * 0.5)::decimal(10,1) as x from range(200000) r(i)")
+    con.execute("create table d70 as select i as k, 'a' || (i % 31) as an, i % 5 as seg from range(70000) r(i)")
+    con.execute("create table d60 as select i as k, 'b' || (i % 29) as bn, i % 7 as seg from range(60000) r(i)")
+    con.execute("create table ds as select i as k, 'c' || (i % 4) as cn from range(50) r(i)")
+    # 40,000 keys, a handful of them repeated: a sample of the column can call it unique, the build then finds the repeats
+    con.execute("create table dd as select case when i % 9973 = 0 then i - 1 else i end as k, 'd' || (i % 13) as dn from range(40000) r(i)")
+    con.execute("create table bf2 as select i as id, (i * 7) % 40000 as kd, (i * 13) % 50 as ks, ((i % 300) * 0.5)::decimal(10,1) as x from range(300000) r(i)")
+    paths = {}
+    for t in ["bf", "d70", "d60", "ds", "dd", "bf2"]:
+        paths[t] = d / f"{t}.parquet"
+        con.execute(f"copy {t} to '{paths[t]}' (format parquet, row_group_size 40000)")
+    return {"con": con, "paths": paths}
+
+
+def test_just_under_the_star_ratio_the_planners_order_stands(mx, bounds):
+    # 200,000 rows against a 70,000-row dimension: 2.86x, under 3
+    sql = "SELECT d70.an, ds.cn, count(*), sum(bf.x) FROM bf, d70, ds WHERE bf.k70 = d70.k AND bf.ks = ds.k GROUP BY d70.an, ds.cn ORDER BY d70.an, ds.cn"
+    res = q(mx, bounds, sql, ["bf", "d70", "ds"], ordered=True)
+    assert not [n for n in res["notes"] if "a star from" in n], res["notes"]
+
+
+def test_over_the_star_ratio_the_fact_table_probes_every_dimension(mx, bounds):
+    # 200,000 rows against a 60,000-row dimension: 3.33x
+    sql = "SELECT d60.bn, ds.cn, count(*), sum(bf.x) FROM bf, d60, ds WHERE bf.k60 = d60.k AND bf.ks = ds.k GROUP BY d60.bn, ds.cn ORDER BY d60.bn, ds.cn"
+    res = q(mx, bounds, sql, ["bf", "d60", "ds"], ordered=True)
+    note(res, "a star from bf")
+
+
+def test_keys_that_look_unique_but_repeat_fall_back_and_stay_correct(mx, bounds):
+    sql = "SELECT dd.dn, ds.cn, count(*), sum(bf2.x) FROM bf2, dd, ds WHERE bf2.kd = dd.k AND bf2.ks = ds.k GROUP BY dd.dn, ds.cn ORDER BY dd.dn, ds.cn"
+    res = q(mx, bounds, sql, ["bf2", "dd", "ds"], ordered=True)
+    note(res, "star: dd has repeated keys: the joins run one by one")      # the plan was a star (the ndv said unique); the build found the repeats and the joins ran one by one
+
+
+# LIKE with ESCAPE and ILIKE (the case-folded pattern takes the same literal matcher)
+ESC_PATTERNS = [("a\\%b%", "\\"), ("%a\\_b%", "\\"), ("a!%b", "!"), ("%special%requests%", "\\"), ("a\\%%b", "\\")]
+
+
+@pytest.mark.parametrize("pattern,esc", ESC_PATTERNS)
+def test_like_with_escape_equals_duckdb(mx, words, pattern, esc):
+    p = pattern.replace("'", "''")
+    check(mx, f"SELECT id, s LIKE '{p}' ESCAPE '{esc}' AS m FROM w ORDER BY id", words["con"], files={"w": words["paths"]["w"]}, ordered=True)
+
+
+ILIKE_PATTERNS = ["%SPECIAL%Requests%", "SPECIAL%REQUESTS", "A%B%", "%CAFÉ%", "%X%x%", "%É%é%", "a%B%c"]
+
+
+@pytest.mark.parametrize("pattern", ILIKE_PATTERNS)
+def test_ilike_with_several_literals_equals_duckdb(mx, words, pattern):
+    p = pattern.replace("'", "''")
+    check(mx, f"SELECT id, s ILIKE '{p}' AS m, s NOT ILIKE '{p}' AS n FROM w ORDER BY id", words["con"], files={"w": words["paths"]["w"]}, ordered=True)

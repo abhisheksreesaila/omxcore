@@ -28,7 +28,7 @@ from .holistic import (HolStates, HolSpec, HolResult, A_DISTINCT, A_PCT, A_MEDIA
                            float_key)
 from .sql import sql_error, parse_sql, SqlStatement, EXPLAIN_NONE, EXPLAIN_ANALYZE
 from .bind import (copy_query, Catalog, SqlSource, BoundQuery, SortKey, bind_sql, bind_statement, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, F_COUNT_STAR,
-                   F_COUNT, F_SUM, F_MIN, F_MAX, F_AVG, F_COUNT_DISTINCT, F_MEDIAN, F_STDDEV_SAMP, F_STDDEV_POP, F_VAR_SAMP, F_VAR_POP, F_QEDGE, B_QBIN, B_LIT, B_AGG, B_AND, B_CMP,
+                   F_COUNT, F_SUM, F_MIN, F_MAX, F_AVG, F_COUNT_DISTINCT, F_MEDIAN, F_STDDEV_SAMP, F_STDDEV_POP, F_VAR_SAMP, F_VAR_POP, F_QEDGE, B_QBIN, B_LIT, B_AGG, B_AND, B_CMP, C_EQ,
                    BExpr, AggSpec, KeySpec, pow10_checked)
 from .plan import LogicalPlan, build_plan, executable
 from .post import run_post
@@ -2168,7 +2168,7 @@ def _run_star[P: Planner](mut catalog: Catalog, q: BoundQuery, mut leaves: List[
                 return False
             qx.rexprs.append(BExpr(B_COL, ka.value, 0, -1, -1, Int64(q.edge_a[k]), q.src_name(q.edge_a[k]), 0, 0))
             qx.rexprs.append(BExpr(B_COL, kb.value, 0, -1, -1, Int64(q.edge_b[k]), q.src_name(q.edge_b[k]), 0, 0))
-            qx.rexprs.append(BExpr(B_CMP, BOOL.value, 0, len(qx.rexprs) - 2, len(qx.rexprs) - 1, Int64(24), "", 0, 0))
+            qx.rexprs.append(BExpr(B_CMP, BOOL.value, 0, len(qx.rexprs) - 2, len(qx.rexprs) - 1, Int64(C_EQ), "", 0, 0))
             conj.append(len(qx.rexprs) - 1)
     var need = final_needed(qx, conj)
     var stages = List[StageData]()
