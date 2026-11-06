@@ -161,7 +161,7 @@ def main() raises:
     check(rows_of(r.table),
           "Logical plan\n  Project region, sum(price)\n    Aggregate keys=[region] aggs=[sum(price)]\n      Filter (WHERE) qty > 1\n        Scan orders\n"
           "Physical plan\n  source: orders (table), 10 rows\n  group: dense, 1 key region 4 (with a NULL slot) = 4 slots: the domain of 4 slots is small\n"
-          "  columns read: region, qty, price (3 of 5)\n  kernel: 19 instructions a row (1 slot)\n  device: CPU (AUTO: the table has 10 rows, under the 1000000 AUTO runs on the GPU)\n",
+          "  columns read: region, qty, price (3 of 5)\n  kernel: 17 instructions a row (1 slot)\n  device: CPU (AUTO: the table has 10 rows, under the 1000000 AUTO runs on the GPU)\n",
           "EXPLAIN")
 
     # a frame: the edits are seen (a changed row, an appended row, a removed row)
