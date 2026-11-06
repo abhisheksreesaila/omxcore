@@ -18,7 +18,15 @@ def test_warm_loads_cpu_libraries_without_touching_the_gpu():
 import omxcore, time
 assert omxcore._warm_thread is not None
 omxcore._warm_thread.join(30)
-maps = open('/proc/self/maps').read()
+if sys.platform == 'darwin':          # no /proc/self/maps: ask dyld for the loaded images
+    import ctypes
+    dyld = ctypes.CDLL(None)
+    dyld._dyld_image_count.restype = ctypes.c_uint32
+    dyld._dyld_get_image_name.restype = ctypes.c_char_p
+    dyld._dyld_get_image_name.argtypes = [ctypes.c_uint32]
+    maps = '\n'.join(dyld._dyld_get_image_name(i).decode() for i in range(dyld._dyld_image_count()))
+else:
+    maps = open('/proc/self/maps').read()
 print('libmxkernels_aot.so' in maps, 'libmxpipeline_cpu.so' in maps, 'libcuda' in maps,
       'omxcore.custom_ops' in sys.modules, 'pandas' in sys.modules)
 """)

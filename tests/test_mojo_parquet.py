@@ -907,14 +907,24 @@ def multi_page_file(path, pages, ptype=2, rep=0, text=False, group_rows=None, na
     Path(path).write_bytes(data)
 
 
-def refused_by_both(cells, path, message):
-    """read_parquet and the scan raise `message` (a normal error exit) under a 32 GB address-space cap, so a build that
-    allocates what the file claims would abort instead."""
+def address_space_cap():
+    """A preexec_fn that caps a child's address space at 32 GB; the test is skipped where the OS refuses RLIMIT_AS (macOS)."""
     import resource
 
     def cap():
         resource.setrlimit(resource.RLIMIT_AS, (32 << 30, 32 << 30))
 
+    try:
+        subprocess.run(["true"], check=True, preexec_fn=cap)
+    except (subprocess.SubprocessError, OSError):
+        pytest.skip("this OS refuses setrlimit(RLIMIT_AS) (macOS does), and the test needs the address-space cap")
+    return cap
+
+
+def refused_by_both(cells, path, message):
+    """read_parquet and the scan raise `message` (a normal error exit) under a 32 GB address-space cap, so a build that
+    allocates what the file claims would abort instead."""
+    cap = address_space_cap()
     for mode in ("read", "scan"):
         p = subprocess.run([str(cells), str(path), mode], capture_output=True, text=True, preexec_fn=cap)
         assert p.returncode == 1, (mode, p.returncode, p.stderr[-300:])
@@ -948,11 +958,7 @@ def footer_counts_file(path, groups):
 def test_footer_row_counts_that_are_negative_or_wrap_are_refused(cells, tmp_path, groups):
     """read_parquet sums the footer's counts to size its columns: a negative count or a sum past int64 is refused (a
     normal error exit, never an abort) under a 32 GB address-space cap, as the scan already was."""
-    import resource
-
-    def cap():
-        resource.setrlimit(resource.RLIMIT_AS, (32 << 30, 32 << 30))
-
+    cap = address_space_cap()
     path = tmp_path / "counts.parquet"
     footer_counts_file(path, groups)
     for mode in ("read", "scan"):

@@ -543,12 +543,13 @@ PEAK = textwrap.dedent("""
           .agg(col("v").sum().alias("sv"), (col("v") * col("q")).sum().alias("svq"), col("q").mean().alias("aq")))
     lf.schema                                       # imports and warms up before the peak is reset
     lf.compute(device="cpu")
-    open("/proc/self/clear_refs", "w").write("5")   # VmHWM starts again from the current size
-    base = status("VmRSS")
+    if sys.platform == "linux":                      # macOS has no /proc and no way to restart the peak
+        open("/proc/self/clear_refs", "w").write("5")   # VmHWM starts again from the current size
+    base = status("VmRSS") if sys.platform == "linux" else 0
     out = lf.compute(device=sys.argv[2])
     import omxcore
     print(json.dumps({"module": omxcore.__file__, "rows": out.num_rows, "path": lf.last_compile_provenance["path"],
-                      "arrow_peak": pa.default_memory_pool().max_memory(), "rss_peak_growth": status("VmHWM") - base}))
+                      "arrow_peak": pa.default_memory_pool().max_memory(), "rss_peak_growth": (status("VmHWM") - base) if sys.platform == "linux" else None}))
 """)
 
 
@@ -579,7 +580,8 @@ def test_peak_memory_is_bounded_by_the_budget_not_the_file(files):
     assert streamed["rows"] == whole["rows"] == 12
     assert streamed["arrow_peak"] < 40 << 20, streamed          # under the 40 MB budget
     assert whole["arrow_peak"] > 0.7 * decoded                  # the contrast: reading it whole holds the file
-    assert streamed["rss_peak_growth"] < 0.5 * whole["rss_peak_growth"], (streamed, whole)
+    if sys.platform == "linux":                                 # the resident peak of one call needs /proc and clear_refs (not on macOS)
+        assert streamed["rss_peak_growth"] < 0.5 * whole["rss_peak_growth"], (streamed, whole)
 
 
 # --- explain says what will happen ------------------------------------------------------------------------

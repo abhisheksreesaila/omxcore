@@ -371,6 +371,8 @@ def test_thread_budget_changes_actual_parallelism(aot):
     (the calling thread also runs a share, so up to five threads are busy)."""
     if (os.cpu_count() or 1) < 4:
         pytest.skip("needs >= 4 cores")
+    if not os.path.isdir("/proc/self/task"):
+        pytest.skip("counts busy threads from /proc/<pid>/task/<tid>/schedstat (Linux); macOS has no per-thread CPU time Python can read")
     n = 30_000_000
     a = np.ones(n, dtype=np.float32)
     mask = np.ones(n, dtype=np.int32)

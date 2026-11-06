@@ -428,12 +428,13 @@ PEAK = textwrap.dedent("""
          "WHERE l_q > 5 GROUP BY o_prio, l_flag")
     lf = mx.sql(q, o=scan_parquet(o), l=scan_parquet(l))
     lf.compute(device="cpu")                         # warm: the first run decodes and frees everything once
-    open("/proc/self/clear_refs", "w").write("5")
-    base = status("VmRSS")
+    if sys.platform == "linux":                      # macOS has no /proc and no way to restart the peak
+        open("/proc/self/clear_refs", "w").write("5")
+    base = status("VmRSS") if sys.platform == "linux" else 0
     pa.default_memory_pool().release_unused()
     out = lf.compute(device="cpu")
     print(json.dumps({"rows": out.num_rows, "path": lf.last_compile_provenance["path"],
-                      "arrow_peak": pa.default_memory_pool().max_memory(), "rss_peak_growth": status("VmHWM") - base}))
+                      "arrow_peak": pa.default_memory_pool().max_memory(), "rss_peak_growth": (status("VmHWM") - base) if sys.platform == "linux" else None}))
 """)
 
 
