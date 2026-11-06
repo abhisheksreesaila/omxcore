@@ -1967,3 +1967,21 @@ Evidence (random suite, omxcore ms / DuckDB ms under load; SQL from `scripts/gat
 ## F-208 `median` of a DECIMAL column has DuckDB's type [todo] (found 2026-11-06 while merging F-206 / F-207)
 - [ ] `median(x)` over DECIMAL(p, 2) comes back DECIMAL scale 3; DuckDB keeps scale 2 (`SELECT f.a % 5, median(f.x) ... GROUP BY ...` in tests/test_f207_join_bits.py's world). Match DuckDB's result type for median / quantile over DECIMAL, INT and DATE, with tests.
 - Seen too: `tests/test_f056_step3c.py::test_peak_memory_of_an_external_sort_is_bounded_by_the_budget` measured 4,207,680 bytes against a 4 MiB bound once under load; it passed on rerun.
+
+## F-209 omxcore builds and tests on macOS as committed [todo] (first real-Mac run, M4, 2026-11-06; report ~/.cache/night1105/mac-report.md)
+At 65a8ac9 the repo does not run on a Mac without local edits: mojo-test 39 ok / 6 FAIL, pytest 256 failed / 22,620 passed / 25 errors (Linux: 2 failed). Almost all are portability of the tests and tooling, not the engine.
+- [ ] `pixi.toml` gains osx-arm64; the `-rpath=` link flag in the build scripts and the two tests that build a tool takes Apple's form; GNU-only tools (`flock`, `ldd`) have a macOS path
+- [ ] the Python path's GPU check asks for a usable CUDA driver, not a library file (`pipeline_kernels.py:68`; 128 "libcuda not found" failures), and the co-processing / AUTO-split tests skip without NVIDIA (26)
+- [ ] the `/proc/self/status` readers under `mojo/tools` and `ru_maxrss` (bytes on macOS, KB on Linux, `test_star_lookups.py:246`) work on macOS (47); `RLIMIT_AS` tests skip where the OS refuses it (8); Linux library-path checks skip (11)
+- [ ] job tests (`test_jobs`, `test_sort_spill`, `test_permutation_spill`, `test_parquet_dict_race`) guard on whether jobs run on threads (the default Mac build runs a job inside `start_job`); `test_parquet_dict_race` hung 17 minutes there; `scripts/mojo_test.sh` gets a per-test timeout; `test_float.mojo:11` stops hard-coding a Linux home path
+- [ ] the Metal kernel library for the Python path (`libmxkernels_aot_gpu`) is skipped on Apple (Metal has no float64), not reported as a failed build
+
+## F-210 the CPU uses every core on macOS [todo, owner decision] (first real-Mac run, 2026-11-06)
+- Every non-Linux build runs the CPU kernels on one thread (`_fpenv.mojo:26`); `-D MXFRAME_JOB_THREADS` threads background jobs (a 2M-row zstd save went 426 → 91 ms, byte-identical). So `mx --device cpu` on the M4 uses 1 of 10 cores against DuckDB's 10. Decide: a threaded CPU pool on by default on macOS (pthread symbols, `scripts/check_mac_link.sh` updated) or behind a flag.
+
+## F-211 averages and DECIMAL→DOUBLE equal DuckDB on arm64 [todo] (first real-Mac run, 2026-11-06)
+- [ ] 33 pytest failures on the M4 are 1 ULP off DuckDB: measured on arm64, DuckDB 1.5.6 used `double(total) / n` in 106 of the 108 cases where the formulas differ, never the correctly rounded quotient the engine uses where there is no x87 (`np_arrow.py:431-444`, `sqleval.mojo:85`). Match DuckDB's formula per platform, with tests on both.
+
+## F-212 SQL comparisons on nullable columns run on the Apple GPU [todo] (first real-Mac run, 2026-11-06)
+- [ ] `WHERE qty > 3` over a column with NULLs is refused on the Apple GPU (`test_sql_gpu`): the NULL case lowers to a float compare (`sqlprog.mojo:653`) and the Apple integer-only check (`pipeline_gpu.mojo:744`) rejects it. Lower it to integer ops on Apple (NVIDIA unchanged).
+- Seen working on the M4: the Apple GPU ("Apple M4 · metal") equals the CPU on integer / DECIMAL shapes at 2M and 20k rows (slower than the CPU there: 24-90 ms vs 13-27); float32 on the GPU is refused by design (new work if wanted); Parquet UNCOMPRESSED / SNAPPY / ZSTD read and write bit-identical, pyarrow v1/v2 pages read.
