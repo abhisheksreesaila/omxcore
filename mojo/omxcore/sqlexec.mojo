@@ -1102,7 +1102,7 @@ def _join_side[P: Planner](mut catalog: Catalog, q: BoundQuery, t: Int, needed: 
 
 
 comptime DEFER_PASS_DEN = 2          # ... and when at least 1 row in this many passes its filter (else the few rows that pass are written: cheaper than probing them all)
-comptime STAR_RATIO = 4              # F-202: a star from the largest table when it has at least this many times the rows of any other table
+comptime STAR_RATIO = 3              # F-202: a star from the largest table when it has at least this many times the rows of any other table
 comptime STAR_MIN_ROWS = 100000
 comptime DEFER_MIN_ROWS = 65536      # a filtered table of at least this many rows is counted first and read unfiltered when it is the probe side of a fused join
 
@@ -1260,6 +1260,12 @@ def _star_plan(q: BoundQuery, js: JoinStats, jp: JoinPlan) raises -> Optional[Jo
             biggest_other = max(biggest_other, js.rows[t])
     if js.base_rows[fact] < STAR_MIN_ROWS or js.base_rows[fact] < STAR_RATIO * max(biggest_other, 1):
         return None
+    ref last = jp.steps[len(jp.steps) - 1]
+    if last.leaf == fact and not last.build_new:
+        return None                                               # the planner already ends with the fact table as the last join's probe side: that join is fused, nothing before it is large
+    for i in range(len(jp.steps)):                                # a fact table with no filter of its own that meets a small build side early leaves few rows (TPC-H Q2's part): the planner's plan reads it once and writes few
+        if jp.steps[i].leaf == fact and not (len(js.deferred) > 0 and js.deferred[fact]) and jp.steps[i].est_rows * 8 < js.base_rows[fact]:
+            return None
     var visited = List[Bool](length=n, fill=False)
     visited[fact] = True
     var order = List[Int]()
