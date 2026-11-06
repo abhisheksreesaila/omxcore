@@ -32,10 +32,10 @@ from .bind import (copy_query, Catalog, SqlSource, BoundQuery, SortKey, bind_sql
                    BExpr, AggSpec, KeySpec, pow10_checked)
 from .plan import LogicalPlan, build_plan, executable
 from .post import run_post
-from .join import (needed_columns, side_query, joined_query, virtual_schema, all_needed, needed_after, table_of_column, filter_query, final_query, count_query,
+from .join import (needed_columns, live_columns, side_query, joined_query, virtual_schema, all_needed, needed_after, table_of_column, filter_query, final_query, count_query,
                    with_probe_filter, final_needed, virtual_schema_multi, star_query)
 from .joincore import JoinKeys, JoinSide, KeyPlan, make_key_plan, column_ndv, normalize_keys, unmatchable_not_null, join_pairs, select_rows, gather_join, JoinPairs, JOIN_BUDGET_BYTES, build_budget_error, count_flags, apply_build_keep, compact_side
-from .kernels.hashjoin_cpu import hj_build, JoinMap, PM_SEMI, PM_ANTI, PM_ANTI_NA, PM_NONE
+from .kernels.hashjoin_cpu import hj_build, JoinMap, MODE_BITS, PM_SEMI, PM_ANTI, PM_ANTI_NA, PM_NONE
 from .kargs import KernelRun
 from .winsql import plan_windows, finish_windows, point_wide_columns, fix_wide_columns, WIN_TABLE
 from .jfront import EXPAND_MAX_REP, pred_reads_probe_only, FusedJoin, StageData, StreamStage, ProbeStream, chunk_join, stream_template, front_spec, jf_front
@@ -1945,7 +1945,8 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
                     fmode = PM_ANTI_NA
                     na_note = " (a NULL key is dropped)"
         t_build = perf_counter_ns()
-        m = hj_build(keys.bk_addr, keys.bo_addr, nb0, opts.threads, semi_anti)
+        var bits = kind == 0 and len(live_columns(qe, 0 if left_builds else 1)) == 0          # F-207: no build-side column is read: unique keys are one bit each
+        m = hj_build(keys.bk_addr, keys.bo_addr, nb0, opts.threads, semi_anti, bits)
         if fmode == PM_ANTI_NA and not streaming:
             unmatchable_not_null(keys, m.lo, m.hi, left.table, left.key_cols[0], left.table.rows())
         t_probe = perf_counter_ns()
@@ -1953,6 +1954,8 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
         fusable = opts.fuse and not keys.verify and not any_holistic and (m.unique or semi_anti or expands)
         if streaming and (kplan.hashed or fmode == PM_ANTI_NA):
             fusable = False                                          # (hashed tuples are verified per pair; NOT IN's unmatchable words are settled over the whole probe side)
+        if m.mode == MODE_BITS and not fusable:                      # a bitmap names no build row: the pairs of an unfused join need the usual map
+            m = hj_build(keys.bk_addr, keys.bo_addr, nb0, opts.threads, semi_anti)
         if defer_probe >= 0 and not fusable and pass_no == 1:
             # the join cannot be fused after all (repeated build keys, hashed keys): read the probe side filtered, as before
             if defer_probe == 0:

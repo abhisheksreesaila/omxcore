@@ -57,6 +57,20 @@ def live_roots(q: BoundQuery) -> List[Int]:
     return roots^
 
 
+def live_columns(q: BoundQuery, t: Int) -> List[Int]:
+    """F-207: the global columns of table `t` that the live expressions read (not the join keys). An inner join with unique keys whose build side has none
+    needs its partner only to exist: the build side is a bitmap of its keys."""
+    var cols = List[Bool](length=total_columns(q), fill=False)
+    var seen = List[Bool](length=len(q.rexprs), fill=False)
+    for r in live_roots(q):
+        _mark(q, r, cols, seen)
+    var out = List[Int]()
+    for c in range(q.tab_start[t], q.tab_start[t] + q.tab_cols[t]):
+        if cols[c]:
+            out.append(c)
+    return out^
+
+
 def needed_columns(q: BoundQuery, t: Int) -> List[Int]:
     """The global columns of table `t` the joined rows must carry: what the live expressions read, and the join keys."""
     var total = len(q.rexprs)
