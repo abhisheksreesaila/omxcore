@@ -95,6 +95,8 @@ struct ColStat(Copyable, Movable):
     var lo: Int64
     var hi: Int64
     var words: Int               # a TEXT column's dictionary size
+    var fixed: Bool              # F-207: the WHERE keeps only rows where the column equals `fixed_val` (a TEXT code, or the stored value): never NULL there
+    var fixed_val: Int64
 
     def __init__(out self, kind: Int, scale: Int):
         self.kind = kind
@@ -104,6 +106,8 @@ struct ColStat(Copyable, Movable):
         self.lo = 0
         self.hi = 0
         self.words = 0
+        self.fixed = False
+        self.fixed_val = 0
 
 
 struct Stats(Movable):
@@ -141,6 +145,7 @@ struct KeyLayout(Copyable, Movable):
     var src: Int                 # the source column of a plain-column key, else -1
     var words: Int               # hashed: key words (the value, and a NULL flag when nullable)
     var guarded: Bool            # dense: its range came from a file's footer statistics, so rows outside it are looked for
+    var fixed: Bool              # dense (F-207): the WHERE pins the key to `lo` (one slot, radix 1, never NULL): every row that reaches the key has that value
 
 
 struct PhysicalPlan(Movable):
@@ -633,14 +638,19 @@ struct RulePlanner(Planner, Copyable, Movable):
         for k in range(len(q.keys)):
             var e = q.rexprs[q.keys[k].expr].copy()
             var kind = e.kind
-            var layout = KeyLayout(q.keys[k].expr, kind, e.scale, True, 0, 1, 1, -1, 1, False)
+            var layout = KeyLayout(q.keys[k].expr, kind, e.scale, True, 0, 1, 1, -1, 1, False, False)
             if e.op == B_COL:
                 var c = Int(e.value)
                 layout.src = c
                 ref cs = st.cols[c]
                 layout.nullable = cs.nullable
                 var radix = 0
-                if kind == TEXT.value:
+                if cs.fixed:                                    # F-207: one value, one slot
+                    layout.fixed = True
+                    layout.nullable = False
+                    layout.lo = cs.fixed_val
+                    radix = 1
+                elif kind == TEXT.value:
                     radix = cs.words
                     layout.lo = 0
                 elif kind == BOOL.value:
@@ -683,14 +693,14 @@ struct RulePlanner(Planner, Copyable, Movable):
                     radix += 1
                 layout.radix = radix
             layout.words = 1 + (1 if layout.nullable else 0)
-            layout.guarded = st.kind == SRC_SCAN and kind != TEXT.value and kind != BOOL.value
+            layout.guarded = st.kind == SRC_SCAN and kind != TEXT.value and kind != BOOL.value and not layout.fixed
             if dense_ok:
                 if domain > (1 << 40) // max(layout.radix, 1):
                     dense_ok = False
                     why_not = "the domain passes 2^40 slots"
                 else:
                     domain *= layout.radix
-            parts += (" x " if k > 0 else "") + q.keys[k].name + " " + String(layout.radix) + (" (with a NULL slot)" if layout.nullable else "")
+            parts += (" x " if k > 0 else "") + q.keys[k].name + " " + String(layout.radix) + (" (with a NULL slot)" if layout.nullable else "") + (" (fixed by the WHERE)" if layout.fixed else "")
             plan.keys.append(layout^)
         var use_dense = False
         var reason = String()

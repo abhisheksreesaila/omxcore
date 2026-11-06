@@ -548,8 +548,8 @@ comptime TOPK_MAX = 4096                     # F-203: the most rows (LIMIT + OFF
 
 def _topk_groups(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, mut gids: List[Int]):
     """F-203: ORDER BY an aggregate with LIMIT: keeps the groups whose first sort value is as good as the LIMIT + OFFSET'th best (ties included), so the
-    finish builds columns for those alone and the stage after aggregation sorts them by every key and cuts as before. A NULL aggregate (its place
-    depends on NULLS FIRST / LAST) or an unreadable first key leaves `gids` untouched."""
+    finish builds columns for those alone and the stage after aggregation sorts them by every key and cuts as before. A NULL aggregate (a SUM / MIN / MAX
+    of no value) counts as the best or the worst value by NULLS FIRST / LAST (F-207: a sentinel past every Int128 sum); an unreadable first key leaves `gids` untouched."""
     var m = q.limit + q.offset
     if q.limit < 0 or len(q.order) == 0 or m <= 0 or m > TOPK_MAX or len(gids) <= 4 * m or len(gids) < TOPK_MIN_GROUPS:
         return
@@ -561,6 +561,7 @@ def _topk_groups(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial
         return
     _arm(acc, cond)
     var desc = o.desc
+    var null_v = (Int128.MAX if desc else Int128.MIN) if o.nulls_first else (Int128.MIN if desc else Int128.MAX)       # a NULL: better than every value, or worse
     # a heap of the m best values so far; its root is the worst of them
     var hv = List[Int128]()
     hv.reserve(m)
@@ -568,7 +569,7 @@ def _topk_groups(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial
         var is_null = False
         var v = _cond_value(cond, gids[i], is_null)
         if is_null:
-            return
+            v = null_v
         if len(hv) < m:
             hv.append(v)
             var c = len(hv) - 1
@@ -603,6 +604,8 @@ def _topk_groups(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial
     for i in range(len(gids)):
         var is_null = False
         var v = _cond_value(cond, gids[i], is_null)
+        if is_null:
+            v = null_v
         if (v >= thr) if desc else (v <= thr):
             keep.append(gids[i])
     gids = keep^
@@ -647,7 +650,7 @@ def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hre
                         vc.set_null(i)
                         continue
                     part -= 1
-                vc.v[i] = Int64(part) + (0 if (lay.kind == TEXT.value or lay.kind == BOOL.value) else lay.lo)
+                vc.v[i] = Int64(part) + (0 if ((lay.kind == TEXT.value or lay.kind == BOOL.value) and not lay.fixed) else lay.lo)
             else:
                 if lay.nullable and acc.kw[kwat + 1][gids[i]] != 0:
                     vc.set_null(i)
