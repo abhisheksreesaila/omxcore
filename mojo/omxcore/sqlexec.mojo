@@ -411,6 +411,10 @@ struct _Cond(Copyable, Movable):
     var nul: Int                     # the slot counting NULL arguments (-1: none)
     var code: Int                    # B_CMP's code: 20 <, 21 <=, 22 >, 23 >=, 24 =, 25 <>
     var lit: Int64
+    var ps: Int                      # the addresses of the slot lists, set by _arm (0: none)
+    var pn: Int
+    var ph: Int
+    var pc: Int
     var hi: Int                      # a SUM's slot of upper halves (F-192; the total is hi * 2^32 + the slot), -1 for none
 
     def __init__(out self, slot: Int, nul: Int, code: Int, lit: Int64, hi: Int):
@@ -419,6 +423,10 @@ struct _Cond(Copyable, Movable):
         self.code = code
         self.lit = lit
         self.hi = hi
+        self.ps = 0
+        self.pn = 0
+        self.ph = 0
+        self.pc = 0
 
 
 def _conds(q: BoundQuery, sp: SqlProgram, at: Int, mut out: List[_Cond]) -> Bool:
@@ -436,26 +444,67 @@ def _conds(q: BoundQuery, sp: SqlProgram, at: Int, mut out: List[_Cond]) -> Bool
         leaf = x.b
         lit = x.a
         code = 23 if code == 21 else 22 if code == 20 else 21 if code == 23 else 20 if code == 22 else code
-    ref l = q.pexprs[leaf]
     ref c = q.pexprs[lit]
-    if l.op != B_AGG or c.op != B_LIT or c.kind == FLOAT.value or c.kind == TEXT.value or c.kind == BOOL.value:
+    if q.pexprs[leaf].op != B_AGG or c.op != B_LIT or c.kind == FLOAT.value or c.kind == TEXT.value or c.kind == BOOL.value:
         return False
-    ref ag = q.aggs[Int(l.value)]
-    var a = Int(l.value)
-    if ag.hol or ag.kind == FLOAT.value or ag.kind == TEXT.value or ag.scale != c.scale or ag.kind != c.kind:
+    ref ag = q.aggs[Int(q.pexprs[leaf].value)]
+    if ag.scale != c.scale or ag.kind != c.kind:
+        return False
+    var cond = _Cond(-1, -1, code, c.value, -1)
+    if not _leaf_cond(q, sp, leaf, cond):
+        return False
+    out.append(cond^)
+    return True
+
+
+def _leaf_cond(q: BoundQuery, sp: SqlProgram, leaf: Int, mut out: _Cond) -> Bool:
+    """Where the aggregate leaf `leaf` keeps its value in the partial slots, when it is an integer / decimal / date COUNT, SUM, MIN or MAX."""
+    ref ag = q.aggs[Int(q.pexprs[leaf].value)]
+    var a = Int(q.pexprs[leaf].value)
+    if ag.hol or ag.kind == FLOAT.value or ag.kind == TEXT.value or ag.kind == BOOL.value:
         return False
     if ag.arg >= 0 and q.rexprs[ag.arg].kind == FLOAT.value:
         return False
     var f = ag.func
     if f == F_COUNT_STAR:
-        out.append(_Cond(-1, -1, code, c.value, -1))
+        out.slot = -1
+        out.nul = -1
+        out.hi = -1
     elif f == F_COUNT:
-        out.append(_Cond(-1, sp.agg_nul_slot[a], code, c.value, -1))
+        out.slot = -1
+        out.nul = sp.agg_nul_slot[a]
+        out.hi = -1
     elif f == F_SUM or f == F_MIN or f == F_MAX:
-        out.append(_Cond(sp.agg_val_slot[a], sp.agg_nul_slot[a], code, c.value, sp.agg_hi_slot[a] if f == F_SUM else -1))
+        out.slot = sp.agg_val_slot[a]
+        out.nul = sp.agg_nul_slot[a]
+        out.hi = sp.agg_hi_slot[a] if f == F_SUM else -1
     else:
         return False
     return True
+
+
+def _arm(acc: Partial, mut c: _Cond):
+    """Takes the addresses of the slot lists `c` reads, so a pass over millions of groups indexes raw memory."""
+    c.pc = Int(acc.counts.unsafe_ptr())
+    c.ps = Int(acc.slots[c.slot].unsafe_ptr()) if c.slot >= 0 else 0
+    c.pn = Int(acc.slots[c.nul].unsafe_ptr()) if c.nul >= 0 else 0
+    c.ph = Int(acc.slots[c.hi].unsafe_ptr()) if c.hi >= 0 else 0
+
+
+@always_inline
+def _cond_value(c: _Cond, g: Int, mut is_null: Bool) -> Int128:
+    """The aggregate's value for group `g` from its slots (`_arm` first); `is_null` is set when it is NULL (SUM / MIN / MAX over no value)."""
+    var rows = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=c.pc)[g]
+    var nulls = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=c.pn)[g] if c.pn != 0 else 0
+    if c.slot < 0:
+        return Int128(rows - nulls)
+    if rows - nulls == 0:
+        is_null = True
+        return Int128(0)
+    var v = Int128(Int64(UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=c.ps)[g]))
+    if c.ph != 0:
+        v += Int128(Int64(UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=c.ph)[g])) << Int128(32)
+    return v
 
 
 def _having_groups(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, mut gids: List[Int]) -> Int:
@@ -464,6 +513,8 @@ def _having_groups(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Parti
     var conds = List[_Cond]()
     if plan.group == G_NONE or q.having < 0 or not _conds(q, sp, q.having, conds):
         return -1
+    for i in range(len(conds)):
+        _arm(acc, conds[i])
     var total = plan.domain if plan.group == G_DENSE else acc.groups()
     var existing = 0
     for g in range(total):
@@ -473,15 +524,11 @@ def _having_groups(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Parti
         existing += 1
         var keep = True
         for i in range(len(conds)):
-            var nulls = acc.slots[conds[i].nul][g] if conds[i].nul >= 0 else 0
-            var v = Int128(rows - nulls)
-            if conds[i].slot >= 0:
-                if rows - nulls == 0:
-                    keep = False                                   # NULL
-                    break
-                v = Int128(Int64(acc.slots[conds[i].slot][g]))
-                if conds[i].hi >= 0:
-                    v += Int128(Int64(acc.slots[conds[i].hi][g])) << Int128(32)
+            var is_null = False
+            var v = _cond_value(conds[i], g, is_null)
+            if is_null:
+                keep = False
+                break
             var c = conds[i].code
             var y = Int128(conds[i].lit)
             if not (v < y if c == 20 else v <= y if c == 21 else v > y if c == 22 else v >= y if c == 23 else v == y if c == 24 else v != y):
@@ -490,6 +537,72 @@ def _having_groups(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Parti
         if keep:
             gids.append(g)
     return existing
+
+
+comptime TOPK_MIN_GROUPS = 1024
+comptime TOPK_MAX = 4096                     # F-203: the most rows (LIMIT + OFFSET) kept on the slots; past it the stage after aggregation sorts as before
+
+
+def _topk_groups(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, mut gids: List[Int]):
+    """F-203: ORDER BY an aggregate with LIMIT: keeps the groups whose first sort value is as good as the LIMIT + OFFSET'th best (ties included), so the
+    finish builds columns for those alone and the stage after aggregation sorts them by every key and cuts as before. A NULL aggregate (its place
+    depends on NULLS FIRST / LAST) or an unreadable first key leaves `gids` untouched."""
+    var m = q.limit + q.offset
+    if q.limit < 0 or len(q.order) == 0 or m <= 0 or m > TOPK_MAX or len(gids) <= 4 * m or len(gids) < TOPK_MIN_GROUPS:
+        return
+    var o = q.order[0].copy()
+    if q.pexprs[o.expr].op != B_AGG:
+        return
+    var cond = _Cond(-1, -1, 0, 0, -1)
+    if not _leaf_cond(q, sp, o.expr, cond):
+        return
+    _arm(acc, cond)
+    var desc = o.desc
+    # a heap of the m best values so far; its root is the worst of them
+    var hv = List[Int128]()
+    hv.reserve(m)
+    for i in range(len(gids)):
+        var is_null = False
+        var v = _cond_value(cond, gids[i], is_null)
+        if is_null:
+            return
+        if len(hv) < m:
+            hv.append(v)
+            var c = len(hv) - 1
+            while c > 0:
+                var par = (c - 1) // 2
+                if (hv[c] < hv[par]) if desc else (hv[c] > hv[par]):
+                    var t = hv[c]
+                    hv[c] = hv[par]
+                    hv[par] = t
+                    c = par
+                else:
+                    break
+        elif (v > hv[0]) if desc else (v < hv[0]):
+            hv[0] = v
+            var c = 0
+            while True:
+                var l = 2 * c + 1
+                var r = l + 1
+                var w = c
+                if l < m and ((hv[l] < hv[w]) if desc else (hv[l] > hv[w])):
+                    w = l
+                if r < m and ((hv[r] < hv[w]) if desc else (hv[r] > hv[w])):
+                    w = r
+                if w == c:
+                    break
+                var t = hv[c]
+                hv[c] = hv[w]
+                hv[w] = t
+                c = w
+    var thr = hv[0]
+    var keep = List[Int]()
+    for i in range(len(gids)):
+        var is_null = False
+        var v = _cond_value(cond, gids[i], is_null)
+        if (v >= thr) if desc else (v <= thr):
+            keep.append(gids[i])
+    gids = keep^
 
 
 def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hres: HolResult, hol_of: List[Int],
@@ -509,6 +622,11 @@ def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hre
     else:
         for g in range(acc.groups()):
             gids.append(g)
+    if plan.group != G_NONE and q.limit >= 0 and (q.having < 0 or having_total >= 0):
+        var before = len(gids)
+        _topk_groups(q, plan, sp, acc, gids)
+        if len(gids) < before:
+            notes.append("order: top " + commas(q.limit + q.offset) + " found on the groups' partial slots, " + commas(len(gids)) + " of " + commas(before) + " groups kept")
     var n = len(gids)
     var t_b = perf_counter_ns()
     # group keys

@@ -94,6 +94,16 @@ QUERIES = [
     "select uid, sum(wide) from t group by uid having sum(wide) >= 3000000000000000.00 and count(*) > 2 order by uid",
     "select txt, min(a), max(a) from t group by txt having min(a) > 100 and max(a) < 19900 order by txt",
     "select skew, sum(a) from t group by skew having sum(a) = 12345 order by skew",
+    # ORDER BY an aggregate LIMIT: ties at the cut, both directions, DECIMAL / INT / COUNT / MIN / MAX, OFFSET, a HAVING first
+    "select nul, count(*) c from t group by nul order by c desc, nul limit 15",
+    "select nul, count(*) c from t group by nul order by c, nul limit 15 offset 4",
+    "select uid, max(a) m from t group by uid order by m desc, uid limit 12",
+    "select uid, min(a) m from t group by uid order by m, uid desc limit 12",
+    "select uid, sum(wide) s from t group by uid order by s desc, uid limit 9",
+    "select txt, sum(a) s, count(*) c from t group by txt order by s, txt limit 25",
+    "select uid, sum(a) s from t group by uid having sum(a) > 20000 order by s desc, uid limit 5",
+    "select uid, sum(a) s from t group by uid order by s desc, uid limit 3000",
+    "select uid, count(*) c from t group by uid order by c desc limit 1",
     # 128-bit sums
     "select skew, sum(wide) s from t group by skew having sum(wide) > 90000000000000000.00 order by skew",
     "select uid, sum(wide) s from t group by uid having sum(wide) > 1000000000000000.00 order by uid",
@@ -138,3 +148,33 @@ def test_simple_having_is_decided_on_the_partial_slots(mx, world):
     assert any(n.startswith("having: ") and "(decided on the groups' partial slots" in n for n in res["notes"]), res["notes"]
     res = run_mx(mx, ["sql", "--max-rows", "0", "select uid from t group by uid having sum(a) > count(*) * 10000"], world["files"])
     assert not any("partial slots" in n for n in res["notes"]), res["notes"]
+
+
+def test_decimal_having_takes_the_slot_path(mx, world):
+    """Q18's shape: `sum(decimal) > constant` is decided on the partial slots (the note says so) and equals DuckDB."""
+    sql = "select nul from t group by nul having sum(d) > 200"
+    res = run_mx(mx, ["sql", "--max-rows", "0", sql], world["files"])
+    assert any(n.startswith("having: ") and "(decided on the groups' partial slots" in n for n in res["notes"]), res["notes"]
+    check(mx, sql + " order by nul", world["con"], world["files"], ordered=True)
+
+
+def test_order_by_aggregate_limit_is_cut_on_the_slots(mx, world):
+    res = run_mx(mx, ["sql", "--max-rows", "0", "select uid, sum(a) s from t group by uid order by s desc, uid limit 10"], world["files"])
+    assert any(n.startswith("order: top 10 found on the groups' partial slots") for n in res["notes"]), res["notes"]
+
+
+FALLBACK_TOPK = [
+    # some groups have only NULL d: a NULL first-key value sends the cut back to the old path, in both NULL orders
+    "select uid, sum(d) s from t group by uid order by s desc nulls first, uid limit 10",
+    "select uid, sum(d) s from t group by uid order by s desc nulls last, uid limit 10",
+    "select uid, max(d) m from t group by uid order by m nulls first, uid limit 10",
+    # a HAVING the slots cannot decide (OR) leaves the old path too
+    "select uid, sum(a) s from t group by uid having sum(a) > 30000 or count(*) > 4 order by s desc, uid limit 10",
+]
+
+
+@pytest.mark.parametrize("sql", FALLBACK_TOPK)
+def test_a_top_k_the_slots_cannot_cut_falls_back_and_equals_duckdb(mx, world, sql):
+    check(mx, sql, world["con"], world["files"], ordered=True)
+    res = run_mx(mx, ["sql", "--max-rows", "0", sql], world["files"])
+    assert not any("found on the groups' partial slots" in n for n in res["notes"]), res["notes"]
