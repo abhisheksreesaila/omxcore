@@ -485,6 +485,14 @@ struct _Emitter(Movable):
         self.p.emit(OP_LOAD_CONST, r, self.p.const(Int64(x.to_bits())))
         return r
 
+    def null_value(mut self, fl: Bool = False) raises -> V:
+        """The value of a NULL: 0 with its NULL flag set. The flag is the result of `0 == 0`, a boolean as every device makes it (1.0 on
+        the float word, 1 on an Apple GPU's Int64 word); a float constant 1.0 is the bits 0x3FF0... there, and a count of it passed int64 (F-212)."""
+        var z = self.const_i(0)
+        var flag = self.tmp()
+        self.ins(OP_ICMP, flag, z, z, C_EQ)
+        return V(z, flag, False, fl)
+
     def or_nul(mut self, a: Int, b: Int) -> Int:
         if a < 0:
             return b
@@ -551,7 +559,7 @@ struct _Emitter(Movable):
         if x.op == B_LIT:
             return V(self.const_i(x.value), -1, False, x.kind == FLOAT.value)       # (a float literal's value is its bits: the constant pool holds bits)
         if x.op == B_NULL:
-            return V(self.const_i(0), self.const_f(1.0), False)
+            return self.null_value()
         if x.op == B_RESCALE:
             var a = self.value(x.a)
             var k = self.const_i(pow10_checked(Int(x.value)))
@@ -647,12 +655,91 @@ struct _Emitter(Movable):
 
     def truth(mut self, cond: Int) raises -> Int:
         """A register that is 1.0 where the condition is true and 0.0 where it is false or unknown."""
+        if self.known_ok(cond) and self.may_be_unknown(cond):
+            return self.known(cond, True)
         var w = self.boolean(cond)
         if w.unk:
             var one = self.const_f(1.0)
             self.ins(24, w.reg, w.reg, one)
             self.free(one)
         return w.reg
+
+    # -- F-212: a condition over nullable columns without the 0.5 of three-valued logic ------------------------------------------------
+    # `boolean()` keeps an unknown as 0.5 in a float register and `truth` compares it with 1.0 (a float compare): a program the Apple GPU's
+    # Int64 word cannot run. Where only "is it definitely true" is asked (a WHERE, a CASE's WHEN) and the condition is built of comparisons,
+    # AND, OR, NOT and IS NULL, it needs no unknown: `known(e, True)` is 1 where e is true and `known(e, False)` where e is false, and a
+    # comparison with a NULL operand is neither. AND / OR / NOT of the two kinds are the plain integer ops (a NOT swaps what is asked,
+    # an AND asked for false is an OR of the falses). The instructions are the integer ones every device runs (ICMP, ISNULL, AND, OR,
+    # NOT, SELECT), fewer than the float form (no 0.5, no float compare, no short-circuit guard registers).
+    def known_ok(self, e: Int) -> Bool:
+        """The condition is built of nodes `known` lowers, none of which can raise an error flag (so no short-circuit guard is needed)."""
+        var x = self.rx[e].copy()
+        if x.op == B_AND or x.op == B_OR:
+            return self.known_ok(x.a) and self.known_ok(x.b)
+        if x.op == B_NOT:
+            return self.known_ok(x.a)
+        if x.op == B_LIT:
+            return True
+        if x.op == B_ISNULL:
+            return self.operand_ok(x.a)
+        if x.op == B_CMP:
+            return self.operand_ok(x.a) and self.operand_ok(x.b)
+        return False
+
+    def operand_ok(self, e: Int) -> Bool:
+        """A comparison operand `known` can lower: a column, a literal or + - * of those, over numbers, dates or text (not a condition)."""
+        var x = self.rx[e].copy()
+        if x.kind == BOOL.value or x.kind == FLOAT.value:
+            return False
+        if x.op == B_COL or x.op == B_LIT or x.op == B_STR:
+            return True
+        if x.op == B_ADD or x.op == B_SUB or x.op == B_MUL:
+            return self.operand_ok(x.a) and self.operand_ok(x.b)
+        return False
+
+    def may_be_unknown(self, e: Int) -> Bool:
+        """A column the condition reads may hold NULL: only then is there an unknown to take care of."""
+        var x = self.rx[e].copy()
+        if x.op == B_COL:
+            return self.nullable[Int(x.value)]
+        if x.op == B_AND or x.op == B_OR or x.op == B_CMP or x.op == B_ADD or x.op == B_SUB or x.op == B_MUL:
+            return self.may_be_unknown(x.a) or self.may_be_unknown(x.b)
+        if x.op == B_NOT:
+            return self.may_be_unknown(x.a)
+        return False
+
+    def known(mut self, e: Int, want: Bool) raises -> Int:
+        """A register that is 1 where the condition (see `known_ok`) is definitely `want` (true or false) and 0 where it is the other or unknown."""
+        var x = self.rx[e].copy()
+        if x.op == B_AND or x.op == B_OR:
+            var a = self.known(x.a, want)
+            var b = self.known(x.b, want)
+            self.ins(OP_AND if (x.op == B_AND) == want else OP_OR, a, a, b)
+            self.free(b)
+            return a
+        if x.op == B_NOT:
+            return self.known(x.a, not want)
+        if x.op == B_LIT:
+            return self.const_i(Int64(1) if (x.value != 0) == want else Int64(0))
+        if x.op == B_ISNULL:
+            var v = self.value(x.a)
+            self.free(v.reg)
+            if v.nul < 0:
+                return self.const_i(Int64(0) if want else Int64(1))
+            if not want:
+                self.ins(OP_NOT, v.nul, v.nul)
+            return v.nul
+        var t = self.cmp_raw(x.a, x.b, Int(x.value))             # B_CMP
+        var r = t[0]
+        if not want:
+            self.ins(OP_NOT, r, r)
+        var nul = self.or_nul(t[1], t[2])
+        if nul >= 0:                                              # a NULL operand: neither true nor false
+            var zero = self.const_i(0)
+            self.ins(OP_SELECT, r, nul, zero, r)
+            self.free(zero)
+            self.free(nul)
+        return r
 
     def blend(mut self, mask: Int, a: V, b: V) raises -> V:
         """mask != 0 ? a : b, value and NULL flag. Frees a and b; the mask stays."""
@@ -1015,7 +1102,7 @@ struct _Emitter(Movable):
         var x = self.rx[node].copy()
         if not text or x.op == B_NULL:
             if x.op == B_NULL:
-                return V(self.const_i(0), self.const_f(1.0), False, x.kind == FLOAT.value)
+                return self.null_value(x.kind == FLOAT.value)
             return self.value(node)
         if x.op == B_STR:
             return V(self.const_i(Int64(u.lit[j])), -1, False)
@@ -2219,16 +2306,22 @@ struct _Emitter(Movable):
             return self.compare(x)
         if x.op == B_AND or x.op == B_OR:
             var a = self.boolean(x.a)
-            var decided = self.tmp()                                  # where the left side leaves the right one to matter: AND: not false, OR: not true
-            var kconst = self.const_f(0.0 if x.op == B_AND else 1.0)
-            self.ins(25, decided, a.reg, kconst, 0)
-            self.free(kconst)
+            var decided = a.reg                                       # where the left side leaves the right one to matter: AND: not false, OR: not true
+            if a.unk:
+                decided = self.tmp()                                  # (0.5 is neither: a float compare)
+                var kconst = self.const_f(0.0 if x.op == B_AND else 1.0)
+                self.ins(25, decided, a.reg, kconst, 0)
+                self.free(kconst)
+            elif x.op == B_OR:
+                decided = self.tmp()                                  # a definite boolean: AND where it is true (itself), OR where it is false (its NOT): integer ops only (F-212)
+                self.ins(OP_NOT, decided, a.reg)
             var saved_guard = self.guard
             self.guard = self.guard_with(decided)
             var b = self.boolean(x.b)
             self.free(self.guard)
             self.guard = saved_guard
-            self.free(decided)
+            if decided != a.reg:
+                self.free(decided)
             if not a.unk and not b.unk:
                 self.ins(OP_AND if x.op == B_AND else OP_OR, a.reg, a.reg, b.reg)
             else:                                                 # the minimum / the maximum
@@ -2490,12 +2583,7 @@ def lower_sql(q: BoundQuery, plan: PhysicalPlan, var nullable: List[Bool], var p
         e.ins(OP_NOT, mask, mask)
         e.guard = mask
     if q.where >= 0:
-        var w = e.boolean(q.where)
-        if w.unk:
-            var one = e.const_f(1.0)
-            e.ins(24, w.reg, w.reg, one)                         # == 1.0: unknown and false both drop the row
-            e.free(one)
-        pred = w.reg
+        pred = e.truth(q.where)                                   # unknown and false both drop the row
     e.guard = -1
     if masked:
         if pred >= 0:
@@ -2894,12 +2982,7 @@ def lower_rows(q: BoundQuery, computed: List[Int], var nullable: List[Bool], var
         e.ins(OP_NOT, mask, mask)
         e.guard = mask
     if q.where >= 0:
-        var w = e.boolean(q.where)
-        if w.unk:
-            var one = e.const_f(1.0)
-            e.ins(24, w.reg, w.reg, one)
-            e.free(one)
-        pred = w.reg
+        pred = e.truth(q.where)
     e.guard = -1
     if masked:
         if pred >= 0:

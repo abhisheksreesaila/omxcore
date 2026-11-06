@@ -22,7 +22,7 @@ from .table import Table, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, Wor
 from .frame import _radix_order_job, text_ranks
 from .job import JobCtl
 from .holistic import float_key
-from .sqleval import float_bits, ld_div_wide
+from .sqleval import float_bits, avg_div
 from .wide import wide_lo, wide_hi
 from .fan import ParTask, run_tasks
 from .sql import FM_NONE, FM_ROWS, FM_RANGE, FB_UNB_PREC, FB_PREC, FB_CUR, FB_FOL, FB_UNB_FOL
@@ -790,10 +790,7 @@ def _eval_agg(c: _Ctx, fr: _FnRun, ps: Int, pe: Int):
             if is_float:
                 _put(fr, row, float_bits(facc / Float64(cnt)))
             else:
-                var den = UInt128(cnt)
-                for _ in range(fr.scale):
-                    den *= UInt128(10)
-                _put(fr, row, float_bits(ld_div_wide(acc, den)))
+                _put(fr, row, float_bits(avg_div(acc, Int(cnt), fr.scale)))
         else:                                                              # min / max: the deque's front
             var v = argv[perm[dq[head]]]
             if is_float and Float64(from_bits=UInt64(v)) != Float64(from_bits=UInt64(v)):
