@@ -1,7 +1,7 @@
 # F-153: the hash join kernel (kernels_aot/hashjoin_cpu.mojo) against a plain dictionary, on every layout it chooses.
 from std.collections import Dict
 from omxcore.kernels.hashjoin_cpu import (JoinMap, hj_build, hj_probe_unique, hj_probe_pairs, hj_probe_block, MapView, hj_release, MODE_DIRECT, MODE_HASH,
-                                          MODE_EMPTY, E_BUDGET, hj_probe_select, hj_filter_block, hj_probe_left_block, PM_SEMI, PM_ANTI, PM_ANTI_NA, PM_NONE)
+                                          MODE_EMPTY, MODE_BITS, E_BUDGET, hj_probe_select, hj_filter_block, hj_probe_left_block, PM_SEMI, PM_ANTI, PM_ANTI_NA, PM_NONE)
 from omxcore.kernels.hashjoin_cpu import IP, LP, BP
 
 
@@ -206,6 +206,62 @@ def check(name: String, build: List[Int64], build_ok: List[UInt8], probe: List[I
     print("  ok", name, "->", m.kind())
 
 
+def check_bits(name: String, build: List[Int64], build_ok: List[UInt8], probe: List[Int64], probe_ok: List[UInt8], want_bits: Bool, threads: Int) raises:
+    """F-207: `hj_build(bits=True)`: unique keys over a range under 2^26 are one bit each (MODE_BITS), anything else builds as usual; every lookup form agrees with
+    a dictionary on which probe rows have a partner."""
+    var nb = len(build)
+    var np = len(probe)
+    var truth = Dict[Int64, Int]()
+    for i in range(nb):
+        if len(build_ok) > 0 and build_ok[i] == 0:
+            continue
+        truth[build[i]] = i
+    var bok = Int(build_ok.unsafe_ptr()) if len(build_ok) > 0 else 0
+    var pok = Int(probe_ok.unsafe_ptr()) if len(probe_ok) > 0 else 0
+    var m = hj_build(Int(build.unsafe_ptr()), bok, nb, threads, False, True)
+    expect((m.mode == MODE_BITS) == want_bits, name + ": layout " + m.kind())
+    var present = List[Bool]()
+    var n_present = 0
+    for i in range(np):
+        var hit = not (len(probe_ok) > 0 and probe_ok[i] == 0) and probe[i] in truth
+        present.append(hit)
+        n_present += 1 if hit else 0
+    # unique lookups: a partner or -1 (the bits map names no row, any non-negative number)
+    if m.unique:
+        var res = List[Int32](length=np, fill=-9)
+        hj_probe_unique(m, Int(probe.unsafe_ptr()), pok, np, Int(res.unsafe_ptr()), threads)
+        for i in range(np):
+            expect((Int(res[i]) >= 0) == present[i], name + ": unique lookup " + String(i))
+        var sel = List[Int32](length=np, fill=0)
+        for i in range(np):
+            sel[i] = Int32(i)
+        var prow = List[Int32](length=np, fill=-5)
+        var kept = hj_probe_block(MapView(m), LP(unsafe_from_address=Int(probe.unsafe_ptr())), BP(unsafe_from_address=pok if pok != 0 else Int(probe.unsafe_ptr())),
+                                  pok != 0, 0, IP(unsafe_from_address=Int(sel.unsafe_ptr())), np, IP(unsafe_from_address=Int(prow.unsafe_ptr())), True)
+        expect(kept == n_present, name + ": block kept " + String(kept) + " wanted " + String(n_present))
+        var q = 0
+        for i in range(np):
+            if present[i]:
+                expect(Int(sel[q]) == i and Int(prow[i]) >= 0, name + ": block row " + String(q))
+                q += 1
+        # semi / anti over the whole probe side and in blocks
+        for fm in [PM_SEMI, PM_ANTI]:
+            var so = List[Int64](length=2, fill=0)
+            _ = hj_probe_select(m, Int(probe.unsafe_ptr()), pok, np, threads, fm, Int(so.unsafe_ptr()))
+            expect(Int(so[0]) == (n_present if fm == PM_SEMI else np - n_present), name + ": select mode " + String(fm))
+            hj_release(Int(so[1]))
+        var lsel = List[Int32](length=np, fill=0)
+        for i in range(np):
+            lsel[i] = Int32(i)
+        var lrow = List[Int32](length=np, fill=7)
+        hj_probe_left_block(MapView(m), LP(unsafe_from_address=Int(probe.unsafe_ptr())), BP(unsafe_from_address=pok if pok != 0 else Int(probe.unsafe_ptr())),
+                            pok != 0, 0, IP(unsafe_from_address=Int(lsel.unsafe_ptr())), np, IP(unsafe_from_address=Int(lrow.unsafe_ptr())))
+        expect(Int(lsel[np - 1]) == np - 1, name + ": left block leaves every row selected")
+        for i in range(np):
+            expect((Int(lrow[i]) >= 0) == present[i], name + ": left block row " + String(i))
+    print("  ok", name, "->", m.kind())
+
+
 def main() raises:
     var rng = Rng(12345)
     var none_b = List[UInt8]()
@@ -266,4 +322,37 @@ def main() raises:
         var one = List[Int64]()
         one.append(42)
         check("one row t" + String(threads), one, none_b, one, none_p, MODE_DIRECT, True, threads)
+    for threads in [1, 4]:
+        # F-207 bits: unique keys spread over 140,000 values (too sparse for a direct array at 8x rows is not needed: bits win either way), NULL build and probe keys
+        var bb = make_keys(rng, 20000, 0, 1000, 7, True)
+        var bbok = List[UInt8](length=20000, fill=1)
+        for i in range(0, 20000, 9):
+            bbok[i] = 0
+        var pb = make_keys(rng, 30000, 22000, 990, 3, False)
+        var pbok = List[UInt8](length=30000, fill=1)
+        for i in range(0, 30000, 4):
+            pbok[i] = 0
+        check_bits("bits unique t" + String(threads), bb, bbok, pb, pbok, True, threads)
+        check_bits("bits unique, no NULL keys t" + String(threads), bb, none_b, pb, none_p, True, threads)
+        # a repeated key among the usable rows: not unique, built as usual
+        var br = make_keys(rng, 20000, 5000, 1000, 7, False)
+        check_bits("bits, repeated keys t" + String(threads), br, none_b, pb, none_p, False, threads)
+        # a repeat only on a row that is not usable does not count
+        var bn = make_keys(rng, 5000, 0, 100, 3, True)
+        var bnok = List[UInt8](length=5000, fill=1)
+        bn.append(bn[0])
+        bnok.append(0)
+        check_bits("bits, a repeat on an unusable row t" + String(threads), bn, bnok, pb, none_p, True, threads)
+        # a range past 2^26 values: the bitmap would be too big, the usual layout
+        var bw = make_keys(rng, 3000, 0, -4000000000000, 1000003, True)
+        check_bits("bits, a wide range t" + String(threads), bw, none_b, bw, none_p, False, threads)
+        # extreme keys: the span overflows, the usual layout
+        var bx = List[Int64]()
+        bx.append(Int64.MAX)
+        bx.append(Int64.MIN)
+        check_bits("bits, extreme keys t" + String(threads), bx, none_b, bx, none_p, False, threads)
+        # one key: a one-bit map
+        var b1k = List[Int64]()
+        b1k.append(42)
+        check_bits("bits, one key t" + String(threads), b1k, none_b, b1k, none_p, True, threads)
     print("ok test_hashjoin")

@@ -2388,7 +2388,12 @@ def _run_star[P: Planner](mut catalog: Catalog, q: BoundQuery, mut leaves: List[
             kplan = make_key_plan(stage_leaf.table, psrc.table, rkey, lkey, pw, pal, keys)
         else:
             normalize_keys(stage_leaf.table, probe, rkey, lkey, keys, threads)
-        var m = hj_build(keys.bk_addr, keys.bo_addr, stage_leaf.table.rows(), threads)
+        var no_cols = True                                          # F-207: no column of this dimension is read (a filter-only or key-only dimension): its keys are one bit each
+        for c in range(stage_leaf.table.columns()):
+            var g = stage_leaf.gtable[c]
+            if g >= 0 and need[g]:
+                no_cols = False
+        var m = hj_build(keys.bk_addr, keys.bo_addr, stage_leaf.table.rows(), threads, False, no_cols)
         if keys.verify or kplan.hashed or not m.unique:
             res.notes.append("star: " + label + " has " + ("hashed keys" if (keys.verify or kplan.hashed) else "repeated keys") + ": the joins run one by one")
             return False
