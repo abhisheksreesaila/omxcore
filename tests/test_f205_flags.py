@@ -175,3 +175,60 @@ def test_dim_frame_with_changed_rows_is_read_as_before(probe, world, sql):
     res, cur = run_frame(probe, world, sql, ["fact", "dim"], "dim_changed")
     same(res, cur, sql, "dim frame, changes")
     assert not has(res, FLAG), res["notes"]
+
+
+# ── every entry point on one world: SQL over tables, SQL over edited Frames, the builder over tables and over Frames ────────────
+
+from test_f204_builder_join import (probes, run, sql_rows, builder_rows, same as same_rows, fast, make_edits as make_int_edits, write, FACT_SPEC, DIM_SPEC, sql_text, GROUPS)   # noqa: F401,E402
+
+
+def big_int_world(tmp_path, seed):
+    rnd = random.Random(seed)
+    n, m = 150000, 90000
+    fact = [[i, None if rnd.random() < 0.04 else rnd.randrange(0, 60000), rnd.randrange(0, GROUPS), None if rnd.random() < 0.05 else rnd.randrange(0, 1000)] for i in range(n)]
+    dim = [[None if rnd.random() < 0.03 else rnd.randrange(0, 45000), None if rnd.random() < 0.08 else rnd.randrange(0, 100), rnd.randrange(0, 6)] for _ in range(m)]
+    write(tmp_path / "fact_base.parquet", ["id", "k", "g", "v"], fact)
+    write(tmp_path / "dim_base.parquet", ["dk", "w", "h"], dim)
+    (tmp_path / "f.edits").write_text(make_int_edits(rnd, fact, FACT_SPEC, 300, 80, 200))
+    (tmp_path / "d.edits").write_text(make_int_edits(rnd, dim, DIM_SPEC, 0, 0, 150))         # the dimension: removed rows only
+    write(tmp_path / "fact.parquet", ["id", "k", "g", "v"], fact)
+    write(tmp_path / "dim.parquet", ["dk", "w", "h"], dim)
+    return fact, dim
+
+
+ENTRY_SHAPES = [
+    ("inner, the filtered dimension builds", "inner", "w>10", "count,sum:v,sum:w"),
+    ("inner, a filter on each side", "inner", "w>10;v<500", "count,sum:w,mean:v"),
+    ("left, the filter on the dimension", "left", "w>10", "count,sum:v,countof:w"),
+]
+
+
+@pytest.mark.parametrize("seed", [0, 1])
+def test_every_entry_point_equals_duckdb_on_a_big_world(probes, tmp_path, seed):
+    fact, dim = big_int_world(tmp_path, seed)
+    con = oracle_connection()
+    con.execute("create table fact(id bigint, k bigint, g bigint, v bigint)")
+    con.execute("create table dim(dk bigint, w bigint, h bigint)")
+    con.executemany("insert into fact values (?, ?, ?, ?)", [r for r in fact if r is not None])
+    con.executemany("insert into dim values (?, ?, ?)", [r for r in dim if r is not None])
+    sqlp, bp = probes["sql_probe"], probes["builder_probe"]
+    t = tmp_path
+    for name, how, where, aggs in ENTRY_SHAPES:
+        sql = sql_text(how, where, aggs, True)
+        want = con.execute(sql).fetchall()
+        what = f"{name} (seed {seed})"
+        a = run(sqlp, ["--mode", "table", sql, f"fact={t}/fact.parquet", f"dim={t}/dim.parquet"])
+        same_rows(sql_rows(a), want, "(a) sql table: " + what)
+        fast(a, "(a) " + what)
+        assert has(a, FLAG) == (how == "inner"), (what, a["notes"])        # (a left join filtered in WHERE is an inner join: its filter is on the right side too)
+        b = run(sqlp, ["--mode", "frame", "--edits", str(t / "f.edits"), "--redits", str(t / "d.edits"), sql, f"fact={t}/fact_base.parquet", f"dim={t}/dim_base.parquet"])
+        same_rows(sql_rows(b), want, "(b) sql frame: " + what)
+        fast(b, "(b) " + what)
+        common = ["--how", how, "--on", "k=dk", "--aggs", aggs, "--where", where, "--group", f"g:{GROUPS}"]
+        c = run(bp, ["--mode", "table"] + common + [f"left={t}/fact.parquet", f"right={t}/dim.parquet"])
+        same_rows(builder_rows(c, True), want, "(c) builder table: " + what)
+        fast(c, "(c) " + what)
+        d = run(bp, ["--mode", "frame", "--edits", str(t / "f.edits"), "--right-mode", "frame", "--redits", str(t / "d.edits")] + common +
+                [f"left={t}/fact_base.parquet", f"right={t}/dim_base.parquet"])
+        same_rows(builder_rows(d, True), want, "(d) builder frame: " + what)
+        fast(d, "(d) " + what)

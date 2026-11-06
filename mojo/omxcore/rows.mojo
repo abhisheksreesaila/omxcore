@@ -23,7 +23,7 @@ from .job import JobCtl, STAGE_AGGREGATE, STAGE_FINISH, STAGE_SORT, STAGE_WRITE 
 from .sortspill import SpillSort, run_row_cap, sort_budget_bytes      # F-167
 from .parquet import ParquetWriter, WRITE_BUDGET
 from .query import Program, MAGIC, SRC_WORDS, CTL_REG, OVERFLOW_MESSAGE, overflow_message
-from .kernels._fpenv import core_count, par_n
+from .kernels._fpenv import core_count
 from .kernels.pipeline_cpu import IP, LP, FP, BP, VEC, E_OVERFLOW, pipeline_keyed
 from .sql import sql_error
 from .bind import SqlSource, BoundQuery, SortKey, B_COL, B_LIT, SRC_FRAME, SRC_SCAN, pow10_checked
@@ -89,16 +89,16 @@ def _flags_hook(chunk: Int, row0: Int, sel: IP, nsel: Int, use_sel: Bool, dst: I
     return True
 
 
-def run_flags(src: SqlSource, inp: _Inputs, sp: SqlProgram, opts: PlannerOptions) raises -> Int:
+def run_flags(src: SqlSource, inp: _Inputs, sp: SqlProgram, opts: PlannerOptions) raises:
     """F-205: the row query's filter over a plain table (or a Frame's shared rows, unchanged rows only), one flag byte a row at `opts.keep_at`
-    (1: the row passes, a row the Frame's mask hides stays 0). Returns how many rows pass. No row is collected, no column is copied."""
+    (1: the row passes, a row the Frame's mask hides stays 0). No row is collected, no column is copied."""
     if src.kind == SRC_SCAN or len(src.overlay.delta) > 0 or opts.keep_at == 0:
         raise Error("internal: flags are written for a table, or a Frame with no changed rows")
     var ch = _open_chunks(src, inp.used)
     var chunk = _load_chunk(src, ch, 0)
     var n = chunk.rows()
     if n == 0:
-        return 0
+        return
     ref p = sp.p
     var run = KernelRun(p, sp.set_bytes, sp.set_meta, chunk, ch.mask_addr)
     var ctl = run.region(4)
@@ -114,23 +114,6 @@ def run_flags(src: SqlSource, inp: _Inputs, sp: SqlProgram, opts: PlannerOptions
         raise Error(overflow_message(p.conv_text()))
     if rc != 0:
         raise Error("the CPU kernel failed with code " + String(rc))
-    var tasks = max(1, min(opts.threads if opts.threads > 0 else core_count(), n // 262144 + 1))
-    var counts = List[Int](length=tasks, fill=0)
-    var cp = LP(unsafe_from_address=Int(counts.unsafe_ptr()))
-    var at = opts.keep_at
-
-    def count(t: Int) {imm}:
-        var fl = BP(unsafe_from_address=at)
-        var c = 0
-        for i in range(n * t // tasks, n * (t + 1) // tasks):
-            c += Int(fl[i])
-        cp[t] = Int64(c)
-
-    par_n(count, tasks, tasks)
-    var passed = 0
-    for t in range(tasks):
-        passed += counts[t]
-    return passed
 
 
 struct RowChunk(Movable):
@@ -1053,8 +1036,7 @@ def prepare_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, dicts: DictA
 def execute_rows(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOptions, dicts: DictAccess, mut notes: List[String],
                  inp: _Inputs, var stage: RowStage, trust: Bool, fj: Optional[ArcPointer[FusedJoin]] = None, stream: Bool = False) raises -> Table:
     if q.keep_flags:
-        var passed = run_flags(src, inp, stage.sp, opts)
-        notes.append("flags: " + commas(passed) + " of " + commas(src.table.rows()) + " rows pass the filter (one byte a row, no rows copied)")
+        run_flags(src, inp, stage.sp, opts)
         return Table.empty()
     if plan.top_k > 0:
         return run_topk_rows(src, q, plan, opts, dicts, notes, inp, stage.sp, stage.items, trust, fj)
