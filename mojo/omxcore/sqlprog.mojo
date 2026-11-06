@@ -2861,6 +2861,7 @@ def lower_sql(q: BoundQuery, plan: PhysicalPlan, var nullable: List[Bool], var p
     out.key_regs = key_regs
     out.set_bytes = e.set_bytes.copy()
     out.set_meta = e.set_meta.copy()
+    e.p.prune_below = e.kept_next                                 # F-210: the kept registers are the only ones read outside the program
     out.instr = (len(e.p.pred) + len(e.p.body) + len(e.p.aggs)) // 5
     out.p = e^.take_program()
     out.p.set_bytes = out.set_bytes.copy()
@@ -2963,6 +2964,7 @@ def lower_rows(q: BoundQuery, computed: List[Int], var nullable: List[Bool], var
     out.key_regs = 1
     out.set_bytes = e.set_bytes.copy()
     out.set_meta = e.set_meta.copy()
+    e.p.prune_below = e.kept_next                                 # F-210: the kept registers are the only ones read outside the program
     out.instr = (len(e.p.pred) + len(e.p.body) + len(e.p.aggs)) // 5
     out.p = e^.take_program()
     out.p.set_bytes = out.set_bytes.copy()

@@ -132,6 +132,7 @@ comptime OP_AGG_MAX = 52
 comptime OP_AGG_ISUM = 53   # sum of an "int" register, accumulated in int64 (F-060, F-060b); the slot holds int64 bits
 comptime OP_AGG_IMIN = 54   # min / max of an "int" register, accumulated in int64 (F-060c); the slot holds int64 bits
 comptime OP_AGG_IMAX = 55
+comptime OP_ICMPCOL = 56    # F-210: dst = 1.0 if column ins[2] <cmp in ins[4]> the int64 constant consts[ins[3]] else 0.0: OP_LOADI + OP_LOAD_CONST + OP_ICMP in one pass over the column (made by the host, query.cpu_code)
 comptime E_OVERFLOW = -21   # an int64 sum or result passed its range, or an int64 value past 2^53 met a float op (the caller's exact path answers)
 comptime LIM53 = Int64(1) << 53
 comptime B62 = 4611686018427387904.0     # 2^62 as a double: |a double product| below it proves an int64 product fits
@@ -331,6 +332,77 @@ def _icmp[CMP: Int](d: FP, xa: LP, xb: LP, n: Int):
         else:
             d[i] = 1.0 if x != y else 0.0
         i += 1
+
+@always_inline
+def _icmp_col[T: DType, CMP: Int](d: FP, addr: Int, i0: Int, n: Int, k: Int64):
+    """OP_ICMPCOL over the first n rows of a dense column of type T (read widened to int64): 1.0 / 0.0 against the constant k."""
+    var src = Pointer[Scalar[T], MutUntrackedOrigin](unsafe_from_address=addr) + i0
+    var kv = SIMD[DType.int64, W](k)
+    var one = SIMD[F64, W](1.0)
+    var zero = SIMD[F64, W](0.0)
+    var i = 0
+    while i + W <= n:
+        var x = src.load[width=W](i).cast[DType.int64]()
+        comptime if CMP == OP_LT:
+            d.store(i, x.lt(kv).select(one, zero))
+        elif CMP == OP_LE:
+            d.store(i, x.le(kv).select(one, zero))
+        elif CMP == OP_GT:
+            d.store(i, x.gt(kv).select(one, zero))
+        elif CMP == OP_GE:
+            d.store(i, x.ge(kv).select(one, zero))
+        elif CMP == OP_EQ:
+            d.store(i, x.eq(kv).select(one, zero))
+        else:
+            d.store(i, x.ne(kv).select(one, zero))
+        i += W
+    while i < n:
+        var x = src[i].cast[DType.int64]()
+        comptime if CMP == OP_LT:
+            d[i] = 1.0 if x < k else 0.0
+        elif CMP == OP_LE:
+            d[i] = 1.0 if x <= k else 0.0
+        elif CMP == OP_GT:
+            d[i] = 1.0 if x > k else 0.0
+        elif CMP == OP_GE:
+            d[i] = 1.0 if x >= k else 0.0
+        elif CMP == OP_EQ:
+            d[i] = 1.0 if x == k else 0.0
+        else:
+            d[i] = 1.0 if x != k else 0.0
+        i += 1
+
+@always_inline
+def _icmp_col_t[T: DType](d: FP, addr: Int, i0: Int, n: Int, k: Int64, cmp: Int):
+    if cmp == OP_LT:
+        _icmp_col[T, OP_LT](d, addr, i0, n, k)
+    elif cmp == OP_LE:
+        _icmp_col[T, OP_LE](d, addr, i0, n, k)
+    elif cmp == OP_GT:
+        _icmp_col[T, OP_GT](d, addr, i0, n, k)
+    elif cmp == OP_GE:
+        _icmp_col[T, OP_GE](d, addr, i0, n, k)
+    elif cmp == OP_EQ:
+        _icmp_col[T, OP_EQ](d, addr, i0, n, k)
+    else:
+        _icmp_col[T, OP_NE](d, addr, i0, n, k)
+
+def _icmp_col_run(d: FP, addr: Int, dtype: Int, i0: Int, sel: IP, use_sel: Bool, n: Int, k: Int64, cmp: Int):
+    """OP_ICMPCOL: rows [i0, i0 + n) (or the rows `sel` names) of a column against k. The column's dtype is read as OP_LOADI reads it."""
+    if use_sel:
+        _load_coli(d, addr, dtype, i0, sel, use_sel, n)             # the gathered rows, widened to int64, then compared in place
+        var x = _ibits(d)
+        for i in range(n):
+            var v = x[i]
+            var r = (v < k) if cmp == OP_LT else (v <= k) if cmp == OP_LE else (v > k) if cmp == OP_GT else \
+                    (v >= k) if cmp == OP_GE else (v == k) if cmp == OP_EQ else (v != k)
+            d[i] = 1.0 if r else 0.0
+    elif dtype == 0:
+        _icmp_col_t[DType.int32](d, addr, i0, n, k, cmp)
+    elif dtype == 4:
+        _icmp_col_t[DType.uint8](d, addr, i0, n, k, cmp)
+    else:                                                           # 1: int64, 8: int64 read only here
+        _icmp_col_t[DType.int64](d, addr, i0, n, k, cmp)
 
 def _int_op2[OP: Int](d: FP, a: FP, b: FP, cmp: Int, n: Int, ovf: LP):
     """OP_IDIV / OP_IMOD / OP_IMIN / OP_IMAX / OP_ICMP over the first n lanes of two "int" registers. INT64_MIN // -1
@@ -1014,6 +1086,9 @@ def _run_ops(p: Prog, regs: FP, cols: LP, base: Int, count: Int, i0: Int, sel: I
             while i < VEC:
                 d.store(i, v)
                 i += W
+        elif op == OP_ICMPCOL:
+            var c = Int(ins[2])
+            _icmp_col_run(d, Int(cols[c]), Int(p.dtypes[c]), i0, sel, use_sel, n, _lp(Int(p.consts))[Int(ins[3])], Int(ins[4]))
         elif op == OP_CMPC:
             # column <cmp> constant: widen exactly, compare against the pre-rounded threshold
             var c = Int(ins[2])
