@@ -6,7 +6,6 @@ bits of a float sum differed between two runs of the same query on the same data
 shape 30 times with 8 workers and demands 0 groups whose sum or mean differs bitwise from the first run,
 and that the path under test ran (call counters), so it cannot pass through a fallback."""
 import ctypes
-import sys
 
 import numpy as np
 import pyarrow as pa
@@ -166,9 +165,10 @@ def test_the_per_morsel_table_path_and_the_staged_path_give_the_defined_order(ca
 def test_reproducible_false_overrides_the_environment_variable(calls, monkeypatch):
     """With MXFRAME_REPRODUCIBLE=1, `reproducible=False` runs the default mode again: above 8,192 groups that
     is the faster path whose sums differ between runs (200k groups over 6M rows: many groups differ)."""
-    if sys.platform != "linux":
-        pytest.skip("the default mode differs between runs only through thread order; the macOS CPU kernels run on one thread "
-                    "(kernels_aot/_fpenv.mojo SERIAL, F-210), so its sums repeat bit for bit")
+    from conftest import cpu_kernels_threaded
+    if not cpu_kernels_threaded():
+        pytest.skip("the default mode differs between runs only through thread order, and the CPU kernels of this build run "
+                    "on one thread (kernels_aot/_fpenv.mojo SERIAL), so its sums repeat bit for bit")
     monkeypatch.setenv("MXFRAME_REPRODUCIBLE", "1")
     t = _fact(6_000_000, 200_000)
     plan = LazyFrame(t).groupby("s").agg((col("p") * (lit(1.0) - col("d"))).sum().alias("tot"))

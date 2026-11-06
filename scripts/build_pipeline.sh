@@ -28,15 +28,21 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 WHICH="${1:-all}"
 BUILT=()
+# MXFRAME_KERNEL_OUT: build into another directory (scripts/run_tests.sh does on a Mac: build/kernels-arm64), leaving the
+# committed libraries and their .sources.json untouched. Unset: the committed ones, as before.
+OUT="${MXFRAME_KERNEL_OUT:-kernels_aot}"
+mkdir -p "$OUT"
 
 # build <source stem> <library stem> [mojo flags...]
 build() {
     local src="$1" lib="$2"; shift 2
     pixi run mojo build "kernels_aot/$src.mojo" -I kernels_aot "$@" --emit shared-lib \
-        -o "kernels_aot/$lib.so"
-    if [[ "$(uname)" == "Linux" ]]; then bash scripts/set_runpath.sh "kernels_aot/$lib.so"; fi   # ELF RUNPATH: Linux only
-    pixi run python scripts/record_build_hash.py "kernels_aot/$lib.so"
-    BUILT+=("kernels_aot/$lib.so")
+        -o "$OUT/$lib.so"
+    if [[ "$OUT" == "kernels_aot" ]]; then
+        if [[ "$(uname)" == "Linux" ]]; then bash scripts/set_runpath.sh "kernels_aot/$lib.so"; fi   # ELF RUNPATH: Linux only
+        pixi run python scripts/record_build_hash.py "kernels_aot/$lib.so"
+    fi
+    BUILT+=("$OUT/$lib.so")
 }
 if [[ "$(uname -m)" == "x86_64" ]]; then V3=(--target-cpu x86-64-v3); else V3=(); fi   # an x86-64 level means nothing on arm64
 

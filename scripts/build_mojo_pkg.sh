@@ -21,9 +21,23 @@ if command -v flock > /dev/null; then
   flock 9
   trap 'rm -rf "$work"' EXIT
 else
+  # The lock directory holds the owner's pid: a lock whose owner is dead (killed build) is cleared, and a wait of
+  # MXFRAME_LOCK_WAIT seconds (default 1800) ends with a message instead of blocking forever.
   lockdir="$root/build/.omxcore-pkg.lockdir"
-  until mkdir "$lockdir" 2> /dev/null; do sleep 1; done
-  trap 'rm -rf "$work"; rmdir "$lockdir"' EXIT
+  waited=0
+  until mkdir "$lockdir" 2> /dev/null; do
+    owner="$(cat "$lockdir/pid" 2> /dev/null || true)"
+    if [ -n "$owner" ] && ! kill -0 "$owner" 2> /dev/null; then
+      echo "build_mojo_pkg.sh: clearing the lock of dead build $owner" >&2
+      rm -rf "$lockdir"; continue
+    fi
+    if [ "$waited" -ge "${MXFRAME_LOCK_WAIT:-1800}" ]; then
+      echo "build_mojo_pkg.sh: waited ${waited}s for $lockdir (held by pid ${owner:-unknown}); remove it if no build runs" >&2; exit 1
+    fi
+    sleep 1; waited=$((waited + 1))
+  done
+  echo $$ > "$lockdir/pid"
+  trap 'rm -rf "$work" "$lockdir"' EXIT
 fi
 sha1() { if command -v sha1sum > /dev/null; then sha1sum; else shasum; fi; }
 stamp="$( { mojo --version 2>/dev/null; cat "$root"/mojo/omxcore/*.mojo "$root"/kernels_aot/*.mojo "$0"; } | sha1 | cut -c1-40)"

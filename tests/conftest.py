@@ -81,3 +81,28 @@ def _strict_native(monkeypatch):
     """An unexpected exception in a native hook is raised in the tests, not turned into a quiet fallback
     (a test that wants the fallback unsets it)."""
     monkeypatch.setenv("MXFRAME_STRICT_NATIVE", "1")
+
+
+_THREADED = None
+
+
+def cpu_kernels_threaded() -> bool:
+    """Do the CPU kernels spread one call over several threads in this build? Asked by running one: a call on 4 threads
+    uses more CPU time (all the process's threads) than wall time. A serial build (every non-Linux build until F-210, or
+    -D MXFRAME_SERIAL) uses about as much as the wall time. Tests that need threads skip on this, not on the platform."""
+    global _THREADED
+    if _THREADED is None:
+        import time
+        import numpy as np
+        from omxcore.aot_kernels import AOTKernels
+        aot = AOTKernels()
+        a = np.ones(30_000_000, dtype=np.float32)
+        mask = np.ones(30_000_000, dtype=np.int32)
+        aot.masked_global_sum(a, mask, threads=4)                 # warm the pool and page in the data
+        best = 0.0
+        for _ in range(3):
+            w0, c0 = time.perf_counter(), time.process_time()
+            aot.masked_global_sum(a, mask, threads=4)
+            best = max(best, (time.process_time() - c0) / (time.perf_counter() - w0))
+        _THREADED = best > 1.5
+    return _THREADED

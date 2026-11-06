@@ -1550,13 +1550,15 @@ def scratch():
 
 
 def run_budget_probe(probe, tmp_path, rows, threads, budget, data):
-    if sys.platform != "linux":
-        pytest.skip("the probe measures how far one save raises the peak resident memory, which needs /proc/self/clear_refs to "
-                    "restart the peak; macOS cannot, so its peak stays the process's all-time peak and the growth would read 0")
     path = tmp_path / f"b{threads}_{budget}_{data}.parquet"
     p = subprocess.run([str(probe), str(rows), str(path), str(threads), str(budget), data], capture_output=True, text=True)
     assert p.returncode == 0, p.stdout + p.stderr
     res = json.loads(p.stdout.strip().split("\n")[-1])
+    # The process holds the table (125 MB) when it measures, so a working probe reads at least that; -1 would be a failed read.
+    assert res["before_kb"] >= res["table_kb"] and res["peak_kb"] >= res["table_kb"], res
+    # Linux restarts the peak before the save (clear_refs), so this is what the save added. macOS cannot restart it: the peak is
+    # the process's all-time one (the table build included), so this is an upper bound on what the save added: the bounds below
+    # still catch a save that holds more than its budget past the build's own peak.
     res["growth_kb"] = res["peak_kb"] - res["before_kb"]
     return res
 
@@ -1583,5 +1585,8 @@ def test_a_save_with_many_threads_holds_pages_within_its_budget(budget_probe, sc
 def test_without_a_bound_a_save_holds_the_pages_of_its_row_group(budget_probe, scratch):
     tmp_path = scratch
     """The measure sees what the budget bounds: with a 1 GB budget the same save adds over 100 MB."""
+    if sys.platform != "linux":
+        pytest.skip("macOS cannot restart the process's peak resident memory (Linux: /proc/self/clear_refs), so a save's growth "
+                    "below the build's own peak is invisible there and this contrast cannot be measured")
     big = run_budget_probe(budget_probe, tmp_path, 2_000_000, 24, 1024 * 2**20, "random")
     assert big["growth_kb"] * 1024 > 100 * 2**20, big
