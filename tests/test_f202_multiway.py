@@ -181,3 +181,149 @@ def test_a_dimension_with_repeated_keys_is_not_a_star(mx, data):
 def test_a_star_with_an_empty_dimension_and_null_cross_keys(mx, data):
     q(mx, data, "SELECT count(*), sum(f.x) FROM f, nothing, db WHERE f.a = nothing.a AND f.b = db.b AND nothing.ak = db.bk", ["f", "nothing", "db"])
     q(mx, data, "SELECT count(*) FROM f, da, db WHERE f.a = da.a AND f.b = db.b AND da.ak = db.bk AND da.ak IS NULL", ["f", "da", "db"])
+
+
+# the star's boundaries: STAR_RATIO = 3 (the fact table has at least 3x the rows of every other), and keys a sample calls unique that are not
+@pytest.fixture(scope="session")
+def bounds(tmp_path_factory):
+    d = tmp_path_factory.mktemp("f202b")
+    con = oracle_connection()
+    con.execute("create table bf as select i as id, (i * 7) % 70000 as k70, (i * 11) % 60000 as k60, (i * 13) % 50 as ks, i % 17 as g, ((i % 400) * 0.5)::decimal(10,1) as x from range(200000) r(i)")
+    con.execute("create table d70 as select i as k, 'a' || (i % 31) as an, i % 5 as seg from range(70000) r(i)")
+    con.execute("create table d60 as select i as k, 'b' || (i % 29) as bn, i % 7 as seg from range(60000) r(i)")
+    con.execute("create table ds as select i as k, 'c' || (i % 4) as cn from range(50) r(i)")
+    # 40,000 keys, a handful of them repeated: a sample of the column can call it unique, the build then finds the repeats
+    con.execute("create table dd as select case when i % 9973 = 0 then i - 1 else i end as k, 'd' || (i % 13) as dn from range(40000) r(i)")
+    con.execute("create table bf2 as select i as id, (i * 7) % 40000 as kd, (i * 13) % 50 as ks, ((i % 300) * 0.5)::decimal(10,1) as x from range(300000) r(i)")
+    paths = {}
+    for t in ["bf", "d70", "d60", "ds", "dd", "bf2"]:
+        paths[t] = d / f"{t}.parquet"
+        con.execute(f"copy {t} to '{paths[t]}' (format parquet, row_group_size 40000)")
+    return {"con": con, "paths": paths}
+
+
+def test_just_under_the_star_ratio_the_planners_order_stands(mx, bounds):
+    # 200,000 rows against a 70,000-row dimension: 2.86x, under 3
+    sql = "SELECT d70.an, ds.cn, count(*), sum(bf.x) FROM bf, d70, ds WHERE bf.k70 = d70.k AND bf.ks = ds.k GROUP BY d70.an, ds.cn ORDER BY d70.an, ds.cn"
+    res = q(mx, bounds, sql, ["bf", "d70", "ds"], ordered=True)
+    assert not [n for n in res["notes"] if "a star from" in n], res["notes"]
+
+
+def test_over_the_star_ratio_the_fact_table_probes_every_dimension(mx, bounds):
+    # 200,000 rows against a 60,000-row dimension: 3.33x
+    sql = "SELECT d60.bn, ds.cn, count(*), sum(bf.x) FROM bf, d60, ds WHERE bf.k60 = d60.k AND bf.ks = ds.k GROUP BY d60.bn, ds.cn ORDER BY d60.bn, ds.cn"
+    res = q(mx, bounds, sql, ["bf", "d60", "ds"], ordered=True)
+    note(res, "a star from bf")
+
+
+def test_keys_that_look_unique_but_repeat_fall_back_and_stay_correct(mx, bounds):
+    sql = "SELECT dd.dn, ds.cn, count(*), sum(bf2.x) FROM bf2, dd, ds WHERE bf2.kd = dd.k AND bf2.ks = ds.k GROUP BY dd.dn, ds.cn ORDER BY dd.dn, ds.cn"
+    res = q(mx, bounds, sql, ["bf2", "dd", "ds"], ordered=True)
+    note(res, "star: dd has repeated keys: the joins run one by one")      # the plan was a star (the ndv said unique); the build found the repeats and the joins ran one by one
+
+
+# LIKE with ESCAPE and ILIKE (the case-folded pattern takes the same literal matcher)
+ESC_PATTERNS = [("a\\%b%", "\\"), ("%a\\_b%", "\\"), ("a!%b", "!"), ("%special%requests%", "\\"), ("a\\%%b", "\\")]
+
+
+@pytest.mark.parametrize("pattern,esc", ESC_PATTERNS)
+def test_like_with_escape_equals_duckdb(mx, words, pattern, esc):
+    p = pattern.replace("'", "''")
+    check(mx, f"SELECT id, s LIKE '{p}' ESCAPE '{esc}' AS m FROM w ORDER BY id", words["con"], files={"w": words["paths"]["w"]}, ordered=True)
+
+
+ILIKE_PATTERNS = ["%SPECIAL%Requests%", "SPECIAL%REQUESTS", "A%B%", "%CAFÉ%", "%X%x%", "%É%é%", "a%B%c"]
+
+
+@pytest.mark.parametrize("pattern", ILIKE_PATTERNS)
+def test_ilike_with_several_literals_equals_duckdb(mx, words, pattern):
+    p = pattern.replace("'", "''")
+    check(mx, f"SELECT id, s ILIKE '{p}' AS m, s NOT ILIKE '{p}' AS n FROM w ORDER BY id", words["con"], files={"w": words["paths"]["w"]}, ordered=True)
+
+
+# a correlated scalar subquery whose table is joined to others (TPC-H Q2's shape): D is cut to the outer rows' keys with an IN list
+@pytest.mark.parametrize("sql", [
+    "SELECT da.a, da.an FROM da WHERE da.seg = 2 AND da.a < 400 AND da.a = (SELECT min(f.a) FROM f, db WHERE f.a = da.a AND f.b = db.b AND db.bk < 12) ORDER BY da.a",
+    "SELECT da.a, da.an FROM da WHERE da.seg = 1 AND da.a < 600 AND (SELECT min(f.x) FROM f, db WHERE f.a = da.a AND f.b = db.b AND db.bk < 12) > 40 ORDER BY da.a",
+    "SELECT da.a FROM da WHERE da.a < 500 AND (SELECT count(*) FROM f, db WHERE f.a = da.a AND f.b = db.b AND db.bk > 20) >= 2 ORDER BY da.a",
+])
+def test_a_correlated_subquery_over_joined_tables_is_cut_to_the_outer_keys(mx, data, sql):
+    res = q(mx, data, sql, ["da", "f", "db"], ordered=True)
+    note(res, "cut to the keys of the")
+
+
+# the sampled filter count (a table of 4M+ rows): the path ran, the answer is DuckDB's, and the two fallbacks count every row
+@pytest.fixture(scope="session")
+def bigworld(tmp_path_factory):
+    d = tmp_path_factory.mktemp("f202big")
+    con = oracle_connection()
+    con.execute("""create table big as select i as id, case when i % 97 = 0 then null else (i * 7) % 5000 end as k, (i * 31) % 100000 as v,
+        case when i % 23 = 0 then null else ((i % 500) * 0.25)::decimal(10,2) end as x,
+        (['alpha','Beta','gamma','delta','eps','zeta','eta','theta'])[1 + i % 8] as s,
+        date '2020-01-01' + (i % 900)::int as t from range(4200000) r(i)""")
+    con.execute("create table d as select i as k, 'name' || (i % 40) as name, i % 7 as seg from range(5000) r(i)")
+    con.execute("create table d2 as select i as k, 'x' || (i % 11) as name2 from range(5000) r(i)")
+    paths = {}
+    for t in ("big", "d", "d2"):
+        paths[t] = d / f"{t}.parquet"
+        con.execute(f"copy {t} to '{paths[t]}' (format parquet, row_group_size 100000)")
+    return {"con": con, "paths": paths}
+
+
+def test_the_filter_count_runs_over_a_sample_of_a_big_table(mx, bigworld):
+    res = q(mx, bigworld, "SELECT d.name, count(*), sum(big.x) FROM big, d WHERE big.k = d.k AND big.v < 20000 AND big.s <> 'eps' GROUP BY d.name ORDER BY d.name", ["big", "d"], ordered=True)
+    note(res, "filter count of big: sampled (")
+
+
+def test_the_sampled_count_in_a_multi_way_join(mx, bigworld):
+    res = q(mx, bigworld, "SELECT d.name, d2.name2, count(*), sum(big.x) FROM big, d, d2 WHERE big.k = d.k AND big.k = d2.k AND big.t >= date '2021-03-01' AND big.v < 30000 GROUP BY d.name, d2.name2 ORDER BY 1, 2",
+            ["big", "d", "d2"], ordered=True)
+    note(res, "filter count of big: sampled (")
+
+
+def test_a_sample_with_too_few_passing_rows_counts_every_row(mx, bigworld):
+    # about 40 rows of 4.2M pass: the sample of a 127th holds almost none
+    res = q(mx, bigworld, "SELECT d.name, count(*), sum(big.x) FROM big, d WHERE big.k = d.k AND big.v < 1 GROUP BY d.name ORDER BY d.name", ["big", "d"], ordered=True)
+    note(res, "filter count of big: every row (only ")
+    res = q(mx, bigworld, "SELECT count(*), sum(big.x) FROM big, d WHERE big.k = d.k AND big.id = 77777", ["big", "d"])
+    note(res, "filter count of big: every row (only ")
+
+
+# the correlated cut (D cut to the outer rows' distinct keys as an IN list) and when it is skipped
+@pytest.fixture(scope="session")
+def cutworld(data, tmp_path_factory):
+    d = tmp_path_factory.mktemp("f202cut")
+    con = oracle_connection()
+    for t in ("f", "db"):
+        con.execute(f"create table {t} as select * from read_parquet('{data['paths'][t]}')")
+    con.execute("create table o1 as select i as id, case when i % 7 = 0 then null else (i * 5) % 400 end as k, i % 3 as g from range(600) r(i)")      # NULL keys
+    con.execute("create table o2 as select i as id, case when i % 11 = 0 then null else (i * 3) % 500 end as k from range(600) r(i)")
+    con.execute("create table obig as select i as id, i as k from range(30000) r(i)")                                                              # 30,000 distinct keys
+    con.execute("create table oneg as select i as id, (i - 20) as k from range(60) r(i)")                                                          # negative keys
+    con.execute("create table otxt as select i as id, (['red','Green','blue','amber','none'])[1 + i % 5] as s from range(40) r(i)")                 # a text key
+    con.execute("create table onone as select i as id, 500000 + i as k from range(50) r(i)")                                                       # keys no inner row has
+    paths = {}
+    for t in ("f", "db", "o1", "o2", "obig", "oneg", "otxt", "onone"):
+        paths[t] = d / f"{t}.parquet"
+        con.execute(f"copy {t} to '{paths[t]}' (format parquet, row_group_size 20000)")
+    return {"con": con, "paths": paths}
+
+
+CUT_SQL = {
+    "null_keys": ("SELECT o1.id FROM o1 WHERE o1.g = 1 AND (SELECT min(f.x) FROM f, db WHERE f.a = o1.k AND f.b = db.b AND db.bk < 12) > 20 ORDER BY o1.id", ["o1", "f", "db"], True),
+    "second_outer_table": ("SELECT o1.id, o2.k FROM o1, o2 WHERE o1.id = o2.id AND o2.k < 300 AND (SELECT min(f.x) FROM f, db WHERE f.a = o2.k AND f.b = db.b AND db.bk < 12) > 10 ORDER BY o1.id",
+                           ["o1", "o2", "f", "db"], True),
+    "too_many_keys": ("SELECT obig.id FROM obig WHERE obig.id < 25000 AND (SELECT min(f.x) FROM f, db WHERE f.a = obig.k AND f.b = db.b AND db.bk < 12) > 50 ORDER BY obig.id", ["obig", "f", "db"], False),
+    "negative_keys": ("SELECT oneg.id FROM oneg WHERE (SELECT min(f.x) FROM f, db WHERE f.a = oneg.k AND f.b = db.b AND db.bk < 12) > 5 ORDER BY oneg.id", ["oneg", "f", "db"], False),
+    "text_keys": ("SELECT otxt.id FROM otxt WHERE (SELECT count(*) FROM f, db WHERE f.s = otxt.s AND f.b = db.b AND db.bk = 3 AND f.id < 2000) > 3 ORDER BY otxt.id", ["otxt", "f", "db"], False),
+    "no_inner_rows": ("SELECT onone.id FROM onone WHERE (SELECT min(f.x) FROM f, db WHERE f.a = onone.k AND f.b = db.b) IS NULL ORDER BY onone.id", ["onone", "f", "db"], True),
+    "no_inner_rows_compared": ("SELECT onone.id FROM onone WHERE (SELECT min(f.x) FROM f, db WHERE f.a = onone.k AND f.b = db.b) > 1 ORDER BY onone.id", ["onone", "f", "db"], True),
+}
+
+
+@pytest.mark.parametrize("name", list(CUT_SQL))
+def test_the_correlated_cut_and_when_it_is_skipped(mx, cutworld, name):
+    sql, tables, cut = CUT_SQL[name]
+    res = q(mx, cutworld, sql, tables, ordered=True)
+    hits = [n for n in res["notes"] if "cut to the keys of the" in n]
+    assert bool(hits) == cut, (name, res["notes"])

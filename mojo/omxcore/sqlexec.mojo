@@ -28,7 +28,7 @@ from .holistic import (HolStates, HolSpec, HolResult, A_DISTINCT, A_PCT, A_MEDIA
                            float_key)
 from .sql import sql_error, parse_sql, SqlStatement, EXPLAIN_NONE, EXPLAIN_ANALYZE
 from .bind import (copy_query, Catalog, SqlSource, BoundQuery, SortKey, bind_sql, bind_statement, SRC_TABLE, SRC_FRAME, SRC_SCAN, B_COL, F_COUNT_STAR,
-                   F_COUNT, F_SUM, F_MIN, F_MAX, F_AVG, F_COUNT_DISTINCT, F_MEDIAN, F_STDDEV_SAMP, F_STDDEV_POP, F_VAR_SAMP, F_VAR_POP, F_QEDGE, B_QBIN, B_LIT, B_AGG, B_AND, B_CMP,
+                   F_COUNT, F_SUM, F_MIN, F_MAX, F_AVG, F_COUNT_DISTINCT, F_MEDIAN, F_STDDEV_SAMP, F_STDDEV_POP, F_VAR_SAMP, F_VAR_POP, F_QEDGE, B_QBIN, B_LIT, B_AGG, B_AND, B_CMP, C_EQ,
                    BExpr, AggSpec, KeySpec, pow10_checked)
 from .plan import LogicalPlan, build_plan, executable
 from .post import run_post
@@ -1349,9 +1349,99 @@ def _can_defer(catalog: Catalog, q: BoundQuery, t: Int, allow: Bool) -> Bool:
     return src.kind == SRC_TABLE and len(src.overlay.mask) == 0 and len(src.overlay.delta) == 0 and src.table.rows() >= DEFER_MIN_ROWS
 
 
-def _count_side[P: Planner](mut catalog: Catalog, q: BoundQuery, t: Int, planner: P, opts: PlannerOptions, trust: Bool) raises -> Int:
-    var r = _run_sql_once(catalog, count_query(catalog, q, t), planner, opts, trust, String())
-    return Int(r.table.get(0, 0))
+comptime COUNT_SAMPLE_MIN_ROWS = 4000000     # F-202: a table of at least this many rows has its filter counted over a sample of its blocks
+comptime COUNT_SAMPLE_EVERY = 127            # one block of 1,024 rows in this many
+comptime COUNT_SAMPLE_BLOCK = 1024
+comptime COUNT_SAMPLE_MIN_HITS = 256         # fewer rows than this pass in the sample: the share is too coarse, count every row
+
+
+def _sample_table(t: SharedTable) -> Optional[SharedTable]:
+    """F-202: every COUNT_SAMPLE_EVERY-th block of `t`'s rows as a table of its own (the same columns and dictionaries), to count a filter over a hundredth of the rows.
+    The kernel evaluates every row of a table even when a mask hides it, so the sample has to be a table. None when a column holds 128-bit values."""
+    var n = t.rows()
+    for c in range(t.columns()):
+        if len(t._table[].cols[c].high) > 0:
+            return None
+    var starts = List[Int]()
+    var b = 0
+    while b * COUNT_SAMPLE_BLOCK < n:
+        starts.append(b * COUNT_SAMPLE_BLOCK)
+        b += COUNT_SAMPLE_EVERY
+    var m = 0
+    for st in starts:
+        m += min(COUNT_SAMPLE_BLOCK, n - st)
+    var out = Table.empty()
+    try:
+        for c in range(t.columns()):
+            var kind = t.kind(c)
+            var oc = out.add_column(t.name(c), kind, scale=t.scale(c))
+            if kind == TEXT:
+                out.share_dictionary(oc, t, c)
+            var vals = List[Int64](length=m, fill=0)
+            var at = 0
+            ref src = t._table[].cols[c]
+            for st in starts:
+                var k = min(COUNT_SAMPLE_BLOCK, n - st)
+                _ = external_call["memcpy", Int](Int(vals.unsafe_ptr()) + at * 8, Int(src.values.unsafe_ptr()) + st * 8, k * 8)
+                at += k
+            out.cols[oc].values = vals^
+            if len(src.validity) > 0:
+                var bits = List[UInt8](length=(m + 7) // 8, fill=0xFF)
+                var nulls = 0
+                at = 0
+                for st in starts:
+                    var k = min(COUNT_SAMPLE_BLOCK, n - st)
+                    for r in range(k):
+                        if (src.validity[(st + r) >> 3] >> UInt8((st + r) & 7)) & 1 == 0:
+                            bits[(at + r) >> 3] &= ~(UInt8(1) << UInt8((at + r) & 7))
+                            nulls += 1
+                    at += k
+                if nulls > 0:
+                    out.cols[oc].validity = bits^
+                    out.cols[oc].nulls = nulls
+    except:
+        return None
+    return out^.share()
+
+
+def _count_side[P: Planner](mut catalog: Catalog, q: BoundQuery, t: Int, planner: P, opts: PlannerOptions, trust: Bool, mut res: SqlResult) raises -> Int:
+    """The rows side `t` keeps after its filter. A table of millions of rows is counted over a sample of its blocks first (a filter's share is what the plan needs, and the
+    full count is a pass over the table that the read repeats); the exact count when the sample holds too few passing rows to give the share."""
+    var src = q.sources[t]
+    var n = catalog.sources[src].table.rows()
+    if catalog.sources[src].kind == SRC_TABLE and n >= COUNT_SAMPLE_MIN_ROWS and len(catalog.sources[src].overlay.mask) == 0 and len(catalog.sources[src].overlay.delta) == 0:
+        var smp = _sample_table(catalog.sources[src].table)
+        if not smp:
+            res.notes.append("filter count of " + _label(q, t) + ": every row (a 128-bit column: no sample table)")
+        if smp:
+            var full = catalog.sources[src].table
+            var r_cols = catalog.sources[src].range_cols.copy()        # (the ranges the run caches are the sample's: they go away with it)
+            var r_lo = catalog.sources[src].range_lo.copy()
+            var r_hi = catalog.sources[src].range_hi.copy()
+            var r_has = catalog.sources[src].range_has.copy()
+            catalog.sources[src].table = smp.value()
+            var r: SqlResult
+            try:
+                r = _run_sql_once(catalog, count_query(catalog, q, t), planner, opts, trust, String())
+            except e:
+                catalog.sources[src].table = full
+                catalog.sources[src].range_cols = r_cols^
+                catalog.sources[src].range_lo = r_lo^
+                catalog.sources[src].range_hi = r_hi^
+                catalog.sources[src].range_has = r_has^
+                raise e^
+            catalog.sources[src].table = full
+            catalog.sources[src].range_cols = r_cols^
+            catalog.sources[src].range_lo = r_lo^
+            catalog.sources[src].range_hi = r_hi^
+            catalog.sources[src].range_has = r_has^
+            var hits = Int(r.table.get(0, 0))
+            if hits >= COUNT_SAMPLE_MIN_HITS:
+                res.notes.append("filter count of " + _label(q, t) + ": sampled (" + commas(hits) + " of " + commas(smp.value().rows()) + " sample rows pass), scaled to " + commas(n) + " rows")
+                return min(n, Int(Float64(hits) * Float64(n) / Float64(smp.value().rows()) + 0.5))
+            res.notes.append("filter count of " + _label(q, t) + ": every row (only " + commas(hits) + " sample rows pass, too few for a share)")
+    var r2 = _run_sql_once(catalog, count_query(catalog, q, t), planner, opts, trust, String())
+    return Int(r2.table.get(0, 0))
 
 
 def _any_hol(q: BoundQuery) -> Bool:
@@ -1680,7 +1770,7 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
     if str0:
         lrows = catalog.sources[q.sources[0]].rows()                 # (its rows before the filter: the side is not read to count them)
     elif may0:
-        lrows = _count_side[P](catalog, q, 0, planner, opts, trust)
+        lrows = _count_side[P](catalog, q, 0, planner, opts, trust, res)
         if lrows * DEFER_PASS_DEN < catalog.sources[q.sources[0]].table.rows():      # a selective filter: writing the few rows that pass beats probing them all ...
             if len(q.conj_x) == 0:
                 pf0 = True                                       # ... unless the pipeline runs the filter first and probes only those rows (F-161): nothing is written
@@ -1693,7 +1783,7 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
     if str1:
         rrows = catalog.sources[q.sources[1]].rows()
     elif may1:
-        rrows = _count_side[P](catalog, q, 1, planner, opts, trust)
+        rrows = _count_side[P](catalog, q, 1, planner, opts, trust, res)
         if rrows * DEFER_PASS_DEN < catalog.sources[q.sources[1]].table.rows():
             if len(q.conj_x) == 0:
                 pf1 = True
@@ -2018,14 +2108,17 @@ def _read_filtered_reduced[P: Planner](mut catalog: Catalog, q: BoundQuery, t: I
                 var r = Int(rows[i])
                 mask[r >> 3] |= UInt8(1) << UInt8(r & 7)
             var src = q.sources[t]
+            var frame_mask = catalog.sources[src].overlay.mask.copy()    # a Frame's own mask (the shared rows it still holds unchanged) stays: the presence mark narrows it
+            for i in range(min(len(mask), len(frame_mask))):
+                mask[i] &= frame_mask[i]
             catalog.sources[src].overlay.mask = mask^
             var before = pick.n
             try:
                 _read_filtered[P](catalog, q, t, leaves, planner, opts, trust, res)
             except e:
-                catalog.sources[src].overlay.mask = List[UInt8]()
+                catalog.sources[src].overlay.mask = frame_mask^
                 raise e^
-            catalog.sources[src].overlay.mask = List[UInt8]()
+            catalog.sources[src].overlay.mask = frame_mask^
             res.notes.append("runtime join filter: " + _label(q, t) + " is read only where its key has a partner among the " + commas(cur_table.rows()) + " rows joined so far (" + commas(before) + " of " + commas(n) + " rows), " +
                              _ms(Float64(perf_counter_ns() - t_m) / 1e6) + " ms")
             return
@@ -2170,7 +2263,7 @@ def _run_star[P: Planner](mut catalog: Catalog, q: BoundQuery, mut leaves: List[
                 return False
             qx.rexprs.append(BExpr(B_COL, ka.value, 0, -1, -1, Int64(q.edge_a[k]), q.src_name(q.edge_a[k]), 0, 0))
             qx.rexprs.append(BExpr(B_COL, kb.value, 0, -1, -1, Int64(q.edge_b[k]), q.src_name(q.edge_b[k]), 0, 0))
-            qx.rexprs.append(BExpr(B_CMP, BOOL.value, 0, len(qx.rexprs) - 2, len(qx.rexprs) - 1, Int64(24), "", 0, 0))
+            qx.rexprs.append(BExpr(B_CMP, BOOL.value, 0, len(qx.rexprs) - 2, len(qx.rexprs) - 1, Int64(C_EQ), "", 0, 0))
             conj.append(len(qx.rexprs) - 1)
     var need = final_needed(qx, conj)
     var stages = List[StageData]()
@@ -2363,6 +2456,9 @@ def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPl
     var needed = all_needed(q)
     var leaves = List[_Leaf]()
     var js = JoinStats()
+    var biggest_source = 0
+    for t in range(n):
+        biggest_source = max(biggest_source, catalog.sources[q.sources[t]].rows())
     for t in range(n):
         var t_leaf = perf_counter_ns()
         var start = q.tab_start[t]
@@ -2386,15 +2482,16 @@ def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPl
             for c in range(src_table.columns()):
                 gtable.append(start + c)
         elif _can_defer(catalog, q, t, opts.fuse and not _any_hol(q)):
-            counted = _count_side[P](catalog, q, t, planner, opts, trust)          # its rows are only counted for now
+            counted = _count_side[P](catalog, q, t, planner, opts, trust, res)          # its rows are only counted for now
             is_deferred = True                                         # F-202: always: read filtered only if the order does not make it the last join's probe side
             table = src_table
             for g in gcols:
                 cols.append(g - start)
             for c in range(src_table.columns()):
                 gtable.append(start + c)
-        elif _can_stream(catalog, q, t, opts.fuse and not _any_hol(q)):
+        elif _can_stream(catalog, q, t, opts.fuse and not _any_hol(q)) and catalog.sources[q.sources[t]].rows() * STAR_RATIO > biggest_source:
             # a scan or a Frame: not read now; it streams if it ends up a probe side, else it is read filtered once the order is known
+            # (F-202: one with under a third of the rows of the biggest table cannot be a star's fact table: it is read, and its distinct counts say whether it is a dimension)
             is_deferred = True
             is_streamed = True
             counted = catalog.sources[q.sources[t]].rows()
@@ -2465,7 +2562,7 @@ def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPl
     var last_leaf = jp.steps[len(jp.steps) - 1].leaf
     var lazy = List[Bool](length=n, fill=False)                  # F-202: read when its step comes, from the rows joined by then (`_read_filtered_reduced`)
     for j in range(len(jp.steps) - 1):
-        if j < (star_s0 if star_s0 >= 0 else len(jp.steps) - 1) and jp.steps[j].leaf != jp.start and not leaves[jp.steps[j].leaf].streamed:
+        if j < (star_s0 if star_s0 >= 0 else len(jp.steps) - 1) and jp.steps[j].leaf != jp.start and (not leaves[jp.steps[j].leaf].streamed or catalog.sources[q.sources[jp.steps[j].leaf]].kind == SRC_FRAME):
             lazy[jp.steps[j].leaf] = True
     var star_lazy = List[Bool](length=n, fill=False)             # F-202: the tables of a star's dimension groups of several tables: the group reads them (`_build_cluster`)
     if star_s0 >= 0:
