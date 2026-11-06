@@ -1564,6 +1564,20 @@ def _flag_side[P: Planner](mut catalog: Catalog, q: BoundQuery, t: Int, needed: 
     return JoinSide(table, cols^, kc^, True, flags^, kept)
 
 
+def _empty_side(catalog: Catalog, q: BoundQuery, t: Int, needed: List[Int]) -> JoinSide:
+    """F-206: side `t` when an exact count found that its filter keeps no row: its whole table with every flag 0 (no second pass to read what is known to be nothing)."""
+    var start = q.tab_start[t]
+    var keycols = q.jk_l.copy() if t == 0 else q.jk_r.copy()
+    var table = catalog.sources[q.sources[t]].table
+    var cols = List[Int]()
+    for g in needed:
+        cols.append(g - start)
+    var kc = List[Int]()
+    for g in keycols:
+        kc.append(g - start)
+    return JoinSide(table, cols^, kc^, True, List[UInt8](length=table.rows(), fill=0), 0)
+
+
 def _read_side[P: Planner](mut catalog: Catalog, q: BoundQuery, t: Int, needed: List[Int], planner: P, opts: PlannerOptions, trust: Bool, build: Bool = False) raises -> JoinSide:
     """Side `t` of a two-table join: flags over its table when it has a big filter (`_settle_side` copies it later if it does not build), else `_join_side`."""
     var f = _flag_side[P](catalog, q, t, needed, planner, opts, trust)
@@ -2020,7 +2034,10 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
         lrows = catalog.sources[q.sources[0]].rows()                 # (its rows before the filter: the side is not read to count them)
     elif may0:
         lrows = _count_side[P](catalog, q, 0, planner, opts, trust, res)
-        if lrows * DEFER_PASS_DEN < catalog.sources[q.sources[0]].table.rows():      # a selective filter: writing the few rows that pass beats probing them all ...
+        if lrows == 0 and kind == 0:                                 # F-206: an inner join with a side that keeps no row has no rows: nothing is read again
+            may0 = False
+            left = _empty_side(catalog, q, 0, lneed)
+        elif lrows * DEFER_PASS_DEN < catalog.sources[q.sources[0]].table.rows():      # a selective filter: writing the few rows that pass beats probing them all ...
             if len(q.conj_x) == 0:
                 pf0 = True                                       # ... unless the pipeline runs the filter first and probes only those rows (F-161): nothing is written
             else:
@@ -2033,7 +2050,10 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
         rrows = catalog.sources[q.sources[1]].rows()
     elif may1:
         rrows = _count_side[P](catalog, q, 1, planner, opts, trust, res)
-        if rrows * DEFER_PASS_DEN < catalog.sources[q.sources[1]].table.rows():
+        if rrows == 0 and kind == 0:
+            may1 = False
+            right = _empty_side(catalog, q, 1, rneed)
+        elif rrows * DEFER_PASS_DEN < catalog.sources[q.sources[1]].table.rows():
             if len(q.conj_x) == 0:
                 pf1 = True
             else:

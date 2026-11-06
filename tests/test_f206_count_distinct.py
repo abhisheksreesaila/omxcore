@@ -232,3 +232,17 @@ def test_random_queries_equal_duckdb(probe, world, seed):
     sql, tables = random_query(random.Random(seed))
     res = run_probe(probe, sql, files_of(world, tables), mode="table")
     same(res, world["con"].execute(sql), sql, f"seed {seed}")
+
+
+@pytest.mark.parametrize("sql", [
+    "select dg, count(distinct xt) as n from fact join dim on k = dk where v < 0 group by dg order by dg",
+    "select count(*) as c, sum(v) as s, count(distinct dt) as n from fact join dim on k = dk where v < 0",
+    "select dg, count(*) as c, sum(v) as s from dim join fact on dk = k where v < 0 group by dg order by dg",
+    "select count(*) as c, count(dk) as cd from fact left join dim on k = dk where v < 0",
+    "select count(*) as c, count(dk) as cd from dim left join fact on k = dk where v < 0",
+    "select count(*) as c from fact join dim on k = dk where v < 3 and xi < 0",
+], ids=["distinct", "global", "dim first", "left, filter on the preserved side", "left, filter on the right (WHERE)", "two filters"])
+def test_a_join_side_that_keeps_no_row_is_not_read_again(probe, world, sql):
+    """The 150,000-row table's filter keeps nothing: an exact count says so, and the inner join is empty without a second pass over the table (a LEFT join keeps its answer)."""
+    res = run_probe(probe, sql, files_of(world, ["fact", "dim"]), mode="table")
+    same(res, world["con"].execute(sql), sql, "no rows")
