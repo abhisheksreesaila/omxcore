@@ -63,6 +63,7 @@ struct PlannerOptions(Copyable, Movable):
     # GPU runs what the GPU programs run (a single table's integer / DECIMAL / DATE aggregates) and the notes say what fell back to the CPU
     var device: Int                          # CPU, GPU or AUTO (query.mojo's)
     var gpu_min_rows: Int                    # AUTO's row threshold (AUTO_GPU_MIN_ROWS; a test lowers it instead of building a big table)
+    var keep_at: Int                         # F-205: the address of the caller's n flag bytes, which a `keep_flags` row query fills (0: none)
     var device_table: Optional[DeviceTable]  # the table's copy already on the device (as `Query.on_device`); None: the table is uploaded for this query
 
     def __init__(out self):
@@ -73,6 +74,7 @@ struct PlannerOptions(Copyable, Movable):
         self.device = AUTO
         self.gpu_min_rows = AUTO_GPU_MIN_ROWS
         self.device_table = None
+        self.keep_at = 0
         self.job = JobCtl()
         self.written_order = False
         self.join_order = List[Int]()

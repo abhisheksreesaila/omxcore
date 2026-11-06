@@ -757,12 +757,20 @@ struct JoinSide(Movable):
     var cols: List[Int]
     var key_cols: List[Int]
     var zero_copy: Bool
+    var keep: List[UInt8]            # F-205: one flag byte per row of `table` (1: the side's filter passes it); empty: every row is the side's. The table is then the source itself.
+    var kept: Int                    # the rows that pass (`table.rows()` when `keep` is empty)
 
-    def __init__(out self, table: SharedTable, var cols: List[Int], var key_cols: List[Int], zero_copy: Bool):
+    def __init__(out self, table: SharedTable, var cols: List[Int], var key_cols: List[Int], zero_copy: Bool, var keep: List[UInt8] = List[UInt8](), kept: Int = -1):
         self.table = table
         self.cols = cols^
         self.key_cols = key_cols^
         self.zero_copy = zero_copy
+        self.keep = keep^
+        self.kept = kept if kept >= 0 else self.table.rows()
+
+    def rows(self) -> Int:
+        """The side's rows after its filter."""
+        return self.kept
 
 
 def _gather_column(src: Int, valid: Int, rows_a: Int, n: Int, dst_a: Int, nul_a: Int, threads: Int):
@@ -836,3 +844,105 @@ def _fill_column_owned(mut col: Column, var vals: List[Int64], var nul: List[UIn
             col.validity = List[UInt8]()
 
 
+
+
+# ── a filter as flag bytes (F-205) ───────────────────────────────────────────────────────────────────
+
+def count_flags(addr: Int, n: Int, threads: Int) -> Int:
+    """How many of the n flag bytes at `addr` are 1."""
+    var tasks = max(1, min(threads if threads > 0 else core_count(), n // 262144 + 1))
+    var counts = List[Int](length=tasks, fill=0)
+    var cp = Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=Int(counts.unsafe_ptr()))
+
+    def count(t: Int) {imm}:
+        var fl = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=addr)
+        var c = 0
+        for i in range(n * t // tasks, n * (t + 1) // tasks):
+            c += Int(fl[i])
+        cp[t] = Int64(c)
+
+    par_n(count, tasks, tasks)
+    var total = 0
+    for t in range(tasks):
+        total += counts[t]
+    return total
+
+
+def apply_build_keep(mut keys: JoinKeys, keep: List[UInt8], threads: Int):
+    """F-205: the build side's rows its filter drops cannot match: their `ok` byte is 0 (the map holds the passing rows only, no filtered copy is written)."""
+    var n = len(keep)
+    if n == 0:
+        return
+    if keys.bo_addr == 0:
+        keys.bok = keep.copy()
+        keys.bo_addr = Int(keys.bok.unsafe_ptr())
+        return
+    var tasks = max(1, min(threads if threads > 0 else core_count(), n // 262144 + 1))
+    var ok = Int(keys.bok.unsafe_ptr())
+    var kp = Int(keep.unsafe_ptr())
+
+    def both(t: Int) {imm}:
+        var o = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=ok)
+        var k = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=kp)
+        for i in range(n * t // tasks, n * (t + 1) // tasks):
+            o[i] = o[i] & k[i]
+
+    par_n(both, tasks, tasks)
+
+
+def compact_side(side: JoinSide, threads: Int) raises -> JoinSide:
+    """F-205: a flagged side as the table of its passing rows (the carried columns only): no second evaluation of the filter, a gather by the flags' row numbers."""
+    var n = side.table.rows()
+    var m = side.kept
+    var tasks = max(1, min(threads if threads > 0 else core_count(), n // 262144 + 1))
+    var counts = List[Int](length=tasks + 1, fill=0)
+    var kp = Int(side.keep.unsafe_ptr())
+    var cp = Pointer[Int64, MutUntrackedOrigin](unsafe_from_address=Int(counts.unsafe_ptr()))
+
+    def count(t: Int) {imm}:
+        var fl = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=kp)
+        var c = 0
+        for i in range(n * t // tasks, n * (t + 1) // tasks):
+            c += Int(fl[i])
+        cp[t + 1] = Int64(c)
+
+    par_n(count, tasks, tasks)
+    for t in range(tasks):
+        counts[t + 1] += counts[t]
+    var rows = List[Int32](unsafe_uninit_length=max(m, 1))
+    var rp = Pointer[Int32, MutUntrackedOrigin](unsafe_from_address=Int(rows.unsafe_ptr()))
+
+    def fill(t: Int) {imm}:
+        var fl = Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=kp)
+        var at = Int(cp[t])
+        for i in range(n * t // tasks, n * (t + 1) // tasks):
+            if fl[i] != 0:
+                rp[at] = Int32(i)
+                at += 1
+
+    par_n(fill, tasks, tasks)
+    if counts[tasks] != m:                                          # (also keeps `counts` alive until the workers have read it)
+        raise Error("internal: the flags' count changed while they were read")
+    var out = Table.empty()
+    var cols = List[Int]()
+    var kc = List[Int]()
+    for j in range(len(side.cols)):
+        var c = side.cols[j]
+        var kind = side.table.kind(c)
+        var col = out.add_column(side.table.name(c), kind, scale=side.table.scale(c))
+        cols.append(j)
+        var vals = List[Int64](unsafe_uninit_length=m)
+        var has_nulls = side.table.null_count(c) > 0
+        var nul = List[UInt8](length=m if has_nulls else 0, fill=0)
+        _gather_column(Int(side.table.values(c).unsafe_ptr()), _valid_bits(side.table, c), Int(rows.unsafe_ptr()), m, Int(vals.unsafe_ptr()),
+                       Int(nul.unsafe_ptr()) if has_nulls else 0, threads)
+        if kind == TEXT:
+            out.share_dictionary(col, side.table, c)
+        _fill_column_owned(out.cols[col], vals^, nul^)
+    _ = rows^                                                       # (alive until every column is gathered)
+    for k in side.key_cols:
+        for j in range(len(side.cols)):
+            if side.cols[j] == k:
+                kc.append(j)
+                break
+    return JoinSide(out^.share(), cols^, kc^, False)

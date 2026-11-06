@@ -417,6 +417,7 @@ struct BoundQuery(Movable):
     var resid_text: List[String]
     var resid_mask: List[Int]
     var is_side: Bool                # F-158: this row query delivers a join's build side: the rows it collects count against the join memory budget
+    var keep_flags: Bool             # F-205: a row query over a plain table that writes one flag byte per row (1: the filter passes it) at `PlannerOptions.keep_at`, no rows
     var rows: Bool                   # a row query: `routs` and `rorder` hold its select list and ORDER BY (expressions of `rexprs`)
     var distinct: Bool               # SELECT DISTINCT (bound as a group-by on the select list)
     var routs: List[Int]
@@ -454,6 +455,7 @@ struct BoundQuery(Movable):
         self.resid_mask = List[Int]()
         self.rows = False
         self.is_side = False
+        self.keep_flags = False
         self.distinct = False
         self.routs = List[Int]()
         self.rorder = List[SortKey]()
@@ -2959,6 +2961,7 @@ def copy_query(q: BoundQuery) -> BoundQuery:
     c.resid_mask = q.resid_mask.copy()
     c.rows = q.rows
     c.is_side = q.is_side
+    c.keep_flags = q.keep_flags
     c.distinct = q.distinct
     c.routs = q.routs.copy()
     c.rorder = q.rorder.copy()
