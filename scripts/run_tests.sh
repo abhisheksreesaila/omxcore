@@ -28,4 +28,4 @@ for a in "$@"; do
 done
 [ ${#paths[@]} -eq 0 ] && paths=("$shim/omxcore/tests")
 # a test stuck for 15 minutes dumps every thread's stack (a full-suite run hung once under load, F-070)
-cd "$shim/omxcore" && exec pytest -o faulthandler_timeout=900 "${paths[@]}" "${args[@]}"
+cd "$shim/omxcore" && exec pytest -o faulthandler_timeout=900 "${paths[@]}" ${args[@]+"${args[@]}"}

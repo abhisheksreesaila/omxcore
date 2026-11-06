@@ -656,13 +656,14 @@ def test_permutation_job() raises:
             _ = watch(job, "sort " + String(c))
             var got = job.result()
             expect(len(got) == len(plain) and same_ints(got, plain), "permutation_job == permutation: " + String(c) + " descending " + String(desc))
-    var slow = permutation_job(f, f.column("v"))
-    pause(5000)
-    slow.cancel()
-    var t0 = perf_counter_ns()
-    expect(slow.wait() == JOB_CANCELLED, "a cancelled sort has no result")
-    var ms = Float64(perf_counter_ns() - t0) / 1e6
-    expect(ms < 400.0, "the sort stops within a few checks of the cancel: " + String(ms) + " ms")
+    comptime if JOBS_ARE_THREADED:                      # (a job that runs inside its start call is done before cancel() is called)
+        var slow = permutation_job(f, f.column("v"))
+        pause(5000)
+        slow.cancel()
+        var t0 = perf_counter_ns()
+        expect(slow.wait() == JOB_CANCELLED, "a cancelled sort has no result")
+        var ms = Float64(perf_counter_ns() - t0) / 1e6
+        expect(ms < 400.0, "the sort stops within a few checks of the cancel: " + String(ms) + " ms")
 
 
 def test_cancel_latency() raises:

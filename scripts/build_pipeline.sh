@@ -43,23 +43,23 @@ if [[ "$(uname -m)" == "x86_64" ]]; then V3=(--target-cpu x86-64-v3); else V3=()
 case "$WHICH" in all|cpu|exec|gpu|keys|join|hashjoin|aot) ;; *) echo "unknown target: $WHICH" >&2; exit 2 ;; esac
 
 if [[ "$WHICH" == "all" || "$WHICH" == "cpu" ]]; then
-    build pipeline_cpu libmxpipeline_cpu "${V3[@]}"
+    build pipeline_cpu libmxpipeline_cpu ${V3[@]+"${V3[@]}"}
 fi
 if [[ "$WHICH" == "all" || "$WHICH" == "cpu" || "$WHICH" == "exec" ]]; then
     # F-030 native executor: one call runs the whole plan (imports pipeline_cpu.mojo)
-    build executor_cpu libmxexec_cpu "${V3[@]}"
+    build executor_cpu libmxexec_cpu ${V3[@]+"${V3[@]}"}
 fi
 if [[ "$WHICH" == "all" || "$WHICH" == "gpu" ]]; then
-    build pipeline_gpu libmxpipeline_gpu "${V3[@]}"
+    build pipeline_gpu libmxpipeline_gpu ${V3[@]+"${V3[@]}"}
 fi
 if [[ "$WHICH" == "all" || "$WHICH" == "keys" ]]; then
-    build groupkeys_cpu libmxgroupkeys_cpu "${V3[@]}"
+    build groupkeys_cpu libmxgroupkeys_cpu ${V3[@]+"${V3[@]}"}
 fi
 if [[ "$WHICH" == "all" || "$WHICH" == "join" ]]; then
-    build joinsemi_cpu libmxjoin_cpu "${V3[@]}"
+    build joinsemi_cpu libmxjoin_cpu ${V3[@]+"${V3[@]}"}
 fi
 if [[ "$WHICH" == "all" || "$WHICH" == "hashjoin" ]]; then
-    build hashjoin_lib libmxhashjoin_cpu "${V3[@]}"
+    build hashjoin_lib libmxhashjoin_cpu ${V3[@]+"${V3[@]}"}
 fi
 if [[ "$WHICH" == "all" || "$WHICH" == "aot" ]]; then
     build kernels_aot libmxkernels_aot
