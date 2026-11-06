@@ -48,7 +48,7 @@ from std.memory.alloc import unsafe_alloc
 from std.ffi import external_call
 from .sqlprog import lower_rows
 from .planner import (plan_sinks, Planner, RulePlanner, PlannerOptions, PhysicalPlan, Stats, ColStat, G_NONE, G_DENSE, G_HASHED, commas, JoinStats, JoinPlan, JoinStep,
-                      BUILD_AUTO, BUILD_LEFT, BUILD_RIGHT)
+                      BUILD_AUTO, BUILD_LEFT, BUILD_RIGHT, GROUP_AUTO)
 from .sqlprog import SqlProgram, DictAccess, lower_sql, collect_columns, PHASE_ALL, PHASE_PLAIN, PHASE_HOL
 from .sqleval import ValCol, float_bits, ld_div, ld_div_wide
 from .wide import wide_text
@@ -117,10 +117,11 @@ def _hash_group(kw: List[List[Int64]], g: Int) -> UInt64:
 
 
 comptime TWO_PHASE_DECLINED = "count(DISTINCT): too many (keys, value) groups for two phases"     # F-206: raised by the first phase, caught where the query is run
-comptime TWO_PHASE_MIN_ROWS = 1048576        # F-206: a hashed first phase over fewer rows has at most this many groups: it needs no trial
-comptime TWO_PHASE_MAX_GROUPS = 2000000      # F-206: more (keys, value) groups than this (or than 1/8 of the rows) and the pair set of the holistic path is the cheaper way
+comptime TWO_PHASE_MIN_ROWS = 262144         # F-206: a first phase over fewer rows has at most this many groups: it needs no trial
+comptime TWO_PHASE_MAX_GROUPS = 2000000      # F-206: more (keys, value) groups than this, or more than 1/3 of the rows that reach the groups (a pair for almost every row), and the pair set of the holistic path is the cheaper way ...
 comptime TWO_PHASE_MIN_GROUPS = 131072       # F-206: ... but this many is always fine
-comptime TWO_PHASE_DENSE_MAX = 1048576       # F-206: a dense first phase over a domain of more slots than this is declined (its groups are read slot by slot)
+comptime TWO_PHASE_SHARE = 3
+comptime TWO_PHASE_DENSE_MAX = 65536          # F-206: the first phase is dense only up to this many slots (the planner is told; a table of 300,000 slots for 7,000 groups costs more than the groups), and a forced dense layout past it is declined
 comptime MERGE_PART_BITS = 8                  # 256 partitions: each is merged by one worker, with no sharing and no locks
 
 
@@ -292,6 +293,18 @@ struct PartAcc(Movable):
         var total = 0
         for p in range(len(self.parts)):
             total += len(self.parts[p].counts)
+        return total
+
+    def passed_count(self) -> Int:
+        """The rows the groups hold so far."""
+        var total = 0
+        if self.batches <= 1:
+            for c in self.first.counts:
+                total += c
+            return total
+        for p in range(len(self.parts)):
+            for c in self.parts[p].counts:
+                total += c
         return total
 
     def finish(mut self) -> Partial:
@@ -861,7 +874,7 @@ def _two_phase_query(q: BoundQuery, d: Int) -> BoundQuery:
     var q2 = copy_query(q)
     var sd = q.aggs[d].copy()
     q2.fold_keys = len(q.keys)
-    q2.keys.append(KeySpec(sd.arg, sd.name, "distinct " + sd.canon))
+    q2.keys.append(KeySpec(sd.arg, "(distinct value of " + sd.name + ")", "distinct " + sd.canon))
     q2.aggs[d] = AggSpec(F_COUNT_STAR, -1, 0.0, sd.kind, sd.scale, sd.name, sd.canon)
     q2.fold_dist.append(d)
     return q2^
@@ -1071,8 +1084,14 @@ def _gpu_chunk(chunk: SharedTable, sp: SqlProgram, mut g: _Gpu, job: JobCtl) rai
     return None
 
 
+def _too_many_pairs(est_groups: Int, groups: Int, passed: Int) -> Bool:
+    """F-206: whether the first phase of a COUNT(DISTINCT) would make too many (keys, value) groups for a group table: `est_groups` is the whole run's guess from what has been
+    read, `groups` the groups made so far from `passed` rows."""
+    return est_groups > TWO_PHASE_MAX_GROUPS or (est_groups > TWO_PHASE_MIN_GROUPS and groups * TWO_PHASE_SHARE > passed)
+
+
 def _fold(sp: SqlProgram, plan: PhysicalPlan, chunk: SharedTable, mask_addr: Int, mut hs: HolStates, ops: List[Int], threads: Int,
-          mut pacc: PartAcc, mut dense_acc: QueryResult, fj: Optional[ArcPointer[FusedJoin]], mut gpu: _Gpu, job: JobCtl = JobCtl(), max_groups: Int = 0) raises:
+          mut pacc: PartAcc, mut dense_acc: QueryResult, fj: Optional[ArcPointer[FusedJoin]], mut gpu: _Gpu, job: JobCtl = JobCtl(), trial: Bool = False) raises:
     """Runs the program over one chunk and folds its partial result into the accumulator. `job` (F-175) moves by the chunk's rows."""
     var n = chunk.rows()
     var exact = job.active() and not sp.p.repro
@@ -1090,10 +1109,13 @@ def _fold(sp: SqlProgram, plan: PhysicalPlan, chunk: SharedTable, mask_addr: Int
                 job.advance(end - at)
                 at = end
             return
-        if max_groups > 0 and n >= TWO_PHASE_MIN_ROWS:                # F-206: the first 1/32 of the rows say how many groups the whole will make (a clustered key's groups grow with the rows); when
+        if trial and n >= TWO_PHASE_MIN_ROWS:                # F-206: the first 1/32 of the rows say how many groups the whole will make (a clustered key's groups grow with the rows); when
             var cut = max(MORSEL_ROWS, n // 32) // 8 * 8                  # that passes the limit the pair set of the holistic path is cheaper; else the partial is kept and the rest is a second range
             var first = _run_hashed(chunk, sp, mask_addr, plan.key_words(), threads, fj, 0, cut)
-            if first.groups() * (n // cut) > max_groups:
+            var passed = 0
+            for c in first.counts:
+                passed += c
+            if _too_many_pairs(first.groups() * (n // cut), first.groups(), passed):
                 raise Error(TWO_PHASE_DECLINED)
             pacc.add(first^, ops, threads)
             pacc.add(_run_hashed(chunk, sp, mask_addr, plan.key_words(), threads, fj, cut, n - cut), ops, threads)
@@ -1329,13 +1351,11 @@ def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
         if fj:
             ch.override = fj.value()[].probe
     var delta_rows = len(lsrc.overlay.delta)
-    var max_groups = 0                                                # F-206: the first phase of a COUNT(DISTINCT) may make this many (keys, value) groups
+    var trial = False                                                 # F-206: the first phase of a COUNT(DISTINCT) is checked for too many (keys, value) groups as it goes
     if q.fold_keys >= 0:
         if plan.group == G_DENSE and plan.domain > TWO_PHASE_DENSE_MAX:
             raise Error(TWO_PHASE_DECLINED)
-        var all_rows = chunk_rows_total(lsrc, ch)
-        if all_rows >= TWO_PHASE_MIN_ROWS:                            # (fewer rows make at most that many groups: no trial)
-            max_groups = min(TWO_PHASE_MAX_GROUPS, max(TWO_PHASE_MIN_GROUPS, all_rows // 8))
+        trial = chunk_rows_total(lsrc, ch) >= TWO_PHASE_MIN_ROWS      # (fewer rows make at most that many groups: no trial)
     if gpu.use:                                                       # F-191
         _gpu_open(src, opts, gpu)
     if fj and not ps and fj.value()[].pred_first and sp.p.pred_reg >= 0 and pred_reads_probe_only(sp.p, fj.value()[].n_probe_cols):
@@ -1366,8 +1386,8 @@ def _execute(src: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: PlannerOpt
         var fji = fj
         if ps:                                                         # this chunk's own join: its keys, the build sides' maps shared
             fji = ArcPointer(chunk_join(ps.value()[], chunk))
-        _fold(sp, plan, chunk, ch.mask_addr, hs, ops, threads, pacc, dense_acc, fji, gpu, opts.job, max_groups if ch.n() == 1 else 0)
-        if max_groups > 0 and plan.group == G_HASHED and ch.n() > 1 and i + 1 < ch.n() and pacc.group_count() * ch.n() // (i + 1) > max_groups:
+        _fold(sp, plan, chunk, ch.mask_addr, hs, ops, threads, pacc, dense_acc, fji, gpu, opts.job, trial and ch.n() == 1)
+        if trial and plan.group == G_HASHED and ch.n() > 1 and i + 1 < ch.n() and _too_many_pairs(pacc.group_count() * ch.n() // (i + 1), pacc.group_count(), pacc.passed_count()):
             raise Error(TWO_PHASE_DECLINED)                           # (a scan's row groups: the groups so far, by the share of the chunks read)
     if sp.guard_slot >= 0 and dense_acc.counts[sp.guard_slot] > 0:
         raise Error(LIE + String(dense_acc.counts[sp.guard_slot]) + (" row lies" if dense_acc.counts[sp.guard_slot] == 1 else " rows lie") +
@@ -3140,7 +3160,10 @@ def _run_sql_resolved[P: Planner](mut catalog: Catalog, q: BoundQuery, planner: 
     var d = _two_phase_agg(q)                                          # F-206: COUNT(DISTINCT e) GROUP BY g runs as GROUP BY (g, e), then a count per g
     if d >= 0:
         try:
-            return _run_sql_phases(catalog, _two_phase_query(q, d), planner, opts)
+            var o2 = opts.copy()
+            if o2.group == GROUP_AUTO:
+                o2.dense_limit = min(o2.dense_limit, TWO_PHASE_DENSE_MAX)
+            return _run_sql_phases(catalog, _two_phase_query(q, d), planner, o2)
         except e:
             if String(e) != TWO_PHASE_DECLINED:
                 raise e^

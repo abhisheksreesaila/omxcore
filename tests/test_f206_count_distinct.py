@@ -158,14 +158,17 @@ def test_a_join_stays_fused(probe, world):
 
 @pytest.fixture(scope="module")
 def big(tmp_path_factory):
-    """1.2M rows (past the trial's 1,048,576): gh few groups under a large key domain (hashed), gu unique, gp clustered (3 rows a key), x small."""
+    """1.2M rows (past the trial's 262,144): gh few groups under a large key domain (hashed), gu unique, gp clustered (2 rows a key), x small."""
     d = tmp_path_factory.mktemp("f206big")
     con = oracle_connection()
-    con.execute("""create table bt as select i as id, (i % 400) * 1000003 as gh, i as gu, i // 3 as gp,
-        case when i % 17 = 0 then null else (i * 7) % 13 end as x from range(1200000) r(i)""")
+    con.execute("""create table bt as select i as id, (i % 400) * 1000003 as gh, i as gu, i // 2 as gp,
+        case when i % 17 = 0 then null else (i * 7) % 13 end as x, (i * 13) % 1000 as jk from range(1200000) r(i)""")
+    con.execute("create table bd as select i as dk, case when i % 50 = 0 then null else i % 7 end as dv from range(1000) r(i)")
     path = d / "bt.parquet"
     con.execute(f"copy bt to '{path}' (format parquet, row_group_size 100000)")
-    return {"path": path, "con": con}
+    dpath = d / "bd.parquet"
+    con.execute(f"copy bd to '{dpath}' (format parquet)")
+    return {"path": path, "dpath": dpath, "con": con}
 
 
 @pytest.mark.parametrize("mode", ["table", "scan"])
@@ -180,10 +183,23 @@ def test_few_groups_over_many_rows_run_two_phases(probe, big, mode):
 @pytest.mark.parametrize("mode", ["table", "scan"])
 @pytest.mark.parametrize("key", ["gu", "gp"])
 def test_many_groups_keep_the_pair_set_of_the_holistic_path(probe, big, mode, key):
-    """A unique key (1.2M pairs) and a clustered one (400,000, past 1/8 of the rows) are declined by the trial: same answers, no two-phase note."""
+    """A unique key (1.2M pairs) and a clustered one (600,000, one pair for every second row) are declined by the trial: same answers, no two-phase note."""
     sql = f"select {key}, count(distinct x) as n from bt group by {key} having count(distinct x) = 0 or {key} % 4999 = 0 order by {key}"
     res = run_probe(probe, sql, {"bt": big["path"]}, mode=mode)
     same(res, big["con"].execute(sql), sql, f"{mode} {key}")
+    assert not two_phase(res), res["notes"]
+
+
+def test_the_trial_runs_through_a_fused_join(probe, big):
+    """A probe table of 1.2M rows joined with a 1,000-row dimension: the trial range goes through the fused join, the answer equals DuckDB; with a pair for every row it is declined."""
+    files = {"bt": big["path"], "bd": big["dpath"]}
+    few = "select gh, count(distinct dv) as n from bt join bd on jk = dk group by gh order by gh"
+    res = run_probe(probe, few, files, mode="table")
+    same(res, big["con"].execute(few), few, "few pairs")
+    assert two_phase(res) and any("join path: fused" in n for n in res["notes"]), res["notes"]
+    many = "select gu, count(distinct dv) as n from bt join bd on jk = dk group by gu having count(distinct dv) = 0 or gu % 4999 = 0 order by gu"
+    res = run_probe(probe, many, files, mode="table")
+    same(res, big["con"].execute(many), many, "a pair for every row")
     assert not two_phase(res), res["notes"]
 
 
