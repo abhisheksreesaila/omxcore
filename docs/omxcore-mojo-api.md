@@ -877,7 +877,7 @@ suffix `_1`). It must come first; the rest of the builder's rules (`where`, dens
 No joined row is written when the query computes: it runs fused, as SQL's join does (`jfront.mojo`: the same keys, the same hash table, the same front stage that looks each block of probe rows up and gathers
 only the build-side columns the plan reads) when the build side's keys are unique, repeat up to 64 times, or the join is semi / anti; `QueryResult.notes` says so (`join build side:`, `join path: fused ...`,
 `join path: materialized ...: (why)`). Otherwise (a holistic aggregate, hashed multi-column keys, a key with more than 64 rows, `compute(GPU)`) the rows are written first, only the columns the plan reads
-(`join path: materialized`). The joined query's `table` is the joined *schema* with no rows (names, kinds, dictionaries); `q.joined_table()` writes the joined rows as a table when you want them
+(`join path: materialized`). **Breaking (F-204):** the field that held a Query's input is now `Query.base` and `table` is a method, `q.table()`, that returns the rows the query reads (a joined query's joined rows, written when asked; its `base` is only the joined schema, no rows, so `q.table.rows()` no longer compiles and nothing can read an empty table by mistake). `q.joined_table()` is the same call
 (`Query.on_device`, `view_sql` / `view_source` refuse a joined query, `window` writes the rows first). Builder queries that do not start with a join have no notes.
 
 **Keys (exactness)**: a NULL key never matches. TEXT keys match by bytes across dictionaries (a once-per-dictionary translation of codes), so `West` is not `west`

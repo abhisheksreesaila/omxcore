@@ -138,7 +138,7 @@ def compute_joined(q: Query, device: Int, job: JobCtl) raises -> QueryResult:
     var t0 = perf_counter_ns()
     var kind = how_kind(jn.how)
     var semi_anti = kind >= 2
-    var vt = q.table                                                  # the joined schema, no rows
+    var vt = q.base                                                  # the joined schema, no rows
     var prog = _lower(vt, q.nodes, False, False)                      # a bad plan fails here, before any key is built
     var used = List[Bool](length=len(jn.names), fill=False)
     for node in q.nodes:
@@ -172,10 +172,8 @@ def compute_joined(q: Query, device: Int, job: JobCtl) raises -> QueryResult:
     var np = (jn.right.rows() if left_builds else jn.left.rows())
     var side_note = "join: " + jn.how + " on " + jn.key_text + ": " + commas(jn.left.rows()) + " rows and " + commas(jn.right.rows()) + " rows"
     if not fusable:
-        if device == GPU:                                              # a joined query has no DeviceTable: the refusal is the one a table without it gets, before any row is written
-            var bare = Query(q.table)
-            bare.nodes = q.nodes.copy()
-            return bare.compute(GPU, job)
+        if device == GPU:
+            raise Error("device GPU: a Query that starts with a join runs on the CPU (the join is fused into the CPU pipeline; there is no DeviceTable of the joined rows)")
         var gathered = String()
         var jt = materialize_join(jn, used, q._threads, gathered)
         var inner = Query(jt^.share())

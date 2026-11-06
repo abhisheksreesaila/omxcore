@@ -22,6 +22,14 @@ The Mac build commands are unchanged from 3d2455d (below). **No new libSystem sy
 OK). For parallel saves on the Mac, build the app with `-D MXFRAME_JOB_THREADS` (the pthread symbols listed under
 23edc59, nothing more); without it, saves run on one thread.
 
+## Next stable (F-204, not yet stable), for apps: BREAKING builder changes
+
+| Area | What changes | Ticket |
+|---|---|---|
+| **BREAKING** `Query.table` | the field is now `Query.base`, and `table` is a method: `q.table()` returns the rows the query reads (the table, a Frame's edited rows, or a joined query's joined rows). `q.table.rows()` no longer compiles; write `q.table().rows()`. A joined query's `base` is the joined schema with no rows, which is why the field is no longer called `table`. | F-204 |
+| **BREAKING** `Query.join` | lazy: nothing is written until `compute` (fused like SQL, `QueryResult.notes` says `join path: fused`); `Frame` accepted on either side (`join(other: Frame, ...)`, `Query(frame).join`); `joined_table()` / `table()` write the joined rows; `on_device`, `view_sql`, `view_source` refuse a joined query; `compute(GPU)` after a join raises `device GPU: a Query that starts with a join runs on the CPU ...`; `Query.window` writes the joined rows first. | F-204 |
+| **BREAKING** signatures | `Query.window(...)` and `ViewSource.view_source(...)` are now `raises`. | F-204 |
+
 ## What changed since the previous stable (5e4cdb1), for apps
 
 | Area | What you get | Ticket |

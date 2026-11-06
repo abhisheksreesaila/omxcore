@@ -208,6 +208,6 @@ def main() raises:
     try:
         _ = Query(left).join(right1, ["k"], ["dk"]).agg(count()).compute(GPU)
     except e:
-        refused = "device GPU" in String(e)
-    expect(refused, "compute(GPU) after a join is refused by name")
+        refused = String(e) == "device GPU: a Query that starts with a join runs on the CPU (the join is fused into the CPU pipeline; there is no DeviceTable of the joined rows)"
+    expect(refused, "compute(GPU) after a join is refused with the join-specific text")
     print("ok test_join_fused")

@@ -283,7 +283,7 @@ struct LazyJoin(Movable):
 struct Query(Movable, ViewSource):
     """A plan over one shared table, or over a session's view of it (`Query(frame)`: its edits, appended and removed
     rows, merges and formula columns, copied when the query is built), built by chaining; `compute` runs it."""
-    var table: SharedTable
+    var base: SharedTable
     var nodes: List[PlanNode]
     var framed: Bool
     var overlay: Overlay
@@ -303,7 +303,7 @@ struct Query(Movable, ViewSource):
         self.jn = None
         self.windows = List[WindowFn]()
         self.edits = 0
-        self.table = table
+        self.base = table
         self.device = None
         self.scan = None
         self._window_rows = 0
@@ -322,7 +322,7 @@ struct Query(Movable, ViewSource):
         self.jn = None
         self.windows = List[WindowFn]()
         self.edits = 0
-        self.table = scan.schema
+        self.base = scan.schema
         self.device = None
         self._window_rows = 0
         self._threads = 0
@@ -338,7 +338,7 @@ struct Query(Movable, ViewSource):
         self.jn = None
         self.windows = List[WindowFn]()
         self.edits = 0
-        self.table = frame.base
+        self.base = frame.base
         self.device = None
         self._window_rows = 0
         self._threads = 0
@@ -373,7 +373,7 @@ struct Query(Movable, ViewSource):
         and the columns of its window functions (a `group_by` or an aggregate is not written: use SQL). It is the text of a catalog view made from a Query
         (`Catalog.view(name, query)`) and of `compute_windows`."""
         if self.jn:
-            raise Error("a Query that starts with a join has no rows to read yet: bake it with `Query(q.joined_table())` first")
+            raise Error("a Query that starts with a join has no rows to read yet: bake it with `Query(q.table())` first")
         var where = String()
         for node in self.nodes:
             if node.kind == P_AGGREGATE:
@@ -395,8 +395,8 @@ struct Query(Movable, ViewSource):
     def view_source(self, name: String) raises -> SqlSource:
         """F-160: the plan's data as a catalog source called `name`: the table, the frame's edits or the Parquet scan it was built over."""
         if self.jn:
-            raise Error("a Query that starts with a join has no rows to read yet: bake it with `Query(q.joined_table())` first")
-        var src = SqlSource(name, self.table)
+            raise Error("a Query that starts with a join has no rows to read yet: bake it with `Query(q.table())` first")
+        var src = SqlSource(name, self.base)
         if self.scan:
             src.kind = SRC_SCAN
             src.scan = self.scan.copy()
@@ -490,7 +490,7 @@ struct Query(Movable, ViewSource):
             raise Error("on_device: a Parquet scan runs on the CPU, one row group at a time")
         if self.jn:
             raise Error("on_device: a Query that starts with a join runs on the CPU (the join is fused into the pipeline)")
-        if not device_table.mirrors(self.table):
+        if not device_table.mirrors(self.base):
             raise Error("on_device: this DeviceTable was not made from the query's table")
         self.device = device_table
         return self^
@@ -507,7 +507,7 @@ struct Query(Movable, ViewSource):
         F-204: no joined row is written. `compute` runs the join the way SQL does (joinq.mojo): the probe table is scanned by the pipeline, each block looks
         its partners up, and only the build-side columns the plan reads are gathered, when the build keys are unique, repeat up to EXPAND_MAX_REP times, or the
         join is a semi / anti one (`QueryResult.notes`: `join path: fused`); otherwise (a holistic aggregate, hashed keys, a hot key) the rows are written, only the
-        columns the plan reads (`join path: materialized`). The joined query's `table` is the joined schema with no rows: `joined_table()` writes the rows."""
+        columns the plan reads (`join path: materialized`). The joined query's `table()` writes the joined rows (its `base` field is the joined schema, no rows)."""
         return self^._join(other, left_on, right_on, how)
 
     def join(var self, other: Frame, left_on: List[String], right_on: List[String], how: String = "inner") raises -> Self:
@@ -562,6 +562,11 @@ struct Query(Movable, ViewSource):
         out._window_rows = self._window_rows
         return out^
 
+    def table(self) raises -> SharedTable:
+        """The rows this query reads, as a table: the table it was built over, a Frame's edited rows, a joined query's joined rows. A method since F-204: the field
+        holding the input is `base`, which for a joined query is only the joined schema with no rows, so a reader must ask (`q.table()`) and never meets it empty."""
+        return self.joined_table()
+
     def joined_table(self) raises -> SharedTable:
         """The rows this query reads as a table: a table is itself, a Frame its edited rows, a query that starts with a join the joined rows (every column, written now)."""
         if self.jn:
@@ -571,7 +576,7 @@ struct Query(Movable, ViewSource):
             return materialize_join(jn, all, self._threads, note)^.share()
         if self.framed and self.edits > 0:                              # (a Frame nobody edited reads as its table)
             return realize_source(self.view_source("t"))
-        return self.table
+        return self.base
 
     def _unjoined(var self) raises -> Self:
         """The same plan over the joined rows as a table (what `window` needs)."""
@@ -619,13 +624,13 @@ struct Query(Movable, ViewSource):
                 raise Error("device GPU: the DeviceTable was released")
             use_gpu = True
         elif device == AUTO and self.device and self.device.value().is_live():
-            if self.table.rows() >= AUTO_GPU_MIN_ROWS:
+            if self.base.rows() >= AUTO_GPU_MIN_ROWS:
                 if holistic:
                     fallback = "count_distinct, percentile, top_k, stddev and variance run on the CPU"
                 else:
                     use_gpu = True
             elif not self.device.value().is_resident():       # (F-196: a table over the budget says why it is not streamed)
-                fallback = "the table has " + String(self.table.rows()) + " rows, under AUTO's " + String(AUTO_GPU_MIN_ROWS) + " for the GPU"
+                fallback = "the table has " + String(self.base.rows()) + " rows, under AUTO's " + String(AUTO_GPU_MIN_ROWS) + " for the GPU"
         var t0 = perf_counter_ns()
         var nodes = self.nodes.copy()
         if self.framed:                                  # formulas inlined, merges remapped
@@ -634,10 +639,10 @@ struct Query(Movable, ViewSource):
                     nodes[i].exprs[k] = self.overlay.expand(nodes[i].exprs[k])
                 for k in range(len(nodes[i].aggs)):
                     nodes[i].aggs[k].arg = self.overlay.expand(nodes[i].aggs[k].arg)
-        var prog = _lower(self.table, nodes, self.framed, len(self.overlay.mask) > 0)
+        var prog = _lower(self.base, nodes, self.framed, len(self.overlay.mask) > 0)
         job.check()
         job.stage(STAGE_AGGREGATE)
-        job.add_total(self.table.rows())
+        job.add_total(self.base.rows())
         if use_gpu and prog.has_float:
             if device == GPU:
                 raise Error("device GPU: a FLOAT column or float arithmetic runs on the CPU (a float64 sum has one defined order there)")
@@ -645,7 +650,7 @@ struct Query(Movable, ViewSource):
             fallback = "a FLOAT column or float arithmetic runs on the CPU (a float64 sum has one defined order there)"
         var hs = HolStates(1, List[HolSpec](), List[List[Int64]]())
         if prog.mat:
-            hs = _build_states(self.nodes, nodes, self.table, self.overlay.words, None, -1 if self.framed else self.table.rows(), prog.src_float.copy(), prog.src_scale.copy())
+            hs = _build_states(self.nodes, nodes, self.base, self.overlay.words, None, -1 if self.framed else self.base.rows(), prog.src_float.copy(), prog.src_scale.copy())
         var r = QueryResult()
         var done = False
         if use_gpu:
@@ -656,7 +661,7 @@ struct Query(Movable, ViewSource):
                 var dt = self.device.value()
                 var ctx = dt.context()
                 var usable = gpu_budget(ctx)
-                var fixed = _gpu_fixed_bytes(ctx, prog, (self.table.rows() + 7) // 8 + 8 if len(self.overlay.mask) > 0 else 0)
+                var fixed = _gpu_fixed_bytes(ctx, prog, (self.base.rows() + 7) // 8 + 8 if len(self.overlay.mask) > 0 else 0)
                 if not dt.is_resident():
                     pieced = True
                 elif fixed > usable:
@@ -674,11 +679,11 @@ struct Query(Movable, ViewSource):
         if use_gpu:
             comptime if HAS_GPU:
                 if pieced:
-                    r = _run_gpu_pieces(self.device.value(), self.table, prog, self.overlay.mask, device == GPU, fallback, job)
+                    r = _run_gpu_pieces(self.device.value(), self.base, prog, self.overlay.mask, device == GPU, fallback, job)
                     done = True
                 else:
-                    var g = _run_gpu(self.device.value(), self.table, prog, self.overlay.mask, device == GPU, fallback)
-                    job.advance(self.table.rows())
+                    var g = _run_gpu(self.device.value(), self.base, prog, self.overlay.mask, device == GPU, fallback)
+                    job.advance(self.base.rows())
                     if g:
                         r = g.take()
                         r.device = GPU
@@ -691,14 +696,14 @@ struct Query(Movable, ViewSource):
         if not done:
             var mask_addr = Int(self.overlay.mask.unsafe_ptr()) if len(self.overlay.mask) > 0 else 0
             if prog.mat:
-                r = _run_mat(self.table, prog, mask_addr, hs, self._window_rows, self._threads, job)
+                r = _run_mat(self.base, prog, mask_addr, hs, self._window_rows, self._threads, job)
             else:
-                r = _run_cpu_job(self.table, prog, mask_addr, self._threads, job)
+                r = _run_cpu_job(self.base, prog, mask_addr, self._threads, job)
             r.fallback_reason = fallback^
         job.check()
         job.stage(STAGE_FINISH)
         if self.framed and len(self.overlay.delta) > 0:
-            _add_delta(r, self.table, nodes, self.overlay, hs)
+            _add_delta(r, self.base, nodes, self.overlay, hs)
         if prog.mat:
             _finish_holistic(r, hs)
         r.milliseconds = Float64(perf_counter_ns() - t0) / 1e6
