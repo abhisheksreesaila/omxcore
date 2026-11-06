@@ -16,6 +16,8 @@ bash "$root/scripts/build_mojo_pkg.sh" > "$root/build/pkg-build.log" 2>&1 || { g
 lib="$root/.pixi/envs/default/lib"
 out="$rundir/bin"   # per run: two runs in one checkout never rebuild a binary the other is running (failures print their log)
 mkdir -p "$out"
+# ldd is GNU only; macOS lists a binary's libraries with otool -L.
+libs_of() { if command -v ldd > /dev/null; then ldd "$1"; else otool -L "$1"; fi; }
 files=("$@")
 [ ${#files[@]} -eq 0 ] && files=("$root"/mojo/tests/test_*.mojo)
 fail=0
@@ -23,13 +25,13 @@ for t in "${files[@]}"; do
   name="$(basename "$t" .mojo)"
   # MOJO_TEST_FLAGS: extra build flags, e.g. "-D OMXCORE_APPLE_GPU_SHAPE" (the Apple GPU's plan on this machine's GPU)
   # shellcheck disable=SC2086
-  if ! mojo build --disable-warnings ${MOJO_TEST_FLAGS:-} "$t" -I "$root/build" -Xlinker -L"$lib" -Xlinker -lzstd -Xlinker -lsnappy -Xlinker -rpath="$lib" \
+  if ! mojo build --disable-warnings ${MOJO_TEST_FLAGS:-} "$t" -I "$root/build" -Xlinker -L"$lib" -Xlinker -lzstd -Xlinker -lsnappy -Xlinker -rpath -Xlinker "$lib" \
        -o "$out/$name" > "$out/$name.build.log" 2>&1; then
     echo "FAIL (build) $name"; tail -20 "$out/$name.build.log"; fail=1; continue
   fi
   # The package must never need Python (brief: no libpython). ldd alone is not enough: Mojo's Python interop
   # dlopens libpython at run time, so look for the interop's runtime symbols in the binary too.
-  if ldd "$out/$name" | grep -i python > /dev/null \
+  if libs_of "$out/$name" | grep -i python > /dev/null \
      || nm -D "$out/$name" 2>/dev/null | grep KGEN_CompilerRT_Python > /dev/null \
      || strings "$out/$name" | grep -E "^Py_Initialize" > /dev/null; then
     echo "FAIL $name uses Python (libpython linked or Mojo Python interop)"; fail=1; continue
@@ -42,7 +44,7 @@ done
 if [ $# -eq 0 ]; then
   sw="$root/mojo/tests/switches/test_switches"
   if mojo build --disable-warnings "$root/mojo/tools/pq_write_sample.mojo" -I "$root/build" -Xlinker -L"$lib" -Xlinker -lzstd -Xlinker -lsnappy \
-       -Xlinker -rpath="$lib" -o "$out/pq_write_sample" > "$out/pq_write_sample.build.log" 2>&1 \
+       -Xlinker -rpath -Xlinker "$lib" -o "$out/pq_write_sample" > "$out/pq_write_sample.build.log" 2>&1 \
      && "$out/pq_write_sample" "$out/switches-zstd.parquet" zstd 500 200 && "$out/pq_write_sample" "$out/switches-snappy.parquet" snappy 500 200 \
      && mojo build --disable-warnings "$sw.mojo" -I "$root/build" -D MXFRAME_NO_GPU -D MXFRAME_SERIAL -D MXFRAME_NO_CODECS \
        -o "$out/test_switches" > "$out/test_switches.build.log" 2>&1; then
@@ -67,7 +69,7 @@ if [ $# -eq 0 ]; then
   printf 'region,qty,revenue\nWest,3,12.50\nEast,1,4.00\nWest,5,20.25\nNorth,4,9.99\nEast,7,30.00\n' > "$out/readme-orders.csv"
   want=$'West 3275 2\nEast 3000 1\nNorth 999 1\nnet 14324 edits 2'
   if mojo build --disable-warnings "$root/mojo/tools/readme_example.mojo" -I "$root/build" -Xlinker -L"$lib" -Xlinker -lzstd \
-       -Xlinker -lsnappy -Xlinker -rpath="$lib" -o "$out/readme_example" > "$out/readme_example.build.log" 2>&1 \
+       -Xlinker -lsnappy -Xlinker -rpath -Xlinker "$lib" -o "$out/readme_example" > "$out/readme_example.build.log" 2>&1 \
      && [ "$("$out/readme_example" "$out/readme-orders.csv")" == "$want" ]; then
     echo "ok   readme_example"
   else echo "FAIL readme_example (docs/reference.md shows its output)"; tail -5 "$out/readme_example.build.log"; fail=1; fi

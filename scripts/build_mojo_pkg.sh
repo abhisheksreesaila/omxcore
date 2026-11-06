@@ -14,11 +14,19 @@ mkdir -p "$root/build"
 # Many builds may run at once (pytest -n workers, mojo-test beside pytest): one at a time behind a lock, staged in
 # a private directory and published by rename, so a reader never sees a half-written package; skipped when the
 # sources and the compiler are unchanged.
-exec 9>"$root/build/.omxcore-pkg.lock"
-flock 9
-stamp="$( { mojo --version 2>/dev/null; cat "$root"/mojo/omxcore/*.mojo "$root"/kernels_aot/*.mojo "$0"; } | sha1sum | cut -c1-40)"
+# macOS has neither flock nor sha1sum: a mkdir lock (atomic) and shasum take their place there.
 work="$(mktemp -d "$root/build/pkg.XXXXXX")"
-trap 'rm -rf "$work"' EXIT
+if command -v flock > /dev/null; then
+  exec 9>"$root/build/.omxcore-pkg.lock"
+  flock 9
+  trap 'rm -rf "$work"' EXIT
+else
+  lockdir="$root/build/.omxcore-pkg.lockdir"
+  until mkdir "$lockdir" 2> /dev/null; do sleep 1; done
+  trap 'rm -rf "$work"; rmdir "$lockdir"' EXIT
+fi
+sha1() { if command -v sha1sum > /dev/null; then sha1sum; else shasum; fi; }
+stamp="$( { mojo --version 2>/dev/null; cat "$root"/mojo/omxcore/*.mojo "$root"/kernels_aot/*.mojo "$0"; } | sha1 | cut -c1-40)"
 # build_one <package name>: stage the sources as <name>/, precompile, publish build/<name>.mojoc
 build_one() {
   local name="$1" out="$root/build/$1.mojoc"
@@ -33,8 +41,9 @@ build_one() {
   echo '"""The native kernels (copied from kernels_aot/ by scripts/build_mojo_pkg.sh: edit them there)."""' > "$stage/kernels/__init__.mojo"
   for f in "$root"/kernels_aot/*.mojo; do
     m="$(basename "$f" .mojo)"
-    sed -i -E "s/^from $m import/from .$m import/" "$stage"/kernels/*.mojo
+    sed -i.bak -E "s/^from $m import/from .$m import/" "$stage"/kernels/*.mojo   # -i.bak: GNU and BSD sed both take it
   done
+  rm -f "$stage"/kernels/*.bak
   mojo precompile --disable-warnings "$stage" -o "$work/$name.mojoc"
   mv -f "$work/$name.mojoc" "$out"
   echo "$stamp" > "$out.stamp"

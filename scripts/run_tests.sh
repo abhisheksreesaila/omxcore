@@ -8,7 +8,7 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 # several agents' suites filled until tests failed with "Disk quota exceeded".
 export TMPDIR="${MXFRAME_TEST_TMPDIR:-$HOME/.cache/mxframe-test-tmp}"
 mkdir -p "$TMPDIR"
-shim="${TMPDIR:-/tmp}/omxcore-pytest-$(printf '%s' "$root" | sha1sum | cut -c1-10)"
+shim="${TMPDIR:-/tmp}/omxcore-pytest-$(printf '%s' "$root" | { sha1sum 2> /dev/null || shasum; } | cut -c1-10)"
 mkdir -p "$shim" && ln -sfn "$root" "$shim/omxcore" && ln -sfn "$root/compat/mxframe" "$shim/mxframe"
 # Test paths (`tests/test_x.py`, `tests/test_x.py::name`) run alone, through the shim;
 # with none, the whole tests directory runs. Other arguments pass through.
