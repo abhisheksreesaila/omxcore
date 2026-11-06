@@ -37,8 +37,8 @@ for t in "${files[@]}"; do
   if (cd "$rundir" && "$out/$name") > "$out/$name.log" 2>&1; then echo "ok   $name"; else echo "FAIL $name"; tail -20 "$out/$name.log"; fail=1; fi
 done
 
-# F-138b: the same package built the way an app with no GPU, thread pool or codecs builds it (what every non-Linux
-# target gets by default, forced here with -D). Its inputs are a zstd and a snappy file from the normal build.
+# F-138b: the same package built the way an app with no GPU, thread pool or codecs builds it (no GPU and no codecs are
+# the default of every non-Linux target; the app adds -D MXFRAME_SERIAL, F-210; all forced here with -D). Its inputs are a zstd and a snappy file from the normal build.
 if [ $# -eq 0 ]; then
   sw="$root/mojo/tests/switches/test_switches"
   if mojo build --disable-warnings "$root/mojo/tools/pq_write_sample.mojo" -I "$root/build" -Xlinker -L"$lib" -Xlinker -lzstd -Xlinker -lsnappy \

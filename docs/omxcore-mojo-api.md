@@ -965,7 +965,7 @@ while the job finds more work (a join reads its sides one after another, a hashe
 
 **Threads.** A job is a `pthread` of its own (`pthread_create`, then the work calls the pool as any caller does: `start_pool` first), so jobs run side by side with each other and with the caller. A plain
 call with no job passes `JobCtl()`: never cancelled, nothing counted, the code path unchanged.
-**The serial build** (`MXFRAME_SERIAL`, and every target but Linux) has no async runtime and, by default, no job threads: the job runs to its end inside its start call and the handle comes back done (or failed), progress at the
+**The serial build** (`-D MXFRAME_SERIAL`; since F-210 no longer every target but Linux: a native Mac build has the pool and threaded jobs like Linux, and an app whose link has no async runtime builds with this switch) has no async runtime and, by default, no job threads: the job runs to its end inside its start call and the handle comes back done (or failed), progress at the
 total, the callback already called; `cancel()` then has nothing to stop. No new symbol: the Mac link check (`scripts/check_mac_link.sh`) lists the same libSystem calls as before the jobs (`pthread_*` is compiled out of that build).
 **Jobs with threads on a serial build** (`-D MXFRAME_JOB_THREADS`, for the app that wants its Mac UI free): the job gets a `pthread` with a 16 MB stack and its kernels still run in a loop (no async runtime, no `AsyncRT_*` symbol);
 the app's libSystem stub and its `ALLOWED` set then need `pthread_create`, `pthread_join`, `pthread_detach`, `pthread_attr_init`, `pthread_attr_setstacksize` and `pthread_attr_destroy` and `sched_yield` (`scripts/check_mac_link.sh` prints them under "with job threads").
