@@ -178,3 +178,17 @@ def test_a_top_k_the_slots_cannot_cut_falls_back_and_equals_duckdb(mx, world, sq
     check(mx, sql, world["con"], world["files"], ordered=True)
     res = run_mx(mx, ["sql", "--max-rows", "0", sql], world["files"])
     assert not any("found on the groups' partial slots" in n for n in res["notes"]), res["notes"]
+
+
+EMPTY_HAVING = [
+    # no row reaches the groups (a filter keeps none): HAVING on the slots must see no group, not read slot lists that were never made
+    "select uid from t where a < 0 group by uid having sum(a) > 30 order by uid",
+    "select uid, count(*) from t where a < 0 group by uid having count(*) > 1 order by uid",
+    "select count(*) from t where uid in (select uid from t where a < 0 group by uid having sum(a) > 30)",
+    "select count(*) from t where uid not in (select uid from t where a < 0 and uid is not null group by uid having sum(a) > 30)",
+]
+
+
+@pytest.mark.parametrize("sql", EMPTY_HAVING)
+def test_having_on_the_slots_over_no_rows_equals_duckdb(mx, world, sql):
+    check(mx, sql, world["con"], world["files"], ordered=True)

@@ -514,6 +514,8 @@ def _having_groups(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Parti
     var conds = List[_Cond]()
     if plan.group == G_NONE or q.having < 0 or not _conds(q, sp, q.having, conds):
         return -1
+    if len(acc.counts) == 0 or len(acc.slots) == 0:     # no row reached the groups: the partial holds no slot lists, and no group survives
+        return 0
     for i in range(len(conds)):
         _arm(acc, conds[i])
     var total = plan.domain if plan.group == G_DENSE else acc.groups()
