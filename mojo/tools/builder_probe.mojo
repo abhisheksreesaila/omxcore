@@ -2,17 +2,17 @@
 # compare with DuckDB and with `sql_probe` (the same join as SQL text).
 #
 #   builder_probe [--mode table|frame] [--right-mode table|frame] [--edits FILE] [--redits FILE] [--how inner|left|semi|anti] [--on lk=rk,lk2=rk2]
-#                 [--where "a<5;b>=3|c==2"] [--group COL:GROUPS] [--aggs "count,sum:v,min:v,max:v,mean:v,countof:v,sum:a*b"] [--threads N] [--repeat N]
+#                 [--where "a<5;b>=3|c==2"] [--group COL:GROUPS] [--aggs "count,sum:v,min:v,max:v,mean:v,countof:v,distinct:v,sum:a*b"] [--threads N] [--repeat N]
 #                 left=path.parquet right=path.parquet
 #
 # --mode / --right-mode  table: the file read whole; frame: read whole, then the edit script (the format of sql_probe) applied to a Frame over it.
 # --where   conjuncts separated by `;`, each a `|` list of `column op integer` (op: < <= > >= == !=); every conjunct is one `.where(...)`.
-# --aggs    count, count of a column, sum, min, max, mean of a column or of `a*b` / `a+b` / `a-b`.
+# --aggs    count, count of a column, count_distinct (F-206: `distinct:v`), sum, min, max, mean of a column or of `a*b` / `a+b` / `a-b`.
 # Output: {"notes": [...], "rows": [[g, count(*), agg...]], "ms": x}: the groups that have rows (all of the one group of no `--group`); a sum / min / max / mean with no
 # value in a group is null, a mean is the float64's text.
 from std.sys import argv
 from std.time import perf_counter_ns
-from omxcore import (Frame, Table, SharedTable, read_parquet, Query, QueryResult, Agg, Expr, col, lit, count, sum, mean, min_of, max_of, float_text, CPU)
+from omxcore import (Frame, Table, SharedTable, read_parquet, Query, QueryResult, Agg, Expr, col, lit, count, sum, mean, min_of, max_of, count_distinct, float_text, CPU)
 
 
 def split(s: String, sep: String) -> List[String]:
@@ -191,6 +191,8 @@ def main() raises:
                     q = q^.agg(count())
                 elif p[0] == "countof":
                     q = q^.agg(count(operand(p[1])))
+                elif p[0] == "distinct":
+                    q = q^.agg(count_distinct(operand(p[1])))
                 elif p[0] == "sum":
                     q = q^.agg(sum(operand(p[1])))
                 elif p[0] == "min":
@@ -220,7 +222,7 @@ def main() raises:
                     if kind == "count":
                         continue
                     out += ", "
-                    if kind == "countof":
+                    if kind == "countof" or kind == "distinct":
                         out += String(r.values(k)[g])
                     elif not r.present(k, g):
                         out += "null"
