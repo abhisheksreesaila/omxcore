@@ -735,7 +735,7 @@ def _finish(q: BoundQuery, plan: PhysicalPlan, sp: SqlProgram, acc: Partial, hre
                     vc.v[i] = float_bits(Float64(from_bits=UInt64(Int64(acc.slots[vs][g]))) / Float64(nonnull))
                 else:
                     var sc = q.rexprs[sp_a.arg].scale
-                    _ = pow10_checked(sc)                           # (a scale a power of ten exists for)
+                    _ = pow10_checked(sc)                           # overflow guard: raises for a scale with no Int128 power of ten
                     if sp.agg_hi_slot[a] >= 0:
                         vc.v[i] = float_bits(avg_div((Int128(Int64(acc.slots[sp.agg_hi_slot[a]][g])) << Int128(32)) + Int128(Int64(acc.slots[vs][g])), Int(nonnull), sc))
                     else:

@@ -38,9 +38,10 @@ def mx():
 
 @pytest.fixture(scope="module")
 def data(tmp_path_factory):
-    """400 rows; qty, other and price each hold NULLs (every 7th, 5th and 11th row, offset so that every combination of unknowns occurs)."""
+    """400 rows; qty, other, price, s (text) and d (date) each hold NULLs (every 7th, 5th, 11th, 6th and 9th row, offset so that every combination of
+    unknowns occurs)."""
     path = tmp_path_factory.mktemp("f212") / "t.csv"
-    rows = ["g,qty,other,price"]
+    rows = ["g,qty,other,price,s,d"]
     s = 4321
     for i in range(400):
         s = (s * 6364136223846793005 + 1442695040888963407) % (1 << 64)
@@ -48,7 +49,9 @@ def data(tmp_path_factory):
         qty = "" if i % 7 == 2 else str(v % 11 - 3)
         other = "" if i % 5 == 1 else str((v // 7) % 13 - 4)
         price = "" if i % 11 == 6 else str(v * 7 - 2000)
-        rows.append(f"{i % 4},{qty},{other},{price}")
+        s_ = "" if i % 6 == 3 else "abcde"[v % 5]
+        d = "" if i % 9 == 4 else f"2024-0{v % 9 + 1}-1{v % 10}"
+        rows.append(f"{i % 4},{qty},{other},{price},{s_},{d}")
     path.write_text("\n".join(rows) + "\n")
     con = duckdb.connect()
     con.execute(f"CREATE TABLE t AS SELECT * FROM read_csv('{path}')")
@@ -85,3 +88,24 @@ def test_a_case_with_a_nullable_condition_and_no_else_equals_duckdb(mx, data, ha
     for dev in ("cpu", "gpu") if has_gpu else ("cpu",):
         res = check(mx, sql, con, files={"t": path}, ordered=True, extra=("--device", dev))
         assert res["device"] == dev, "\n".join(res["notes"])
+
+
+TEXT_DATE_CONDITIONS = [
+    "s = 'a'",
+    "s = 'a' OR s IS NULL",
+    "NOT (s = 'b') AND qty > 0",
+    "s < 'c' OR d > DATE '2024-05-01'",
+    "NOT (d >= DATE '2024-03-01' AND s <> 'e')",
+    "d IS NULL OR (s IS NOT NULL AND d < DATE '2024-06-15')",
+]
+
+
+@pytest.mark.parametrize("cond", TEXT_DATE_CONDITIONS)
+def test_a_where_over_nullable_text_and_date_columns_equals_duckdb(mx, data, has_gpu, cond):
+    """Text and date comparisons take the same known-true / known-false lowering; the answer equals DuckDB on each device (the device that ran it is
+    not asserted: a text compare may stay on the CPU)."""
+    path, con = data
+    sql = f"SELECT g, count(*), sum(price), min(qty) FROM t WHERE {cond} GROUP BY g ORDER BY g"
+    assert con.execute(f"SELECT count(*) FROM t WHERE {cond}").fetchone()[0] not in (0, 400), "the condition keeps some rows and drops others"
+    for dev in ("cpu", "gpu") if has_gpu else ("cpu",):
+        check(mx, sql, con, files={"t": path}, ordered=True, extra=("--device", dev))
