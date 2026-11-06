@@ -23,6 +23,32 @@ from .wide import wide_to_float
 from .postwide import WideRewrite, wide_prepass, fix_wide
 
 
+comptime LAZY_MIN_GROUPS = 4096
+
+
+def _refs_of(q2: BoundQuery, node: Int) -> Int:
+    """How many places read expression `node`: other expressions, the select list, ORDER BY, WHERE."""
+    var c = 0
+    for i in range(len(q2.rexprs)):
+        ref x = q2.rexprs[i]
+        if x.a == node:
+            c += 1
+        if x.b == node:
+            c += 1
+        for it in x.items:
+            if it == node:
+                c += 1
+    for o in q2.routs:
+        if o == node:
+            c += 1
+    for k in q2.rorder:
+        if k.expr == node:
+            c += 1
+    if q2.where == node:
+        c += 1
+    return c
+
+
 def _is_number(kind: Int) -> Bool:
     return kind == INT.value or kind == DECIMAL.value
 
@@ -132,10 +158,35 @@ def _run_post(q: BoundQuery, keys: List[ValCol], aggs: List[ValCol], dicts: Dict
     q2.order_text = q.order_text.copy()
     q2.limit = q.limit
     q2.offset = q.offset
+    # F-202: with ORDER BY ... LIMIT over many groups, a TEXT key that the select list only passes through is not put into the groups' table (its dictionary
+    # would take every group's word, 380,000 of them for TPC-H Q10, to keep 20): a placeholder travels, with the group's number, and the words of the
+    # rows that survive are looked up afterwards
+    var lazy = List[Int](length=len(q2.routs), fill=-1)              # per output: the TEXT key it passes through
+    var n_lazy = 0
+    if not wide and q.limit >= 0 and len(q.order) > 0 and q.having < 0 and n >= LAZY_MIN_GROUPS:
+        for o in range(len(q2.routs)):
+            var node = q2.routs[o]
+            if q2.rexprs[node].op == B_COL and q2.rexprs[node].kind == TEXT.value and Int(q2.rexprs[node].value) < nk and _refs_of(q2, node) == 1:
+                var readers = 0                                      # (another node reading the same key, such as ORDER BY's own, makes it needed)
+                for i in range(len(q2.rexprs)):
+                    if q2.rexprs[i].op == B_COL and q2.rexprs[i].value == q2.rexprs[node].value:
+                        readers += 1
+                if readers == 1:
+                    lazy[o] = Int(q2.rexprs[node].value)
+                    n_lazy += 1
+    var is_lazy_key = List[Bool](length=nk, fill=False)
+    for o in range(len(lazy)):
+        if lazy[o] >= 0:
+            is_lazy_key[lazy[o]] = True
     # the groups as a table
     var g = Table.empty()
     for k in range(nk):
-        _put_column(g, "k" + String(k), keys[k], dicts)
+        if is_lazy_key[k]:
+            var ph = ValCol(TEXT.value, 0, n)
+            ph.nul = List[UInt8](length=n, fill=1)
+            _put_column(g, "k" + String(k), ph, dicts)
+        else:
+            _put_column(g, "k" + String(k), keys[k], dicts)
     for a in range(len(aggs)):
         _put_column(g, "a" + String(a), aggs[a], dicts)
     for h in range(nh):
@@ -156,6 +207,17 @@ def _run_post(q: BoundQuery, keys: List[ValCol], aggs: List[ValCol], dicts: Dict
         _put_column(g, "f" + String(s), f, dicts)
     if g.columns() == 0:                                             # no key and no aggregate (`SELECT 1 HAVING true`): the rows of a table with no column are none, so a column carries the groups
         _put_column(g, "n", ValCol(INT.value, 0, n), dicts)
+    var gi_col = -1
+    if n_lazy > 0:                                                   # the group's number, as one more output
+        var gi = ValCol(INT.value, 0, n)
+        for i in range(n):
+            gi.v[i] = Int64(i)
+        gi_col = g.columns()
+        _put_column(g, "gi", gi, dicts)
+        q2.rexprs.append(BExpr(B_COL, INT.value, 0, -1, -1, Int64(gi_col), "gi", 0, 0))
+        q2.routs.append(len(q2.rexprs) - 1)
+        q2.out_names.append("gi")
+        q2.out_text.append("gi")
     var shared = g^.share()
     var src = SqlSource("groups", shared)
     var dicts2 = DictAccess(shared, None, List[List[String]]())
@@ -169,6 +231,29 @@ def _run_post(q: BoundQuery, keys: List[ValCol], aggs: List[ValCol], dicts: Dict
     var table = execute_rows(src, q2, plan, opts, dicts2, scratch, inp, stage^, True)
     if wide:
         fix_wide(table, q2, rw)
+    if n_lazy > 0:
+        var gcol = table.columns() - 1
+        for o in range(len(lazy)):
+            if lazy[o] < 0:
+                continue
+            ref kv = keys[lazy[o]]
+            var vals = List[Int64]()
+            var valid = List[Bool]()
+            for r in range(table.rows()):
+                var at = Int(table.get(gcol, r))
+                if kv.is_null(at):
+                    vals.append(0)
+                    valid.append(False)
+                else:
+                    vals.append(Int64(table.add_word(o, dicts.word(kv.src, Int(kv.v[at])))))
+                    valid.append(True)
+            table.cols[o].values = List[Int64]()
+            table.cols[o].validity = List[UInt8]()
+            table.cols[o].nulls = 0
+            for r in range(len(vals)):
+                table.cols[o].push(vals[r], valid[r])
+        var dropped = table.cols.pop()
+        _ = table.by_name.pop(dropped.name)
     var selected = n
     for note in scratch:
         if note.startswith("rows: ") and " rows selected" in note:

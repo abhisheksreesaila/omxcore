@@ -354,8 +354,14 @@ struct JoinStats(Copyable, Movable):
     var edge_b: List[Int]
     var ndv_a: List[Int]             # the distinct values of the equality's column in each of the two leaves (after their filters), -1 unknown
     var ndv_b: List[Int]
+    var deferred: List[Bool]         # F-202: per leaf (empty: none): only counted, so its filtered rows are written unless it is the last join's probe side
+    var uniq_a: List[Bool]           # F-202: per equality: the column's values are all different in leaf `edge_a` (a key of it) ...
+    var uniq_b: List[Bool]           # ... in leaf `edge_b`
 
     def __init__(out self):
+        self.deferred = List[Bool]()
+        self.uniq_a = List[Bool]()
+        self.uniq_b = List[Bool]()
         self.names = List[String]()
         self.base_rows = List[Int]()
         self.rows = List[Int]()
@@ -449,6 +455,8 @@ def _plan_from(js: JoinStats, order: List[Int], opts: PlannerOptions) -> JoinPla
     plan.start = order[0]
     in_set[order[0]] = True
     var acc = js.rows[order[0]]
+    if len(js.deferred) > 0 and js.deferred[order[0]]:
+        plan.cost += js.rows[order[0]]                            # F-202: the start table is read filtered whole
     for i in range(1, len(order)):
         var leaf = order[i]
         var est = _step_estimate(js, in_set, acc, leaf)
@@ -458,6 +466,8 @@ def _plan_from(js: JoinStats, order: List[Int], opts: PlannerOptions) -> JoinPla
         elif opts.build_side == BUILD_RIGHT:
             build_new = True
         var c = _step_cost(acc, js.rows[leaf], max(est, 0))
+        if len(js.deferred) > 0 and js.deferred[leaf] and (i < len(order) - 1 or build_new):
+            c += _min_int(js.rows[leaf], max(est, 0))             # F-202: read filtered where its key has a partner (`_read_filtered_reduced`): about the step's output is written (the last probe side filters in the pipeline instead)
         plan.steps.append(JoinStep(leaf, build_new, est, c))
         plan.cost += c
         in_set[leaf] = True

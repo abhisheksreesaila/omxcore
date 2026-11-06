@@ -14,6 +14,7 @@ the changed and appended rows; a scan is one chunk per row group. Each chunk's p
 min / max combine; hashed groups merge by key) folds into one.
 """
 from std.time import perf_counter_ns
+from std.math import exp, log
 from .table import Table, SharedTable, Column, ColumnKind, INT, DECIMAL, TEXT, DATE, BOOL, FLOAT, F32_COLUMN
 from .frame import NULL_EDIT, text_ranks, _radix_order
 from .job import JobCtl, STAGE_PLAN, STAGE_AGGREGATE, STAGE_FINISH      # F-175
@@ -46,7 +47,7 @@ from .parquet import write_parquet, ZSTD, DEFAULT_ROW_GROUP
 from std.memory.alloc import unsafe_alloc
 from std.ffi import external_call
 from .sqlprog import lower_rows
-from .planner import (plan_sinks, Planner, RulePlanner, PlannerOptions, PhysicalPlan, Stats, ColStat, G_NONE, G_DENSE, G_HASHED, commas, JoinStats, JoinPlan,
+from .planner import (plan_sinks, Planner, RulePlanner, PlannerOptions, PhysicalPlan, Stats, ColStat, G_NONE, G_DENSE, G_HASHED, commas, JoinStats, JoinPlan, JoinStep,
                       BUILD_AUTO, BUILD_LEFT, BUILD_RIGHT)
 from .sqlprog import SqlProgram, DictAccess, lower_sql, collect_columns, PHASE_ALL, PHASE_PLAIN, PHASE_HOL
 from .sqleval import ValCol, float_bits, ld_div, ld_div_wide
@@ -1330,6 +1331,8 @@ def _join_side[P: Planner](mut catalog: Catalog, q: BoundQuery, t: Int, needed: 
 
 
 comptime DEFER_PASS_DEN = 2          # ... and when at least 1 row in this many passes its filter (else the few rows that pass are written: cheaper than probing them all)
+comptime STAR_RATIO = 3              # F-202: a star from the largest table when it has at least this many times the rows of any other table
+comptime STAR_MIN_ROWS = 100000
 comptime DEFER_MIN_ROWS = 65536      # a filtered table of at least this many rows is counted first and read unfiltered when it is the probe side of a fused join
 
 
@@ -1385,39 +1388,60 @@ def _prefill_ranges_n(mut src: SqlSource, jq: BoundQuery, tabs: List[SharedTable
         src.range_has.append(r[0])
 
 
-def _tail_components(q: BoundQuery, tail: List[Int]) -> List[List[Int]]:
+def _find(parent: List[Int], i: Int) -> Int:
+    var r = i
+    while parent[r] != r:
+        r = parent[r]
+    return r
+
+
+def _tail_components(q: BoundQuery, js: JoinStats, tail: List[Int], before: Int) -> List[List[Int]]:
     """The dimensions of a star's tail grouped by the equalities between them: a dimension reached only through another (nation through supplier) is joined to
-    it first, and the group probes the fact table as one."""
-    var group = List[Int](length=len(tail), fill=-1)
-    var n_groups = 0
-    for i in range(len(tail)):
-        if group[i] < 0:
-            group[i] = n_groups
-            var grew = True
-            while grew:
-                grew = False
-                for j in range(len(tail)):
-                    if group[j] >= 0:
-                        continue
-                    for k in range(len(q.edge_a)):
-                        var ta = table_of_column(q, q.edge_a[k])
-                        var tb = table_of_column(q, q.edge_b[k])
-                        for i2 in range(len(tail)):
-                            if group[i2] == n_groups and ((ta == tail[j] and tb == tail[i2]) or (tb == tail[j] and ta == tail[i2])):
-                                group[j] = n_groups
-                                grew = True
-            n_groups += 1
+    it first, and the group probes the fact table as one. F-202: an equality between two groups that each reach the probe table on their own (TPC-H Q5's
+    customer.nationkey = supplier.nationkey) does not join them: it is checked on the joined values (`_cross_edges`). Equalities with a key of one side come first."""
+    var n = len(tail)
+    var parent = List[Int]()
+    var direct = List[Bool]()                                      # the group holds a table with an equality to the probe side
+    for i in range(n):
+        parent.append(i)
+        var d = False
+        for k in range(len(q.edge_a)):
+            var ta = table_of_column(q, q.edge_a[k])
+            var tb = table_of_column(q, q.edge_b[k])
+            if (ta == tail[i] and (before >> tb) & 1 != 0) or (tb == tail[i] and (before >> ta) & 1 != 0):
+                d = True
+        direct.append(d)
+    for pass_no in range(2):
+        for k in range(len(q.edge_a)):
+            var keyed = js.uniq_a[k] or js.uniq_b[k]
+            if keyed != (pass_no == 0):
+                continue
+            var ta = table_of_column(q, q.edge_a[k])
+            var tb = table_of_column(q, q.edge_b[k])
+            var ia = _position(tail, ta)
+            var ib = _position(tail, tb)
+            if ia < 0 or ib < 0:
+                continue
+            var ra = _find(parent, ia)
+            var rb = _find(parent, ib)
+            if ra == rb or (direct[ra] and direct[rb]):
+                continue
+            parent[rb] = ra
+            direct[ra] = direct[ra] or direct[rb]
     var out = List[List[Int]]()
-    for g in range(n_groups):
-        var l = List[Int]()
-        for i in range(len(tail)):
-            if group[i] == g:
-                l.append(tail[i])
-        out.append(l^)
+    var roots = List[Int]()
+    for i in range(n):
+        var r = _find(parent, i)
+        var at = _position(roots, r)
+        if at < 0:
+            roots.append(r)
+            out.append(List[Int]())
+            at = len(out) - 1
+        out[at].append(tail[i])
     return out^
 
 
-def _star_valid(q: BoundQuery, jp: JoinPlan, s0: Int) -> Bool:
+def _star_valid(q: BoundQuery, js: JoinStats, jp: JoinPlan, s0: Int) -> Bool:
     """Steps `s0` to the last can run as one star: the tables they join form dimension groups (each held together by equalities between its tables), every
     group reaches the tables joined before step `s0` by an equality (its keys are columns of the probe table), and a group of one table is a table the planner
     builds the hash table on. A group of several is joined first (small) and then probes as one."""
@@ -1427,7 +1451,7 @@ def _star_valid(q: BoundQuery, jp: JoinPlan, s0: Int) -> Bool:
     var tail = List[Int]()
     for j in range(s0, len(jp.steps)):
         tail.append(jp.steps[j].leaf)
-    var comps = _tail_components(q, tail)
+    var comps = _tail_components(q, js, tail, before)
     if len(comps) < 2 and not (len(comps) == 1 and len(comps[0]) >= 2):
         return False
     for c in comps:
@@ -1447,6 +1471,67 @@ def _star_valid(q: BoundQuery, jp: JoinPlan, s0: Int) -> Bool:
                 if jp.steps[j].leaf == lf and not jp.steps[j].build_new:
                     return False
     return True
+
+
+def _star_plan(q: BoundQuery, js: JoinStats, jp: JoinPlan) raises -> Optional[JoinPlan]:
+    """F-202: the join plan of a star from the largest table. When one table is at least STAR_RATIO times the rows of every other (after its filter) and every
+    other table is reached from it through keys that are unique on the table reached (a foreign key to a primary key, over and over: the dimensions,
+    the dimensions' dimensions), the fact table probes them all in one fused pass; no joined row is written, and the fact table's filter runs in the same pass.
+    None when the query is not that shape (the planner's order stands)."""
+    var n = len(js.names)
+    var fact = 0
+    for t in range(1, n):
+        if js.base_rows[t] > js.base_rows[fact]:
+            fact = t
+    var biggest_other = 0
+    for t in range(n):
+        if t != fact:
+            biggest_other = max(biggest_other, js.rows[t])
+    if js.base_rows[fact] < STAR_MIN_ROWS or js.base_rows[fact] < STAR_RATIO * max(biggest_other, 1):
+        return None
+    ref last = jp.steps[len(jp.steps) - 1]
+    if last.leaf == fact and not last.build_new:
+        return None                                               # the planner already ends with the fact table as the last join's probe side: that join is fused, nothing before it is large
+    for i in range(len(jp.steps)):                                # a fact table with no filter of its own that meets a small build side early leaves few rows (TPC-H Q2's part): the planner's plan reads it once and writes few
+        if jp.steps[i].leaf == fact and not (len(js.deferred) > 0 and js.deferred[fact]) and jp.steps[i].est_rows * 8 < js.base_rows[fact]:
+            return None
+    var visited = List[Bool](length=n, fill=False)
+    visited[fact] = True
+    var order = List[Int]()
+    var grew = True
+    while grew:
+        grew = False
+        for k in range(len(js.edge_a)):
+            var a = js.edge_a[k]
+            var b = js.edge_b[k]
+            if visited[a] and not visited[b] and js.uniq_b[k]:
+                visited[b] = True
+                order.append(b)
+                grew = True
+            elif visited[b] and not visited[a] and js.uniq_a[k]:
+                visited[a] = True
+                order.append(a)
+                grew = True
+    if len(order) != n - 1:
+        return None
+    var star = JoinPlan()
+    star.start = fact
+    for lf in order:
+        star.steps.append(JoinStep(lf, True, js.rows[fact], 0))
+    if not _star_valid(q, js, star, 0):
+        return None
+    var names = js.names[fact]
+    for lf in order:
+        names += " > " + js.names[lf]
+    star.notes.append("join order: " + names + " (a star from " + js.names[fact] + ", " + commas(js.base_rows[fact]) + " rows: every other table is reached through a unique key; the planner's order was " +
+                      js.names[jp.start] + " first)")
+    star.notes.append("join start: " + js.names[fact] + " (" + commas(js.rows[fact]) + " of " + commas(js.base_rows[fact]) + " rows after its filter)")
+    var acc = js.names[fact]
+    for i in range(len(order)):
+        star.notes.append("join " + String(i + 1) + ": " + acc + " (" + commas(js.rows[fact]) + " rows) with " + js.names[order[i]] + " (" + commas(js.rows[order[i]]) + " of " + commas(js.base_rows[order[i]]) +
+                          " rows): hash table on " + js.names[order[i]] + " (a dimension of the star, unique keys); estimated " + commas(js.rows[fact]) + " rows at most")
+        acc += " + " + js.names[order[i]]
+    return star^
 
 
 def _can_stream(catalog: Catalog, q: BoundQuery, t: Int, allow: Bool) -> Bool:
@@ -1900,12 +1985,78 @@ def _read_filtered[P: Planner](mut catalog: Catalog, q: BoundQuery, t: Int, mut 
     res.actuals.append("read " + _label(q, t) + " filtered: " + commas(tab.rows()) + " rows, " + _ms(Float64(perf_counter_ns() - t_m) / 1e6) + " ms")
 
 
+def _ndv_after_filter(l: _Leaf, ndv: Int) -> Int:
+    """F-202: the distinct values of a column of a leaf that is only counted (its table is unfiltered): `ndv` values spread over `base_rows` rows, `rows` of them kept
+    at random, leave ndv x (1 - (1 - rows / base_rows) ^ (base_rows / ndv)) of them."""
+    if not l.deferred or l.rows >= l.base_rows or ndv <= 1 or l.base_rows <= 0:
+        return ndv
+    if l.rows <= 0:
+        return 0
+    var per = Float64(l.base_rows) / Float64(ndv)
+    var keep = Float64(ndv) * (1.0 - exp(per * log(1.0 - Float64(l.rows) / Float64(l.base_rows))))
+    return max(1, min(ndv, Int(keep + 0.5)))
+
+
+def _read_filtered_reduced[P: Planner](mut catalog: Catalog, q: BoundQuery, t: Int, mut leaves: List[_Leaf], cur_table: SharedTable, lkey: List[Int], rkey: List[Int],
+                                       planner: P, opts: PlannerOptions, trust: Bool, mut res: SqlResult) raises:
+    """F-202: a counted leaf read filtered when the rows joined so far (`cur_table`, joined to it on `lkey` / `rkey`) are known: the leaf's rows with a partner
+    among them are marked first (a presence probe over its key column, the join's own hash table), and the filter runs over the marked rows only. A leaf
+    whose partners are most of it is read plainly."""
+    var t_m = perf_counter_ns()
+    var keys = JoinKeys()
+    normalize_keys(cur_table, leaves[t].table, lkey, rkey, keys, opts.threads)
+    var n = leaves[t].table.rows()
+    if not keys.verify and cur_table.rows() > 0:
+        var m = hj_build(keys.bk_addr, keys.bo_addr, cur_table.rows(), opts.threads)
+        var pick = select_rows(m, keys, n, PM_SEMI, opts.threads)
+        if pick.n * 2 < n:
+            var mask = List[UInt8](length=(n + 7) // 8 + 8, fill=0)
+            var rows = Pointer[Int32, MutUntrackedOrigin](unsafe_from_address=pick.probe_a)
+            for i in range(pick.n):
+                var r = Int(rows[i])
+                mask[r >> 3] |= UInt8(1) << UInt8(r & 7)
+            var src = q.sources[t]
+            catalog.sources[src].overlay.mask = mask^
+            var before = pick.n
+            try:
+                _read_filtered[P](catalog, q, t, leaves, planner, opts, trust, res)
+            except e:
+                catalog.sources[src].overlay.mask = List[UInt8]()
+                raise e^
+            catalog.sources[src].overlay.mask = List[UInt8]()
+            res.notes.append("runtime join filter: " + _label(q, t) + " is read only where its key has a partner among the " + commas(cur_table.rows()) + " rows joined so far (" + commas(before) + " of " + commas(n) + " rows), " +
+                             _ms(Float64(perf_counter_ns() - t_m) / 1e6) + " ms")
+            return
+    _read_filtered[P](catalog, q, t, leaves, planner, opts, trust, res)
+
+
+def _read_leaf_lazily[P: Planner](mut catalog: Catalog, q: BoundQuery, lf: Int, mut leaves: List[_Leaf], cur_table: SharedTable, cur_g: List[Int], cur_pos: List[Int], joined: Int,
+                                  planner: P, opts: PlannerOptions, trust: Bool, mut res: SqlResult) raises:
+    """F-202: leaf `lf`, when it is joined next to the rows joined so far (`joined`: their leaves), is read where its key has a partner among them (a leaf that was only counted)."""
+    if not leaves[lf].deferred:
+        return
+    var rk = List[Int]()
+    var lk = List[Int]()
+    for k in range(len(q.edge_a)):
+        var ga = q.edge_a[k]
+        var gb = q.edge_b[k]
+        var ta = table_of_column(q, ga)
+        var tb = table_of_column(q, gb)
+        if ta == lf and (joined >> tb) & 1 != 0:
+            lk.append(cur_pos[_position(cur_g, gb)])
+            rk.append(leaves[lf].cols[_position(leaves[lf].gcols, ga)])
+        elif tb == lf and (joined >> ta) & 1 != 0:
+            lk.append(cur_pos[_position(cur_g, ga)])
+            rk.append(leaves[lf].cols[_position(leaves[lf].gcols, gb)])
+    _read_filtered_reduced[P](catalog, q, lf, leaves, cur_table, lk, rk, planner, opts, trust, res)
+
+
 def _copy_leaf(l: _Leaf) -> _Leaf:
     return _Leaf(l.table, l.cols.copy(), l.gcols.copy(), l.gtable.copy(), l.rows, l.base_rows, l.deferred, l.streamed)
 
 
-def _build_cluster[P: Planner](q: BoundQuery, leaves: List[_Leaf], js: JoinStats, cluster: List[Int], keep: List[Int], planner: P, opts: PlannerOptions, threads: Int,
-                               budget_bytes: Int, mut res: SqlResult) raises -> _Leaf:
+def _build_cluster[P: Planner](mut catalog: Catalog, q: BoundQuery, mut leaves: List[_Leaf], js: JoinStats, cluster: List[Int], keep: List[Int], planner: P, opts: PlannerOptions, trust: Bool,
+                               threads: Int, budget_bytes: Int, mut res: SqlResult) raises -> _Leaf:
     """The tables of a dimension group joined with each other (the planner orders them), keeping the global columns `keep`: one table to build a star's hash table on."""
     opts.job.check()                                              # F-175: between the steps of a join
     var sub = JoinStats()
@@ -1913,6 +2064,8 @@ def _build_cluster[P: Planner](q: BoundQuery, leaves: List[_Leaf], js: JoinStats
         sub.names.append(js.names[lf])
         sub.base_rows.append(js.base_rows[lf])
         sub.rows.append(js.rows[lf])
+        if len(js.deferred) > 0:
+            sub.deferred.append(js.deferred[lf])
     for k in range(len(js.edge_a)):
         var ia = _position(cluster, js.edge_a[k])
         var ib = _position(cluster, js.edge_b[k])
@@ -1926,6 +2079,8 @@ def _build_cluster[P: Planner](q: BoundQuery, leaves: List[_Leaf], js: JoinStats
     o.written_order = False
     var sp = planner.join_order(sub, o)
     var first = cluster[sp.start]
+    if leaves[first].deferred:                                    # F-202: a counted table that starts the group is read filtered whole; the others where their key has a partner
+        _read_filtered[P](catalog, q, first, leaves, planner, opts, trust, res)
     var cur_table = leaves[first].table
     var cur_g = leaves[first].gcols.copy()
     var cur_pos = leaves[first].cols.copy()
@@ -1933,6 +2088,7 @@ def _build_cluster[P: Planner](q: BoundQuery, leaves: List[_Leaf], js: JoinStats
     for i in range(len(sp.steps)):
         var t_step = perf_counter_ns()
         var lf = cluster[sp.steps[i].leaf]
+        _read_leaf_lazily[P](catalog, q, lf, leaves, cur_table, cur_g, cur_pos, joined, planner, opts, trust, res)
         var lkey = List[Int]()
         var rkey = List[Int]()
         for k in range(len(q.edge_a)):
@@ -1960,7 +2116,7 @@ def _build_cluster[P: Planner](q: BoundQuery, leaves: List[_Leaf], js: JoinStats
     return _Leaf(cur_table, ident^, cur_g.copy(), cur_g.copy(), cur_table.rows(), 0, False)
 
 
-def _run_star[P: Planner](q: BoundQuery, leaves: List[_Leaf], js: JoinStats, jp: JoinPlan, s0: Int, before: Int, probe: SharedTable, probe_gt: List[Int], conj0: List[Int],
+def _run_star[P: Planner](mut catalog: Catalog, q: BoundQuery, mut leaves: List[_Leaf], js: JoinStats, jp: JoinPlan, s0: Int, before: Int, probe: SharedTable, probe_gt: List[Int], conj0: List[Int],
                           psrc: SqlSource, streamed: Bool, done: List[Bool], planner: P, opts: PlannerOptions, trust: Bool, lie: String, mut res: SqlResult, mut out: SqlResult) raises -> Bool:
     """Steps `s0` to the last as one star: the probe table (the rows joined so far, or a table read unfiltered whose filter `conj0` runs in the pipeline) meets each
     dimension (a table, or a group of tables joined with each other first) through a map built on the dimension's unique keys, all in one pass over the probe rows
@@ -1972,11 +2128,49 @@ def _run_star[P: Planner](q: BoundQuery, leaves: List[_Leaf], js: JoinStats, jp:
     for k in range(len(q.resid)):
         if not done[k]:
             conj.append(q.resid[k])
-    var need = final_needed(q, conj)
     var tail = List[Int]()
     for j in range(s0, len(jp.steps)):
         tail.append(jp.steps[j].leaf)
-    var comps = _tail_components(q, tail)
+    var comps = _tail_components(q, js, tail, before)
+    # F-202: the pass probes the dimensions in turn and drops the rows that miss, so the small ones go first (they fit the cache and the filtered ones drop the most)
+    var weight = List[Int]()
+    for ci in range(len(comps)):
+        var w = 0
+        for lf in comps[ci]:
+            w = max(w, js.rows[lf])
+        weight.append(w)
+    for i in range(1, len(comps)):
+        var j = i
+        while j > 0 and weight[j - 1] > weight[j]:
+            var tw = weight[j]
+            weight[j] = weight[j - 1]
+            weight[j - 1] = tw
+            var tc = comps[j].copy()
+            comps[j] = comps[j - 1].copy()
+            comps[j - 1] = tc^
+            j -= 1
+    # F-202: an equality between two dimension groups is one more condition on the joined values
+    var qx = copy_query(q)
+    var comp_of = List[Int](length=len(q.sources), fill=-1)
+    for ci in range(len(comps)):
+        for lf in comps[ci]:
+            comp_of[lf] = ci
+    for k in range(len(q.edge_a)):
+        var ta = table_of_column(q, q.edge_a[k])
+        var tb = table_of_column(q, q.edge_b[k])
+        if comp_of[ta] >= 0 and comp_of[tb] >= 0 and comp_of[ta] != comp_of[tb]:
+            var ca = leaves[ta].cols[_position(leaves[ta].gcols, q.edge_a[k])]
+            var cb = leaves[tb].cols[_position(leaves[tb].gcols, q.edge_b[k])]
+            var ka = leaves[ta].table.kind(ca)
+            var kb = leaves[tb].table.kind(cb)
+            if ka != kb or (ka != INT and ka != DATE) or leaves[ta].table.scale(ca) != leaves[tb].table.scale(cb):
+                res.notes.append("star: an equality between two dimension groups is not on INT or DATE columns of one kind: the joins run one by one")
+                return False
+            qx.rexprs.append(BExpr(B_COL, ka.value, 0, -1, -1, Int64(q.edge_a[k]), q.src_name(q.edge_a[k]), 0, 0))
+            qx.rexprs.append(BExpr(B_COL, kb.value, 0, -1, -1, Int64(q.edge_b[k]), q.src_name(q.edge_b[k]), 0, 0))
+            qx.rexprs.append(BExpr(B_CMP, BOOL.value, 0, len(qx.rexprs) - 2, len(qx.rexprs) - 1, Int64(24), "", 0, 0))
+            conj.append(len(qx.rexprs) - 1)
+    var need = final_needed(qx, conj)
     var stages = List[StageData]()
     var sstages = List[StreamStage]()
     var dim_tabs = List[SharedTable]()
@@ -2004,7 +2198,7 @@ def _run_star[P: Planner](q: BoundQuery, leaves: List[_Leaf], js: JoinStats, jp:
                     keep.append(q.edge_a[k])
                 if (bits >> tb) & 1 != 0 and _position(keep, q.edge_b[k]) < 0:
                     keep.append(q.edge_b[k])
-            stage_leaf = _build_cluster[P](q, leaves, js, cl, keep, planner, opts, threads, budget_bytes, res)
+            stage_leaf = _build_cluster[P](catalog, q, leaves, js, cl, keep, planner, opts, trust, threads, budget_bytes, res)
         var lkey = List[Int]()
         var rkey = List[Int]()
         for k in range(len(q.edge_a)):
@@ -2080,7 +2274,7 @@ def _run_star[P: Planner](q: BoundQuery, leaves: List[_Leaf], js: JoinStats, jp:
     cat2.sources[0].fixed_rows = psrc_rows
     if streamed:
         _stream_overlay_fix(cat2.sources[0], psrc, vstage, vreal)
-    var jq = star_query(q, vglobal, conj)
+    var jq = star_query(qx, vglobal, conj)
     if streamed:
         var skip = List[Int]()
         for c in range(len(vtab)):
@@ -2191,7 +2385,7 @@ def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPl
                 gtable.append(start + c)
         elif _can_defer(catalog, q, t, opts.fuse and not _any_hol(q)):
             counted = _count_side[P](catalog, q, t, planner, opts, trust)          # its rows are only counted for now
-            is_deferred = counted * DEFER_PASS_DEN >= base_rows
+            is_deferred = True                                         # F-202: always: read filtered only if the order does not make it the last join's probe side
             table = src_table
             for g in gcols:
                 cols.append(g - start)
@@ -2221,6 +2415,7 @@ def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPl
         js.names.append(_label(q, t))
         js.base_rows.append(base_rows)
         js.rows.append(rows)
+        js.deferred.append(is_deferred and not is_streamed)
         res.actuals.append("scan " + _label(q, t) + ": " + commas(base_rows) + " rows, " + commas(rows) + " after " + ("its filter" if len(q.leaf_conj[t]) > 0 else "no filter") +
                            " (" + String(len(gcols)) + " columns kept" + (", counted: its filter may run in the last join's pipeline" if is_deferred else "") + "), " + _ms(Float64(perf_counter_ns() - t_leaf) / 1e6) + " ms")
         leaves.append(_Leaf(table, cols^, gcols^, gtable^, rows, base_rows, is_deferred, is_streamed))
@@ -2230,13 +2425,21 @@ def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPl
         var tb = table_of_column(q, q.edge_b[k])
         js.edge_a.append(ta)
         js.edge_b.append(tb)
-        js.ndv_a.append(-1 if leaves[ta].streamed else column_ndv(leaves[ta].table, leaves[ta].cols[_position(leaves[ta].gcols, q.edge_a[k])], threads))
-        js.ndv_b.append(-1 if leaves[tb].streamed else column_ndv(leaves[tb].table, leaves[tb].cols[_position(leaves[tb].gcols, q.edge_b[k])], threads))
+        var raw_a = -1 if leaves[ta].streamed else column_ndv(leaves[ta].table, leaves[ta].cols[_position(leaves[ta].gcols, q.edge_a[k])], threads)
+        var raw_b = -1 if leaves[tb].streamed else column_ndv(leaves[tb].table, leaves[tb].cols[_position(leaves[tb].gcols, q.edge_b[k])], threads)
+        js.uniq_a.append(raw_a >= 0 and raw_a == leaves[ta].table.rows() and not leaves[ta].table.null_count(leaves[ta].cols[_position(leaves[ta].gcols, q.edge_a[k])]) > 0)
+        js.uniq_b.append(raw_b >= 0 and raw_b == leaves[tb].table.rows() and not leaves[tb].table.null_count(leaves[tb].cols[_position(leaves[tb].gcols, q.edge_b[k])]) > 0)
+        js.ndv_a.append(-1 if leaves[ta].streamed else _ndv_after_filter(leaves[ta], raw_a))
+        js.ndv_b.append(-1 if leaves[tb].streamed else _ndv_after_filter(leaves[tb], raw_b))
     for k in range(len(q.edge_a)):
         res.notes.append("statistics: " + _label(q, js.edge_a[k]) + "." + q.src_name(q.edge_a[k]) + " has " + (commas(js.ndv_a[k]) if js.ndv_a[k] >= 0 else String("an unknown number of")) + " distinct values in " + commas(js.rows[js.edge_a[k]]) +
                          " rows, " + _label(q, js.edge_b[k]) + "." + q.src_name(q.edge_b[k]) + " " + (commas(js.ndv_b[k]) if js.ndv_b[k] >= 0 else String("an unknown number")) + " in " + commas(js.rows[js.edge_b[k]]))
     res.actuals.append("distinct counts of the join columns: " + _ms(Float64(perf_counter_ns() - t_ndv) / 1e6) + " ms")
     var jp = planner.join_order(js, opts)
+    if opts.fuse and not _any_hol(q) and len(opts.join_order) == 0 and not opts.written_order and opts.build_side == BUILD_AUTO:
+        var sp = _star_plan(q, js, jp)
+        if sp:
+            jp = sp.take()^
     for nt in jp.notes:
         res.notes.append(nt)
     if q.explain != EXPLAIN_NONE and q.explain != EXPLAIN_ANALYZE:
@@ -2253,13 +2456,29 @@ def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPl
     var star_s0 = -1
     if opts.fuse and not _any_hol(q):
         for s0 in range(len(jp.steps) - 1):
-            if _star_valid(q, jp, s0):
+            if _star_valid(q, js, jp, s0):
                 star_s0 = s0
                 break
     # a leaf that was only counted is read filtered now, unless it is the last join's probe side (its filter then runs in that join's pipeline)
     var last_leaf = jp.steps[len(jp.steps) - 1].leaf
+    var lazy = List[Bool](length=n, fill=False)                  # F-202: read when its step comes, from the rows joined by then (`_read_filtered_reduced`)
+    for j in range(len(jp.steps) - 1):
+        if j < (star_s0 if star_s0 >= 0 else len(jp.steps) - 1) and jp.steps[j].leaf != jp.start and not leaves[jp.steps[j].leaf].streamed:
+            lazy[jp.steps[j].leaf] = True
+    var star_lazy = List[Bool](length=n, fill=False)             # F-202: the tables of a star's dimension groups of several tables: the group reads them (`_build_cluster`)
+    if star_s0 >= 0:
+        var before0 = 1 << jp.start
+        for j in range(star_s0):
+            before0 |= 1 << jp.steps[j].leaf
+        var tail0 = List[Int]()
+        for j in range(star_s0, len(jp.steps)):
+            tail0.append(jp.steps[j].leaf)
+        for cl in _tail_components(q, js, tail0, before0):
+            if len(cl) >= 2:
+                for lf in cl:
+                    star_lazy[lf] = True
     for t in range(n):
-        if leaves[t].deferred and not (t == last_leaf and not jp.steps[len(jp.steps) - 1].build_new) and not (t == jp.start and star_s0 == 0):
+        if leaves[t].deferred and not lazy[t] and not star_lazy[t] and not (t == last_leaf and not jp.steps[len(jp.steps) - 1].build_new) and not (t == jp.start and star_s0 == 0):
             _read_filtered[P](catalog, q, t, leaves, planner, opts, trust, res)
     # the steps
     var done = List[Bool](length=len(q.resid), fill=False)
@@ -2288,7 +2507,7 @@ def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPl
                     sp_src = catalog.sources[q.sources[jp.start]].copy()
                     sp_streamed = True
             var star_out = SqlResult()
-            if _run_star[P](q, leaves, js, jp, si, joined, sp_table, sp_gt, sp_conj, sp_src, sp_streamed, done, planner, opts, trust, lie, res, star_out):
+            if _run_star[P](catalog, q, leaves, js, jp, si, joined, sp_table, sp_gt, sp_conj, sp_src, sp_streamed, done, planner, opts, trust, lie, res, star_out):
                 for nt in star_out.notes:
                     res.notes.append(nt)
                 for a in star_out.actuals:
@@ -2306,6 +2525,7 @@ def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPl
         var t_step = perf_counter_ns()
         ref step = jp.steps[si]
         var lf = step.leaf
+        _read_leaf_lazily[P](catalog, q, lf, leaves, cur_table, cur_g, cur_pos, joined, planner, opts, trust, res)
         var after = joined | (1 << lf)
         var keep = needed_after(q, after, done)
         var lkey = List[Int]()
@@ -2363,6 +2583,8 @@ def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPl
         elif tb == lf and (joined >> ta) & 1 != 0:
             key_l.append(ga)
             key_r.append(gb)
+    if leaves[lf].deferred and last.build_new:
+        _read_leaf_lazily[P](catalog, q, lf, leaves, cur_table, cur_g, cur_pos, joined, planner, opts, trust, res)
     var rest = List[Int]()
     for k in range(len(q.resid)):
         if not done[k]:
