@@ -427,11 +427,12 @@ def _swap_entries(ns: Int, vals: LP, nuls: BP, ids: IP, a: Int, b: Int):
     ids[b] = tid
 
 
-def _topk_worker(ctl: LP, regs: FP) -> Int:
-    """The calling worker's number: its register file's address is its identity, entered in the control block's table the first time."""
+def _topk_worker(ctl: LP, who: Int) -> Int:
+    """The calling worker's number: the address of its selection array (the one scratch the kernel hands to a front stage and to this hook alike) is its
+    identity, entered in the control block's table the first time."""
     var table = LP(unsafe_from_address=Int(ctl[4]))
     var counter = LP(unsafe_from_address=Int(ctl[3]))
-    var mine = Int64(Int(regs))
+    var mine = Int64(who)
     for i in range(min(Int(counter[0]), Int(ctl[5]))):
         if table[i] == mine:
             return i
@@ -450,7 +451,7 @@ def _topk_hook(chunk: Int, row0: Int, sel: IP, nsel: Int, use_sel: Bool, dst: IP
     for j in range(nsel):
         dst[j] = 0
     var ctl = LP(unsafe_from_address=Int(LP(unsafe_from_address=Int(regs + CTL_REG * VEC))[0]))
-    var me = _topk_worker(ctl, regs)
+    var me = _topk_worker(ctl, Int(sel))
     if me < 0:
         return False
     var ns = Int(ctl[0])
@@ -523,8 +524,56 @@ def _topk_hook(chunk: Int, row0: Int, sel: IP, nsel: Int, use_sel: Bool, dst: IP
     return True
 
 
+def _topn_front(ctl_a: Int, tbl_a: Int, nwords: Int, qcol: Int, k: Int, i0: Int, n: Int, sel: IP, ws: BP) -> Int:
+    """F-207: the top-N dynamic filter, a fused front stage. Once the calling worker's heap is full, a row whose first sort key is strictly worse than the
+    heap's worst cannot enter it (the hook would drop it the same way, after the program had read the filter's columns and every key's): this pass reads that one
+    column and lists the rows that can, so the program's predicate and the other keys are read for those rows alone. Ties stay (the later keys decide). The
+    block's column table is the chunk's own (the kernel reads the block through `ws`). Control block words as `_topk_hook`'s."""
+    var cols = LP(unsafe_from_address=tbl_a) + (k * (2 + nwords) + 2)
+    var lc = LP(unsafe_from_address=Int(ws))
+    for q in range(nwords):
+        lc[q] = cols[q]
+    var ctl = LP(unsafe_from_address=ctl_a)
+    var me = _topk_worker(ctl, Int(sel))
+    var K = Int(ctl[2])
+    if me < 0 or K == 0 or Int(LP(unsafe_from_address=Int(ctl[9]))[me]) < K:
+        for j in range(n):
+            sel[j] = Int32(j)
+        return n
+    var ns = Int(ctl[0])
+    var thr = LP(unsafe_from_address=Int(ctl[6]))[me * (K + 1) * ns + Int(ctl[10])]       # the worst kept row's first key
+    var x = LP(unsafe_from_address=Int(cols[qcol])) + i0
+    var kept = 0
+    if ctl[11] != 0:                                                                       # descending: strictly smaller is worse
+        for j in range(n):
+            sel[kept] = Int32(j)
+            kept += 1 if x[j] >= thr else 0
+    else:
+        for j in range(n):
+            sel[kept] = Int32(j)
+            kept += 1 if x[j] <= thr else 0
+    return kept
+
+
+def _front_column(q: BoundQuery, sp: SqlProgram, inp: _Inputs, chunk: SharedTable) -> Int:
+    """The program column of the first sort key's data when the top-N front applies to this chunk, else -1: the key is a plain whole-number column (INT, DATE,
+    DECIMAL: its register holds the stored value) with no NULL in the chunk."""
+    if len(q.rorder) == 0:
+        return -1
+    ref x = q.rexprs[q.rorder[0].expr]
+    if x.op != B_COL or (x.kind != INT.value and x.kind != DATE.value and x.kind != DECIMAL.value):
+        return -1
+    var pos = inp.pos[Int(x.value)]
+    if pos < 0 or chunk.null_count(pos) != 0:
+        return -1
+    for c in range(len(sp.p.cols)):
+        if sp.p.cols[c] == pos and (Int(sp.p.dtypes[c]) & 255) == 1:
+            return c
+    return -1
+
+
 def _run_topk(t: SharedTable, sp: SqlProgram, mask_addr: Int, K: Int, key_slot: List[Int], key_desc: List[Bool], key_nf: List[Bool],
-              key_rank: List[Int], threads: Int, fj: Optional[ArcPointer[FusedJoin]]) raises -> RowChunk:
+              key_rank: List[Int], threads: Int, fj: Optional[ArcPointer[FusedJoin]], fq: Int = -1) raises -> RowChunk:
     """The kernel over the whole chunk with each worker keeping its best K rows; the union of the heaps (at most workers x K rows,
     unordered), as the row numbers and the values of every slot."""
     ref p = sp.p
@@ -567,6 +616,15 @@ def _run_topk(t: SharedTable, sp: SqlProgram, mask_addr: Int, K: Int, key_slot: 
             return jf_front(fs, i0, n, sel, ws)
 
         rc = run.fused(_topk_hook, front, fs.ws_bytes, True, 1, 0, t.rows(), threads)
+    elif fq >= 0:
+        var ctl_a = Int(cw)
+        var tbl_a = run.table_address()
+        var nwords = len(p.cols)
+
+        def topn(k: Int, i0: Int, n: Int, sel: IP, ws: BP) {imm} -> Int:
+            return _topn_front(ctl_a, tbl_a, nwords, fq, k, i0, n, sel, ws)
+
+        rc = run.fused(_topk_hook, topn, nwords * 8 + 64, True, 1, 0, t.rows(), threads)
     else:
         rc = run.keyed(_topk_hook, 1, 0, t.rows(), threads)
     if rc == E_OVERFLOW:
@@ -875,6 +933,7 @@ def run_topk_rows(src0: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: Plan
         best.append(vc^)
     var scanned = 0
     var chunks_read = 0
+    var fronts = 0                                               # F-207: chunks that ran with the top-N front
     var t_run = perf_counter_ns()
     var ns_load = 0
     var has_delta = ch.has_delta
@@ -895,7 +954,10 @@ def run_topk_rows(src0: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: Plan
         var fji = fj
         if ps:
             fji = ArcPointer(chunk_join(ps.value()[], chunk))
-        var rc = _run_topk(chunk, sp, ch.mask_addr, K, key_slot, key_desc, key_nf, key_rank, opts.threads, fji)
+        var fq = _front_column(q, sp, inp, chunk) if not fji else -1
+        if fq >= 0:
+            fronts += 1
+        var rc = _run_topk(chunk, sp, ch.mask_addr, K, key_slot, key_desc, key_nf, key_rank, opts.threads, fji, fq)
         opts.job.advance(chunk.rows())
         if rc.n == 0:
             continue
@@ -967,6 +1029,8 @@ def run_topk_rows(src0: SqlSource, q: BoundQuery, plan: PhysicalPlan, opts: Plan
         notes.append("ran: table " + src.name + ": " + String(chunks_read) + " chunk of " + commas(src.table.rows()) + " rows")
     var kept = len(best[0].v) if len(best) > 0 else 0
     notes.append("rows: the best " + commas(kept) + " of " + commas(scanned) + " rows kept in per-worker heaps, " + String(nk) + (" key" if nk == 1 else " keys"))
+    if fronts > 0:
+        notes.append("top-N front: " + String(fronts) + " of " + String(chunks_read) + (" chunk" if chunks_read == 1 else " chunks") + " read the first sort key alone and dropped the rows the heap's worst beats, before the filter's columns and the other keys were read")
     var lo = min(q.offset, kept)
     var hi = kept if q.limit < 0 else min(kept, lo + q.limit)
     var pick = List[Int]()
