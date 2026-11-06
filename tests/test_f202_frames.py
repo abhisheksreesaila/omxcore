@@ -14,7 +14,7 @@ from mx_oracle import assert_equal, duck_kind
 
 F_COLS = [("a", "int"), ("b", "int"), ("x", "dec2"), ("d", "date"), ("s", "text")]
 DA_COLS = [("an", "text"), ("ak", "int"), ("seg", "int")]
-WORDS = ["red", "Green", "blue", "amber", "zzz-new"]
+WORDS = ["red", "green", "blue", "amber", "zzz-new"]       # (lower case: omxcore orders text case-insensitively, DuckDB by bytes, so mixed-case ties would differ in ORDER BY)
 
 
 def _lit(kind, v):
@@ -73,6 +73,7 @@ def world(tmp_path_factory):
     base.execute("create table nat as select i as nk, 'N' || lpad(i::varchar, 2, '0') as nname from range(25) r(i)")
     base.execute("create table da as select i as id, 'A' || (i % 97) as an, case when i % 41 = 0 then null else i % 25 end as ak, i % 5 as seg from range(3000) r(i)")
     base.execute("create table db as select i as id, 'B-' || i as bn, (i * 7) % 25 as bk, ((i % 13) * 0.5)::decimal(8,1) as w from range(4000) r(i)")
+    base.execute("create table dbig as select i as id, 'G' || (i % 23) as gn, i % 9 as seg from range(100000) r(i)")                 # 100,000 rows: at least a third of f's
     base.execute("""create table f as select i as id,
         case when i % 31 = 0 then null when i % 53 = 0 then 90000 + i else (i * 7) % 3000 end as a,
         case when i % 37 = 0 then null else ((i // 25) * 11) % 4000 end as b,
@@ -80,14 +81,14 @@ def world(tmp_path_factory):
         date '2020-01-01' + (i % 800)::int as d,
         (['red','Green','blue','amber'])[1 + i % 4] as s from range(200000) r(i)""")
     paths = {}
-    for t, rg in [("nat", 25), ("da", 700), ("db", 900), ("f", 50000)]:
+    for t, rg in [("nat", 25), ("da", 700), ("db", 900), ("f", 50000), ("dbig", 25000)]:
         paths[t] = d / f"{t}.parquet"
         base.execute(f"copy {t} to '{paths[t]}' (format parquet, row_group_size {rg})")
     # two oracles: the fact table edited, a dimension edited (each over the other tables as they are)
     out = {"paths": paths}
-    for which, table, cols, n_rows, key_range in (("f", "f", F_COLS, 200000, 3100), ("da", "da", DA_COLS, 3000, 30)):
+    for which, table, cols, n_rows, key_range in (("f", "f", F_COLS, 200000, 3100), ("da", "da", DA_COLS, 3000, 30), ("dbig", "dbig", [("gn", "text"), ("seg", "int")], 100000, 8)):
         con = oracle_connection()
-        for t in ("nat", "da", "db", "f"):
+        for t in ("nat", "da", "db", "f", "dbig"):
             if t == table:
                 con.execute(f"create table {t} as select row_number() over () - 1 as rid, * from read_parquet('{paths[t]}')")
             else:
@@ -160,3 +161,17 @@ def test_a_join_over_a_frame_equals_duckdb(probe, world, name, sql, tables, fram
         assert has(res, "a scan or Frame streamed chunk by chunk"), res["notes"]
         assert has(res, "changed or appended rows"), res["notes"]
     print("PATHS", name, frame_table, [n for n in res["notes"] if n.startswith(("join order", "join path", "star", "runtime join filter", "ran:", "join build"))][:8])
+
+
+def test_a_frame_dimension_at_a_third_of_the_fact_table_still_streams(probe, world):
+    """100,000 rows against 200,000 is over the 1/3 ratio: the Frame is a probe candidate and stays streamed (not read into a table); the answer is DuckDB's."""
+    sql = "SELECT dbig.gn, count(*), sum(f.x) FROM f, dbig, db WHERE f.a = dbig.id AND f.b = db.id GROUP BY dbig.gn ORDER BY dbig.gn"
+    res = run_case(probe, world, sql, ["f", "dbig", "db"], "dbig")
+    assert has(res, "dbig.id an unknown number in 100,000"), res["notes"]       # it stayed a streamed leaf (no distinct counts: nothing was read of it to count)
+    assert not has(res, "a star from f"), res["notes"]
+
+
+def test_a_frame_dimension_under_a_third_is_read_and_can_be_a_star_dimension(probe, world):
+    sql = "SELECT da.an, count(*), sum(f.x) FROM f, da, db WHERE f.a = da.id AND f.b = db.id GROUP BY da.an ORDER BY da.an"
+    res = run_case(probe, world, sql, ["f", "da", "db"], "da")
+    assert has(res, "a star from f"), res["notes"]

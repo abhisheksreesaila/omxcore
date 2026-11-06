@@ -250,3 +250,80 @@ def test_ilike_with_several_literals_equals_duckdb(mx, words, pattern):
 def test_a_correlated_subquery_over_joined_tables_is_cut_to_the_outer_keys(mx, data, sql):
     res = q(mx, data, sql, ["da", "f", "db"], ordered=True)
     note(res, "cut to the keys of the")
+
+
+# the sampled filter count (a table of 4M+ rows): the path ran, the answer is DuckDB's, and the two fallbacks count every row
+@pytest.fixture(scope="session")
+def bigworld(tmp_path_factory):
+    d = tmp_path_factory.mktemp("f202big")
+    con = oracle_connection()
+    con.execute("""create table big as select i as id, case when i % 97 = 0 then null else (i * 7) % 5000 end as k, (i * 31) % 100000 as v,
+        case when i % 23 = 0 then null else ((i % 500) * 0.25)::decimal(10,2) end as x,
+        (['alpha','Beta','gamma','delta','eps','zeta','eta','theta'])[1 + i % 8] as s,
+        date '2020-01-01' + (i % 900)::int as t from range(4200000) r(i)""")
+    con.execute("create table d as select i as k, 'name' || (i % 40) as name, i % 7 as seg from range(5000) r(i)")
+    con.execute("create table d2 as select i as k, 'x' || (i % 11) as name2 from range(5000) r(i)")
+    paths = {}
+    for t in ("big", "d", "d2"):
+        paths[t] = d / f"{t}.parquet"
+        con.execute(f"copy {t} to '{paths[t]}' (format parquet, row_group_size 100000)")
+    return {"con": con, "paths": paths}
+
+
+def test_the_filter_count_runs_over_a_sample_of_a_big_table(mx, bigworld):
+    res = q(mx, bigworld, "SELECT d.name, count(*), sum(big.x) FROM big, d WHERE big.k = d.k AND big.v < 20000 AND big.s <> 'eps' GROUP BY d.name ORDER BY d.name", ["big", "d"], ordered=True)
+    note(res, "filter count of big: sampled (")
+
+
+def test_the_sampled_count_in_a_multi_way_join(mx, bigworld):
+    res = q(mx, bigworld, "SELECT d.name, d2.name2, count(*), sum(big.x) FROM big, d, d2 WHERE big.k = d.k AND big.k = d2.k AND big.t >= date '2021-03-01' AND big.v < 30000 GROUP BY d.name, d2.name2 ORDER BY 1, 2",
+            ["big", "d", "d2"], ordered=True)
+    note(res, "filter count of big: sampled (")
+
+
+def test_a_sample_with_too_few_passing_rows_counts_every_row(mx, bigworld):
+    # about 40 rows of 4.2M pass: the sample of a 127th holds almost none
+    res = q(mx, bigworld, "SELECT d.name, count(*), sum(big.x) FROM big, d WHERE big.k = d.k AND big.v < 1 GROUP BY d.name ORDER BY d.name", ["big", "d"], ordered=True)
+    note(res, "filter count of big: every row (only ")
+    res = q(mx, bigworld, "SELECT count(*), sum(big.x) FROM big, d WHERE big.k = d.k AND big.id = 77777", ["big", "d"])
+    note(res, "filter count of big: every row (only ")
+
+
+# the correlated cut (D cut to the outer rows' distinct keys as an IN list) and when it is skipped
+@pytest.fixture(scope="session")
+def cutworld(data, tmp_path_factory):
+    d = tmp_path_factory.mktemp("f202cut")
+    con = oracle_connection()
+    for t in ("f", "db"):
+        con.execute(f"create table {t} as select * from read_parquet('{data['paths'][t]}')")
+    con.execute("create table o1 as select i as id, case when i % 7 = 0 then null else (i * 5) % 400 end as k, i % 3 as g from range(600) r(i)")      # NULL keys
+    con.execute("create table o2 as select i as id, case when i % 11 = 0 then null else (i * 3) % 500 end as k from range(600) r(i)")
+    con.execute("create table obig as select i as id, i as k from range(30000) r(i)")                                                              # 30,000 distinct keys
+    con.execute("create table oneg as select i as id, (i - 20) as k from range(60) r(i)")                                                          # negative keys
+    con.execute("create table otxt as select i as id, (['red','Green','blue','amber','none'])[1 + i % 5] as s from range(40) r(i)")                 # a text key
+    con.execute("create table onone as select i as id, 500000 + i as k from range(50) r(i)")                                                       # keys no inner row has
+    paths = {}
+    for t in ("f", "db", "o1", "o2", "obig", "oneg", "otxt", "onone"):
+        paths[t] = d / f"{t}.parquet"
+        con.execute(f"copy {t} to '{paths[t]}' (format parquet, row_group_size 20000)")
+    return {"con": con, "paths": paths}
+
+
+CUT_SQL = {
+    "null_keys": ("SELECT o1.id FROM o1 WHERE o1.g = 1 AND (SELECT min(f.x) FROM f, db WHERE f.a = o1.k AND f.b = db.b AND db.bk < 12) > 20 ORDER BY o1.id", ["o1", "f", "db"], True),
+    "second_outer_table": ("SELECT o1.id, o2.k FROM o1, o2 WHERE o1.id = o2.id AND o2.k < 300 AND (SELECT min(f.x) FROM f, db WHERE f.a = o2.k AND f.b = db.b AND db.bk < 12) > 10 ORDER BY o1.id",
+                           ["o1", "o2", "f", "db"], True),
+    "too_many_keys": ("SELECT obig.id FROM obig WHERE obig.id < 25000 AND (SELECT min(f.x) FROM f, db WHERE f.a = obig.k AND f.b = db.b AND db.bk < 12) > 50 ORDER BY obig.id", ["obig", "f", "db"], False),
+    "negative_keys": ("SELECT oneg.id FROM oneg WHERE (SELECT min(f.x) FROM f, db WHERE f.a = oneg.k AND f.b = db.b AND db.bk < 12) > 5 ORDER BY oneg.id", ["oneg", "f", "db"], False),
+    "text_keys": ("SELECT otxt.id FROM otxt WHERE (SELECT count(*) FROM f, db WHERE f.s = otxt.s AND f.b = db.b AND db.bk = 3 AND f.id < 2000) > 3 ORDER BY otxt.id", ["otxt", "f", "db"], False),
+    "no_inner_rows": ("SELECT onone.id FROM onone WHERE (SELECT min(f.x) FROM f, db WHERE f.a = onone.k AND f.b = db.b) IS NULL ORDER BY onone.id", ["onone", "f", "db"], True),
+    "no_inner_rows_compared": ("SELECT onone.id FROM onone WHERE (SELECT min(f.x) FROM f, db WHERE f.a = onone.k AND f.b = db.b) > 1 ORDER BY onone.id", ["onone", "f", "db"], True),
+}
+
+
+@pytest.mark.parametrize("name", list(CUT_SQL))
+def test_the_correlated_cut_and_when_it_is_skipped(mx, cutworld, name):
+    sql, tables, cut = CUT_SQL[name]
+    res = q(mx, cutworld, sql, tables, ordered=True)
+    hits = [n for n in res["notes"] if "cut to the keys of the" in n]
+    assert bool(hits) == cut, (name, res["notes"])

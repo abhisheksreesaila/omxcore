@@ -1404,13 +1404,15 @@ def _sample_table(t: SharedTable) -> Optional[SharedTable]:
     return out^.share()
 
 
-def _count_side[P: Planner](mut catalog: Catalog, q: BoundQuery, t: Int, planner: P, opts: PlannerOptions, trust: Bool) raises -> Int:
+def _count_side[P: Planner](mut catalog: Catalog, q: BoundQuery, t: Int, planner: P, opts: PlannerOptions, trust: Bool, mut res: SqlResult) raises -> Int:
     """The rows side `t` keeps after its filter. A table of millions of rows is counted over a sample of its blocks first (a filter's share is what the plan needs, and the
     full count is a pass over the table that the read repeats); the exact count when the sample holds too few passing rows to give the share."""
     var src = q.sources[t]
     var n = catalog.sources[src].table.rows()
     if catalog.sources[src].kind == SRC_TABLE and n >= COUNT_SAMPLE_MIN_ROWS and len(catalog.sources[src].overlay.mask) == 0 and len(catalog.sources[src].overlay.delta) == 0:
         var smp = _sample_table(catalog.sources[src].table)
+        if not smp:
+            res.notes.append("filter count of " + _label(q, t) + ": every row (a 128-bit column: no sample table)")
         if smp:
             var full = catalog.sources[src].table
             var r_cols = catalog.sources[src].range_cols.copy()        # (the ranges the run caches are the sample's: they go away with it)
@@ -1435,7 +1437,9 @@ def _count_side[P: Planner](mut catalog: Catalog, q: BoundQuery, t: Int, planner
             catalog.sources[src].range_has = r_has^
             var hits = Int(r.table.get(0, 0))
             if hits >= COUNT_SAMPLE_MIN_HITS:
+                res.notes.append("filter count of " + _label(q, t) + ": sampled (" + commas(hits) + " of " + commas(smp.value().rows()) + " sample rows pass), scaled to " + commas(n) + " rows")
                 return min(n, Int(Float64(hits) * Float64(n) / Float64(smp.value().rows()) + 0.5))
+            res.notes.append("filter count of " + _label(q, t) + ": every row (only " + commas(hits) + " sample rows pass, too few for a share)")
     var r2 = _run_sql_once(catalog, count_query(catalog, q, t), planner, opts, trust, String())
     return Int(r2.table.get(0, 0))
 
@@ -1766,7 +1770,7 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
     if str0:
         lrows = catalog.sources[q.sources[0]].rows()                 # (its rows before the filter: the side is not read to count them)
     elif may0:
-        lrows = _count_side[P](catalog, q, 0, planner, opts, trust)
+        lrows = _count_side[P](catalog, q, 0, planner, opts, trust, res)
         if lrows * DEFER_PASS_DEN < catalog.sources[q.sources[0]].table.rows():      # a selective filter: writing the few rows that pass beats probing them all ...
             if len(q.conj_x) == 0:
                 pf0 = True                                       # ... unless the pipeline runs the filter first and probes only those rows (F-161): nothing is written
@@ -1779,7 +1783,7 @@ def _run_join_query[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: Logical
     if str1:
         rrows = catalog.sources[q.sources[1]].rows()
     elif may1:
-        rrows = _count_side[P](catalog, q, 1, planner, opts, trust)
+        rrows = _count_side[P](catalog, q, 1, planner, opts, trust, res)
         if rrows * DEFER_PASS_DEN < catalog.sources[q.sources[1]].table.rows():
             if len(q.conj_x) == 0:
                 pf1 = True
@@ -2478,7 +2482,7 @@ def _run_multiway[P: Planner](mut catalog: Catalog, q: BoundQuery, lp: LogicalPl
             for c in range(src_table.columns()):
                 gtable.append(start + c)
         elif _can_defer(catalog, q, t, opts.fuse and not _any_hol(q)):
-            counted = _count_side[P](catalog, q, t, planner, opts, trust)          # its rows are only counted for now
+            counted = _count_side[P](catalog, q, t, planner, opts, trust, res)          # its rows are only counted for now
             is_deferred = True                                         # F-202: always: read filtered only if the order does not make it the last join's probe side
             table = src_table
             for g in gcols:
