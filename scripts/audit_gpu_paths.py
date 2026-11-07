@@ -41,7 +41,7 @@ GPU_PATHS = {"gpu_aot"}
 MOJO_PATHS = {"cpu_aot", "masked_global_agg_mojo",
               "join_mojo_shortcut"}  # join index generation ran in Mojo
 COMPILED_PATH = "compiled"                            # MAX graph; device field decides
-FALLBACK_PATHS = {"pyarrow_shortcut", "global_agg_pyarrow"}
+FALLBACK_PATHS = {"pyarrow_shortcut", "global_agg_pyarrow", "cpu_fallback"}  # cpu_fallback: F-214, no loadable GPU library
 
 _records: list = []
 _orig_compute = LazyFrame.compute
