@@ -105,6 +105,7 @@ comptime OP_IMOD = 43
 comptime OP_IMIN = 44
 comptime OP_IMAX = 45
 comptime OP_ICMP = 46
+comptime OP_ICMPCOL = 56                 # F-210: one pass over a column: dst = column <cmp> int64 constant (made by `cpu_code`, run by the CPU kernel only)
 comptime OP_AGG_SUM = 50
 comptime OP_AGG_MIN = 51
 comptime OP_AGG_MAX = 52
@@ -874,6 +875,7 @@ struct Program(Movable):
     var src_valid: List[Int]
     var ctl_const: Int               # the constant slot patched with the control block's address (`_run_mat`)
     var section: Int                 # where `emit` writes: 0 predicate, 1 body, 2 aggregates
+    var prune_below: Int             # F-210 (SQL lowering): registers below it are read from outside the program, so every other register is dead at its end (kargs.prune_dead); -1: unknown, nothing is pruned
     var next_keep: Int               # registers 1 .. next_keep-1 hold values that must live on (the predicate's
     var temp_top: Int                # running AND, each aggregate's value); temporaries come down from the top
     var set_bytes: List[UInt8]       # F-150 (SQL): the byte sets OP_IN_SET reads and their (offset, length, lowest) triples; the builder has none
@@ -901,6 +903,7 @@ struct Program(Movable):
         self.null_of = List[Int](length=n_table_cols, fill=-1)
         self.n_regs = MAX_REGS           # register 0: the group key (int), read by `_key_from_reg0`
         self.next_keep = 1
+        self.prune_below = -1
         self.temp_top = MAX_REGS - 1
         self.pred_reg = -1
         self.keyed = False
@@ -1562,22 +1565,155 @@ def _mat_hook(chunk: Int, row0: Int, sel: IP, nsel: Int, use_sel: Bool, dst: IP,
     return True
 
 
+# ── dead instructions (F-210) ─────────────────────────────────────────────────────────────────────────
+# The SQL lowering writes guard and "take" registers (OP_NE against zero, then a copy) for every AND of a filter whether or not a
+# later instruction reads them: 12 of TPC-H Q6's 37 instructions, each a pass over a 1024-row block. A pure instruction whose
+# destination is overwritten, or never read again, is dropped when the CPU kernel's code is assembled. Only registers below
+# `prune_below` (the kept ones: `_Emitter.keep` copies a value into them) and the predicate's register are read from outside the program (keys,
+# holistic sources, row values, the predicate), so every other register is dead at the end of the program.
+comptime _W = 1               # writes d
+comptime _R2 = 2              # reads ins[2]
+comptime _R3 = 4              # reads ins[3]
+comptime _R4 = 8              # reads ins[4]
+comptime _PURE = 16           # no effect besides its register: may go when d is never read
+comptime _RD = 32             # reads d (OP_FLAG)
+
+
+def _effects(op: Int) -> Int:
+    if op == 1 or op == 2 or op == 3 or op == 38 or op == 39 or op == 40 or op == 41 or op == 56:
+        return _W | _PURE                                        # loads, constants, compare against a constant, row id, LIKE, IS NULL, OP_ICMPCOL
+    if (op >= 10 and op <= 14) or (op >= 20 and op <= 25) or op == 30 or op == 31 or op == 44 or op == 45 or op == 46:
+        return _W | _R2 | _R3 | _PURE
+    if op == 15 or op == 16 or op == 17 or op == 42 or op == 43:
+        return _W | _R2 | _R3                                    # integer + - * / %: an overflow sets the error flag, so they stay
+    if op == 18 or op == 32 or op == 33 or op == 34 or op == 37 or op == 47 or op == 48:
+        return _W | _R2 | _PURE
+    if op == 19:
+        return _W | _R2                                          # int to float: sets the overflow flag
+    if op == 35 or op == 36:
+        return _W | _R2 | _R3 | _R4 | _PURE
+    if op == 49:
+        return _R2 | _RD                                         # OP_FLAG
+    if op >= 50 and op <= 55:
+        return _R2                                               # an aggregate: d is its slot
+    return _R2 | _R3 | _R4 | _RD                                 # an instruction this does not know: read everything, remove nothing
+
+
+def prune_dead(ins: List[Int32], keep_below: Int, pred_reg: Int) -> List[Bool]:
+    """Per instruction (five words each, predicate then body then aggregates): True when it is dead. One backward pass."""
+    var n = len(ins) // 5
+    var live = List[Bool](length=256, fill=False)
+    for r in range(min(keep_below, 256)):
+        live[r] = True
+    if pred_reg >= 0 and pred_reg < 256:
+        live[pred_reg] = True
+    var dead = List[Bool](length=max(n, 1), fill=False)
+    var i = n - 1
+    while i >= 0:
+        var m = _effects(Int(ins[i * 5]))
+        var d = Int(ins[i * 5 + 1])
+        if (m & _W) != 0:
+            if (m & _PURE) != 0 and not live[d]:
+                dead[i] = True
+                i -= 1
+                continue
+            live[d] = False
+        for k in range(2, 5):                                    # an operand of an instruction this does not know may not be a register at all: stay inside `live`
+            if (m & (1 << (k - 1))) != 0:
+                var r = Int(ins[i * 5 + k])
+                if r >= 0 and r < 256:
+                    live[r] = True
+        if (m & _RD) != 0 and d >= 0 and d < 256:
+            live[d] = True
+        i -= 1
+    return dead^
+
+
+def _dead_after(ins: List[Int32], after: Int, r: Int, keep_below: Int, pred_reg: Int) -> Bool:
+    """Is register r never read again after instruction `after` of `ins`: the first instruction that touches it writes it, or none does and it is not
+    read from outside the program."""
+    var n = len(ins) // 5
+    for i in range(after + 1, n):
+        var m = _effects(Int(ins[i * 5]))
+        if (m & _R2) != 0 and Int(ins[i * 5 + 2]) == r:
+            return False
+        if (m & _R3) != 0 and Int(ins[i * 5 + 3]) == r:
+            return False
+        if (m & _R4) != 0 and Int(ins[i * 5 + 4]) == r:
+            return False
+        if (m & _RD) != 0 and Int(ins[i * 5 + 1]) == r:
+            return False
+        if (m & _W) != 0 and Int(ins[i * 5 + 1]) == r:
+            return True
+    return r >= keep_below and r != pred_reg
+
+
+def cpu_code(p: Program) -> List[Int32]:
+    """The CPU kernel's code for `p`: the 16-word header, then the predicate, the body and the aggregates. SQL programs (`Program.prune_below`)
+    lose the instructions `prune_dead` finds dead, and a column compared with a constant (OP_LOADI, OP_LOAD_CONST, OP_ICMP, nothing else reading
+    the two registers) becomes one OP_ICMPCOL: one pass over the column instead of three over 8 KB registers."""
+    var all = p.pred.copy()
+    all.extend(p.body.copy())
+    all.extend(p.aggs.copy())
+    var n_pred = len(p.pred) // 5
+    var n_body = len(p.body) // 5
+    var dead = prune_dead(all, p.prune_below, p.pred_reg) if p.prune_below >= 0 else List[Bool](length=max(len(all) // 5, 1), fill=False)
+    var words = List[Int32]()                              # the instructions that stay
+    var sec = List[Int]()                                  # and the section of each: 0 predicate, 1 body, 2 aggregates
+    for i in range(len(all) // 5):
+        if dead[i]:
+            continue
+        sec.append(0 if i < n_pred else (1 if i < n_pred + n_body else 2))
+        for k in range(5):
+            words.append(all[i * 5 + k])
+    var out = List[Int32]()
+    var counts = List[Int]()
+    counts.append(0)
+    counts.append(0)
+    counts.append(0)
+    var n = len(words) // 5
+    var i = 0
+    while i < n:
+        if p.prune_below >= 0 and i + 2 < n and sec[i] == sec[i + 2] and Int(words[(i + 2) * 5]) == OP_ICMP:
+            var o1 = Int(words[i * 5])
+            var o2 = Int(words[(i + 1) * 5])
+            if (o1 == OP_LOADI and o2 == OP_LOAD_CONST) or (o1 == OP_LOAD_CONST and o2 == OP_LOADI):
+                var load = i if o1 == OP_LOADI else i + 1
+                var cst = i + 1 if o1 == OP_LOADI else i
+                var x = Int(words[load * 5 + 1])
+                var y = Int(words[cst * 5 + 1])
+                var j = i + 2
+                var dd = Int(words[j * 5 + 1])
+                if x != y and Int(words[j * 5 + 2]) == x and Int(words[j * 5 + 3]) == y \
+                        and (dd == x or _dead_after(words, j, x, p.prune_below, p.pred_reg)) \
+                        and (dd == y or _dead_after(words, j, y, p.prune_below, p.pred_reg)):
+                    out.append(Int32(OP_ICMPCOL))
+                    out.append(Int32(dd))
+                    out.append(words[load * 5 + 2])        # the program column
+                    out.append(words[cst * 5 + 2])         # the constant
+                    out.append(words[j * 5 + 4])           # the comparison
+                    counts[sec[i]] += 1
+                    i += 3
+                    continue
+        for k in range(5):
+            out.append(words[i * 5 + k])
+        counts[sec[i]] += 1
+        i += 1
+    var header: List[Int] = [MAGIC, p.n_regs, 0, counts[0], counts[1], counts[2],
+                             p.pred_reg, len(p.cols), 0, 0, 0, 0, 0, 0, 0, 0]
+    var code = List[Int32]()
+    for h in header:
+        code.append(Int32(h))
+    code.extend(out^)
+    return code^
+
+
 def _run_cpu(t: SharedTable, p: Program, mask_addr: Int, start: Int = 0, end: Int = -1, ctl_addr: Int = 0, workers: Int = 0) raises -> QueryResult:
     """The kernel over rows [start, end) (all by default). `ctl_addr`: the control block of a holistic query
     (`_mat_hook`), whose pairs the kernel materializes while it aggregates."""
     var n = t.rows()
     var stop = n if end < 0 else end
-    var code = List[Int32]()
-    var header: List[Int] = [MAGIC, p.n_regs, 0, len(p.pred) // 5, len(p.body) // 5, len(p.aggs) // 5,
-                             p.pred_reg, len(p.cols), 0, 0, 0, 0, 0, 0, 0, 0]
-    for h in header:
-        code.append(Int32(h))
-    for w in p.pred:
-        code.append(w)
-    for w in p.body:
-        code.append(w)
-    for w in p.aggs:
-        code.append(w)
+    var code = cpu_code(p)
     var consts = List[Float64]()
     for v in p.consts:                       # int64 bits in the float64 pool: LOAD_CONST copies them exactly
         consts.append(Float64(from_bits=UInt64(v)))

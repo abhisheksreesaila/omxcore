@@ -12,7 +12,7 @@ run (`region`, `bytes_region`, handed back as an index), the control block is on
 (such as `window_blocks`) takes the run as an argument, so the run is borrowed for that call too.
 """
 from .table import SharedTable
-from .query import Program, MAGIC
+from .query import Program, MAGIC, cpu_code
 from .kernels._fpenv import core_count
 from .kernels.pipeline_cpu import IP, LP, FP, BP, pipeline_keyed, pipeline_fused, _no_front
 from .kernels.hashagg_cpu import hash_aggregate
@@ -34,17 +34,7 @@ struct KernelRun(Movable):
     var repro: Bool
 
     def __init__(out self, p: Program, set_bytes: List[UInt8], set_meta: List[Int64], t: SharedTable, mask_addr: Int, groups: Int = 1, row0: Int = 0, rows: Int = -1):
-        self.code = List[Int32]()
-        var header: List[Int] = [MAGIC, p.n_regs, 0, len(p.pred) // 5, len(p.body) // 5, len(p.aggs) // 5,
-                                 p.pred_reg, len(p.cols), 0, 0, 0, 0, 0, 0, 0, 0]
-        for h in header:
-            self.code.append(Int32(h))
-        for w in p.pred:
-            self.code.append(w)
-        for w in p.body:
-            self.code.append(w)
-        for w in p.aggs:
-            self.code.append(w)
+        self.code = cpu_code(p)
         self.consts = List[Float64]()
         for v in p.consts:
             self.consts.append(Float64(from_bits=UInt64(v)))

@@ -3,8 +3,8 @@ each once, in any order, and returns when all are done. A task writes only its o
 
 Which threads:
   - Linux and any build with the thread pool: `par_n` (kernels/_fpenv.mojo), the pool every kernel uses.
-  - a serial build (`MXFRAME_SERIAL`, and every target but Linux) has no async runtime, so by default the tasks run in a loop
-    on the calling thread: a plain Mac build stays serial.
+  - a serial build (`-D MXFRAME_SERIAL`, F-138b: an app whose link has no async runtime) runs the tasks in a loop
+    on the calling thread (since F-210 a native Mac build is not serial: it has the pool).
   - a serial build with `-D MXFRAME_JOB_THREADS` (F-175) has pthreads: they are used here too, with the same libSystem calls
     the jobs already need (pthread_create, pthread_join, pthread_attr_init / _setstacksize / _destroy) and sysconf, which the
     package uses already. No async runtime is added.

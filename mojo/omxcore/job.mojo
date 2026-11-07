@@ -19,7 +19,7 @@ takes `ctl: JobCtl = JobCtl()` and calls `ctl.check()` (raises when cancelled), 
 Memory ownership: the job's body (a struct, `JobBody`) owns its inputs; the control block and the result slot are reference
 counted by hand (`W_REFS`: the handle and the thread). A job holds no address of the caller's memory.
 
-Threads: a raw `pthread_create` thread per job (Linux). The serial build (`MXFRAME_SERIAL`, and every target but Linux,
+Threads: a raw `pthread_create` thread per job (Linux, and macOS since F-210). The serial build (`-D MXFRAME_SERIAL`,
 `kernels/_fpenv.mojo`) has no async runtime and, by default, no job threads: the job runs to its end inside `compute_job` and the handle
 comes back done (or failed); `cancel()` then has nothing to stop; `-D MXFRAME_JOB_THREADS` gives it threads anyway (see `THREADS`). The completion callback runs on the job's thread (on the
 caller's thread in the serial build) with the final state and the token given at the start; it is skipped when the handle was
@@ -31,7 +31,7 @@ from std.memory.alloc import unsafe_alloc
 from std.sys import is_defined
 from .kernels._fpenv import SERIAL, start_pool
 
-# A job gets a thread of its own on Linux (the default build). The serial build (an Apple target, or -D MXFRAME_SERIAL) runs a job inside its
+# A job gets a thread of its own in the default build (Linux, macOS). The serial build (-D MXFRAME_SERIAL) runs a job inside its
 # start call, unless the app opts in with -D MXFRAME_JOB_THREADS: the job then gets a pthread whose kernels still run in a loop (no async
 # runtime), at the price of three libSystem calls the app's stub must list: pthread_create, pthread_join, pthread_detach.
 comptime JOB_STACK_BYTES = 16 * 1024 * 1024        # a job thread's stack

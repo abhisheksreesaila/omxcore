@@ -55,7 +55,13 @@ from std.math import floor
 from std.ffi import external_call
 
 comptime F64 = DType.float64
-comptime W = simd_width_of[F64]()
+# F-210: on arm64 the native vector is two doubles (NEON), and every pass over a block pays its loop overhead per vector: four
+# NEON registers per step ran Q6 24% and Q1 9% faster on an M4 than one (and two: 21% and 8%). x86 keeps its own width.
+comptime W = simd_width_of[F64]() * (1 if CompilationTarget.is_x86() else 4)
+# The accumulator lanes of a global aggregate stay at the native width (WA): more lanes would change the order float
+# sums are added in, and an exact int64 sum's per-lane partial totals can pass int64 where the total does not (a periodic
+# pattern under a filter put one +-2^53 in every step of a lane: test_kernels_from_package got E_OVERFLOW with 8 lanes).
+comptime WA = simd_width_of[F64]()
 comptime VEC = 1024
 comptime MORSEL = 65536
 comptime MAX_REGS = 64
@@ -126,6 +132,7 @@ comptime OP_AGG_MAX = 52
 comptime OP_AGG_ISUM = 53   # sum of an "int" register, accumulated in int64 (F-060, F-060b); the slot holds int64 bits
 comptime OP_AGG_IMIN = 54   # min / max of an "int" register, accumulated in int64 (F-060c); the slot holds int64 bits
 comptime OP_AGG_IMAX = 55
+comptime OP_ICMPCOL = 56    # F-210: dst = 1.0 if column ins[2] <cmp in ins[4]> the int64 constant consts[ins[3]] else 0.0: OP_LOADI + OP_LOAD_CONST + OP_ICMP in one pass over the column (made by the host, query.cpu_code)
 comptime E_OVERFLOW = -21   # an int64 sum or result passed its range, or an int64 value past 2^53 met a float op (the caller's exact path answers)
 comptime LIM53 = Int64(1) << 53
 comptime B62 = 4611686018427387904.0     # 2^62 as a double: |a double product| below it proves an int64 product fits
@@ -287,12 +294,147 @@ def _i2f(d: FP, a: FP, n: Int, ovf: LP, mode: Int):
             ovf[0] = 1
         i += 1
 
+@always_inline
+def _icmp[CMP: Int](d: FP, xa: LP, xb: LP, n: Int):
+    """OP_ICMP for one comparison, in SIMD lanes (F-210: the comparison was chosen per element inside a scalar loop)."""
+    var one = SIMD[F64, W](1.0)
+    var zero = SIMD[F64, W](0.0)
+    var i = 0
+    while i + W <= n:
+        var x = xa.load[width=W](i)
+        var y = xb.load[width=W](i)
+        comptime if CMP == OP_LT:
+            d.store(i, x.lt(y).select(one, zero))
+        elif CMP == OP_LE:
+            d.store(i, x.le(y).select(one, zero))
+        elif CMP == OP_GT:
+            d.store(i, x.gt(y).select(one, zero))
+        elif CMP == OP_GE:
+            d.store(i, x.ge(y).select(one, zero))
+        elif CMP == OP_EQ:
+            d.store(i, x.eq(y).select(one, zero))
+        else:
+            d.store(i, x.ne(y).select(one, zero))
+        i += W
+    while i < n:
+        var x = xa[i]
+        var y = xb[i]
+        comptime if CMP == OP_LT:
+            d[i] = 1.0 if x < y else 0.0
+        elif CMP == OP_LE:
+            d[i] = 1.0 if x <= y else 0.0
+        elif CMP == OP_GT:
+            d[i] = 1.0 if x > y else 0.0
+        elif CMP == OP_GE:
+            d[i] = 1.0 if x >= y else 0.0
+        elif CMP == OP_EQ:
+            d[i] = 1.0 if x == y else 0.0
+        else:
+            d[i] = 1.0 if x != y else 0.0
+        i += 1
+
+@always_inline
+def _icmp_col[T: DType, CMP: Int](d: FP, addr: Int, i0: Int, n: Int, k: Int64):
+    """OP_ICMPCOL over the first n rows of a dense column of type T (read widened to int64): 1.0 / 0.0 against the constant k."""
+    var src = Pointer[Scalar[T], MutUntrackedOrigin](unsafe_from_address=addr) + i0
+    var kv = SIMD[DType.int64, W](k)
+    var one = SIMD[F64, W](1.0)
+    var zero = SIMD[F64, W](0.0)
+    var i = 0
+    while i + W <= n:
+        var x = src.load[width=W](i).cast[DType.int64]()
+        comptime if CMP == OP_LT:
+            d.store(i, x.lt(kv).select(one, zero))
+        elif CMP == OP_LE:
+            d.store(i, x.le(kv).select(one, zero))
+        elif CMP == OP_GT:
+            d.store(i, x.gt(kv).select(one, zero))
+        elif CMP == OP_GE:
+            d.store(i, x.ge(kv).select(one, zero))
+        elif CMP == OP_EQ:
+            d.store(i, x.eq(kv).select(one, zero))
+        else:
+            d.store(i, x.ne(kv).select(one, zero))
+        i += W
+    while i < n:
+        var x = src[i].cast[DType.int64]()
+        comptime if CMP == OP_LT:
+            d[i] = 1.0 if x < k else 0.0
+        elif CMP == OP_LE:
+            d[i] = 1.0 if x <= k else 0.0
+        elif CMP == OP_GT:
+            d[i] = 1.0 if x > k else 0.0
+        elif CMP == OP_GE:
+            d[i] = 1.0 if x >= k else 0.0
+        elif CMP == OP_EQ:
+            d[i] = 1.0 if x == k else 0.0
+        else:
+            d[i] = 1.0 if x != k else 0.0
+        i += 1
+
+@always_inline
+def _icmp_col_t[T: DType](d: FP, addr: Int, i0: Int, n: Int, k: Int64, cmp: Int):
+    if cmp == OP_LT:
+        _icmp_col[T, OP_LT](d, addr, i0, n, k)
+    elif cmp == OP_LE:
+        _icmp_col[T, OP_LE](d, addr, i0, n, k)
+    elif cmp == OP_GT:
+        _icmp_col[T, OP_GT](d, addr, i0, n, k)
+    elif cmp == OP_GE:
+        _icmp_col[T, OP_GE](d, addr, i0, n, k)
+    elif cmp == OP_EQ:
+        _icmp_col[T, OP_EQ](d, addr, i0, n, k)
+    else:
+        _icmp_col[T, OP_NE](d, addr, i0, n, k)
+
+def _icmp_col_run(d: FP, addr: Int, dtype: Int, i0: Int, sel: IP, use_sel: Bool, n: Int, k: Int64, cmp: Int):
+    """OP_ICMPCOL: rows [i0, i0 + n) (or the rows `sel` names) of a column against k. The column's dtype is read as OP_LOADI reads it."""
+    if use_sel:
+        _load_coli(d, addr, dtype, i0, sel, use_sel, n)             # the gathered rows, widened to int64, then compared in place
+        var x = _ibits(d)
+        for i in range(n):
+            var v = x[i]
+            var r = (v < k) if cmp == OP_LT else (v <= k) if cmp == OP_LE else (v > k) if cmp == OP_GT else \
+                    (v >= k) if cmp == OP_GE else (v == k) if cmp == OP_EQ else (v != k)
+            d[i] = 1.0 if r else 0.0
+    elif dtype == 0:
+        _icmp_col_t[DType.int32](d, addr, i0, n, k, cmp)
+    elif dtype == 4:
+        _icmp_col_t[DType.uint8](d, addr, i0, n, k, cmp)
+    else:                                                           # 1: int64, 8: int64 read only here
+        _icmp_col_t[DType.int64](d, addr, i0, n, k, cmp)
+
 def _int_op2[OP: Int](d: FP, a: FP, b: FP, cmp: Int, n: Int, ovf: LP):
     """OP_IDIV / OP_IMOD / OP_IMIN / OP_IMAX / OP_ICMP over the first n lanes of two "int" registers. INT64_MIN // -1
     does not fit: *ovf is set (the caller's exact path or error answers)."""
     var dd = _ibits(d)
     var xa = _ibits(a)
     var xb = _ibits(b)
+    comptime if OP == OP_ICMP:
+        if cmp == OP_LT:
+            _icmp[OP_LT](d, xa, xb, n)
+        elif cmp == OP_LE:
+            _icmp[OP_LE](d, xa, xb, n)
+        elif cmp == OP_GT:
+            _icmp[OP_GT](d, xa, xb, n)
+        elif cmp == OP_GE:
+            _icmp[OP_GE](d, xa, xb, n)
+        elif cmp == OP_EQ:
+            _icmp[OP_EQ](d, xa, xb, n)
+        else:
+            _icmp[OP_NE](d, xa, xb, n)
+        return
+    comptime if OP == OP_IMIN or OP == OP_IMAX:
+        var i = 0
+        while i + W <= n:
+            var x = xa.load[width=W](i)
+            var y = xb.load[width=W](i)
+            dd.store(i, min(x, y) if OP == OP_IMIN else max(x, y))
+            i += W
+        while i < n:
+            dd[i] = min(xa[i], xb[i]) if OP == OP_IMIN else max(xa[i], xb[i])
+            i += 1
+        return
     for i in range(n):
         var x = xa[i]
         var y = xb[i]
@@ -304,16 +446,8 @@ def _int_op2[OP: Int](d: FP, a: FP, b: FP, cmp: Int, n: Int, ovf: LP):
                 dd[i] = x
             else:
                 dd[i] = x // y
-        elif OP == OP_IMOD:
-            dd[i] = 0 if y == 0 or y == -1 else x % y
-        elif OP == OP_IMIN:
-            dd[i] = min(x, y)
-        elif OP == OP_IMAX:
-            dd[i] = max(x, y)
         else:
-            var r = (x < y) if cmp == OP_LT else (x <= y) if cmp == OP_LE else (x > y) if cmp == OP_GT else \
-                    (x >= y) if cmp == OP_GE else (x == y) if cmp == OP_EQ else (x != y)
-            d[i] = 1.0 if r else 0.0
+            dd[i] = 0 if y == 0 or y == -1 else x % y
 
 def _fill_identity(base: FP, count: Int, kind: Int):
     """`count` slot words at their aggregate's identity: 0 for sums, +-inf for float extremes, INT64_MAX / INT64_MIN
@@ -373,8 +507,13 @@ def _coli_t[T: DType](dst: FP, addr: Int, i0: Int, sel: IP, use_sel: Bool, n: In
         for j in range(n):
             d[j] = src[Int(sel[j])].cast[DType.int64]()
     else:
-        for j in range(n):
+        var j = 0
+        while j + W <= n:                                  # F-210: explicit SIMD (the scalar loop was not vectorized on arm64)
+            d.store(j, src.load[width=W](j).cast[DType.int64]())
+            j += W
+        while j < n:
             d[j] = src[j].cast[DType.int64]()
+            j += 1
 
 def _load_coli(dst: FP, addr: Int, dtype: Int, i0: Int, sel: IP, use_sel: Bool, n: Int):
     if dtype == 0:
@@ -908,7 +1047,7 @@ struct Prog(Copyable, Movable):
         self.pred_reg = Int(code[6])
         self.pred_first = Int(code[8]) != 0
         if not has_gids:
-            self.nl = W
+            self.nl = WA
         elif n_groups <= LANE_GROUPS:       # a function of the group count alone: the order in which a
             self.nl = 4                     # group's rows are added must not depend on the aggregate list
         else:
@@ -947,6 +1086,9 @@ def _run_ops(p: Prog, regs: FP, cols: LP, base: Int, count: Int, i0: Int, sel: I
             while i < VEC:
                 d.store(i, v)
                 i += W
+        elif op == OP_ICMPCOL:
+            var c = Int(ins[2])
+            _icmp_col_run(d, Int(cols[c]), Int(p.dtypes[c]), i0, sel, use_sel, n, _lp(Int(p.consts))[Int(ins[3])], Int(ins[4]))
         elif op == OP_CMPC:
             # column <cmp> constant: widen exactly, compare against the pre-rounded threshold
             var c = Int(ins[2])
@@ -1034,7 +1176,7 @@ def _accumulate(p: Prog, regs: FP, gp: IP, n: Int, pv: FP, pc: LP):
     var NL = p.nl
     var A = p.n_aggs
     if not p.has_gids:
-        # Global aggregate: NL == W, accumulate straight into SIMD lanes.
+        # Global aggregate: NL == WA, accumulate straight into SIMD lanes.
         pc[0] += Int64(n)
         for a in range(A):
             var ins = p.instr(p.n_pro + p.n_pred + p.n_body, a)
@@ -1045,15 +1187,15 @@ def _accumulate(p: Prog, regs: FP, gp: IP, n: Int, pv: FP, pc: LP):
                 # exact: the input is an "int" register, its int64 values added in the SIMD lanes
                 var iacc = _ibits(acc)
                 var ir = _ibits(r)
-                var iv = iacc.load[width=W]()
-                var ov = SIMD[DType.int64, W](0)
+                var iv = iacc.load[width=WA]()
+                var ov = SIMD[DType.int64, WA](0)
                 var k = 0
-                while k + W <= n:
-                    var x = ir.load[width=W](k)
+                while k + WA <= n:
+                    var x = ir.load[width=WA](k)
                     var t = iv + x
                     ov |= (iv ^ t) & (x ^ t)
                     iv = t
-                    k += W
+                    k += WA
                 iacc.store(iv)
                 if ov.reduce_or() < 0:
                     p.ovf[0] = 1
@@ -1065,28 +1207,28 @@ def _accumulate(p: Prog, regs: FP, gp: IP, n: Int, pv: FP, pc: LP):
                 # F-060c: the extreme of int64 values (the register holds their bits), in SIMD lanes
                 var xacc = _ibits(acc)
                 var xr = _ibits(r)
-                var xv = xacc.load[width=W]()
+                var xv = xacc.load[width=WA]()
                 var k = 0
-                while k + W <= n:
-                    var x = xr.load[width=W](k)
+                while k + WA <= n:
+                    var x = xr.load[width=WA](k)
                     xv = min(xv, x) if kind == OP_AGG_IMIN else max(xv, x)
-                    k += W
+                    k += WA
                 xacc.store(xv)
                 while k < n:
                     xacc[0] = _iext(kind, xacc[0], xr[k])
                     k += 1
                 continue
-            var accv = acc.load[width=W]()
+            var accv = acc.load[width=WA]()
             var j = 0
-            while j + W <= n:
-                var x = r.load[width=W](j)
+            while j + WA <= n:
+                var x = r.load[width=WA](j)
                 if kind == OP_AGG_SUM:
                     accv = accv + x
                 elif kind == OP_AGG_MIN:
                     accv = min(accv, x)
                 else:
                     accv = max(accv, x)
-                j += W
+                j += WA
             acc.store(accv)
             while j < n:
                 var x = r[j]

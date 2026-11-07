@@ -55,17 +55,9 @@ check_test() {
 for t in "${files[@]}"; do
   check_test "$t" "$(basename "$t" .mojo)"
 done
-# The default macOS build runs a job inside its start call (no job threads), so the job tests cannot see a cancel arrive or
-# two threads race there: they say so and pass. The same tests built with -D MXFRAME_JOB_THREADS (what an app that wants
-# background jobs on a Mac builds with, F-175) are the ones that check cancelling and racing, so run those here too.
-if [ $# -eq 0 ] && [ "$(uname)" != "Linux" ]; then
-  for name in test_job test_jobs test_sort_spill test_permutation_spill test_parquet_dict_race; do
-    check_test "$root/mojo/tests/$name.mojo" "${name}_threads" -D MXFRAME_JOB_THREADS
-  done
-fi
 
-# F-138b: the same package built the way an app with no GPU, thread pool or codecs builds it (what every non-Linux
-# target gets by default, forced here with -D). Its inputs are a zstd and a snappy file from the normal build.
+# F-138b: the same package built the way an app with no GPU, thread pool or codecs builds it (no GPU and no codecs are
+# the default of every non-Linux target; the app adds -D MXFRAME_SERIAL, F-210; all forced here with -D). Its inputs are a zstd and a snappy file from the normal build.
 if [ $# -eq 0 ]; then
   sw="$root/mojo/tests/switches/test_switches"
   if mojo build --disable-warnings "$root/mojo/tools/pq_write_sample.mojo" -I "$root/build" -Xlinker -L"$lib" -Xlinker -lzstd -Xlinker -lsnappy \
