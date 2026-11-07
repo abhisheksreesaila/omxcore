@@ -33,7 +33,7 @@ from max import driver as _driver
 from omxcore import LazyFrame, col, lit, when
 from omxcore.lazy_frame import Scan
 from omxcore.custom_ops import clear_cache
-from omxcore.aot_kernels import AOTKernelsGPU, GPU_AOT_AVAILABLE
+from omxcore.aot_kernels import GPU_AOT_AVAILABLE, get_aot_gpu
 
 try:
     import polars as pl
@@ -56,9 +56,14 @@ def _record_direct_gpu_aot(kernel: str) -> None:
 
 
 def _bench_aot_gpu():
+    """The process-wide GPU kernels, or None (the caller then runs the CPU path) when this machine cannot load
+    them: a Mac's committed library is x86-64 and Metal builds none (F-214). The None says so in the provenance."""
     global _BENCH_AOT_GPU
     if _BENCH_AOT_GPU is None and GPU_AOT_AVAILABLE:
-        _BENCH_AOT_GPU = AOTKernelsGPU()
+        _BENCH_AOT_GPU = get_aot_gpu()
+    if _BENCH_AOT_GPU is None:
+        _DIRECT_PROVENANCE.append({"path": "cpu_fallback", "device": "cpu",
+                                   "note": "GPU kernel library not loadable on this machine: ran on the CPU"})
     return _BENCH_AOT_GPU
 
 
